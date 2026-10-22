@@ -16,7 +16,7 @@ use rustros_util::netcmd;
 use rustros_util::secret;
 use rustros_util::wire::PROTO_ICMP;
 use rustros_util::wire::{Ip, IpFmt, MacFmt, be16, checksum, parse_ip};
-use rustros_api::{Admin, Caps, Kv, Module, ModuleInfo, ModuleKind, Net, RawSocket, SocketAddr, Sys, say};
+use rustros_api::{Admin, Caps, Kv, Module, ModuleInfo, ModuleKind, Net, Param, RawSocket, SocketAddr, Sys, say};
 
 /// Bytes of an HTTP response echoed to the console; the rest is only counted.
 const HTTP_SHOW: usize = 1024;
@@ -520,9 +520,18 @@ impl Shell {
     }
 }
 
+/// The settings, for user interfaces (`Module::params`).
+const PARAMS: &[Param] = &[
+    Param { key: "dns", kind: "address", default: "1.1.1.1", help: "resolver for curl" },
+];
+
 impl Module for Shell {
     fn name(&self) -> &'static str {
         "shell"
+    }
+
+    fn params(&self) -> &'static [Param] {
+        PARAMS
     }
 
     fn caps(&self) -> Caps {

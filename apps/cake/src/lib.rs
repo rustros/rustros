@@ -29,7 +29,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Frame, Module, Sys, Verdict, say};
+use rustros_api::{Caps, Frame, Module, Param, Sys, Verdict, say};
 
 const ETH: usize = 14;
 const FLOWS: usize = 1024;
@@ -443,9 +443,21 @@ impl Cake {
     }
 }
 
+/// The settings, for user interfaces (`Module::params`).
+const PARAMS: &[Param] = &[
+    Param { key: "overhead", kind: "number", default: "0", help: "bytes added per packet for the rate (link framing)" },
+    Param { key: "limit", kind: "number", default: "4194304", help: "queue bytes per shaper" },
+    Param { key: "egress.<if>", kind: "text", default: "", help: "shape what leaves the interface, e.g. 100mbit" },
+    Param { key: "ingress.<if>", kind: "text", default: "", help: "shape what arrives on the interface, e.g. 200mbit" },
+];
+
 impl Module for Cake {
     fn name(&self) -> &'static str {
         "cake"
+    }
+
+    fn params(&self) -> &'static [Param] {
+        PARAMS
     }
 
     fn caps(&self) -> Caps {

@@ -67,6 +67,7 @@ pub struct ModuleStatus {
     pub kind: ModuleKind,
     pub state: String,
     pub restarts: u32,
+    pub params: Vec<rustros_api::ParamInfo>,
 }
 
 // ---------------------------------------------------------------- crash attribution
@@ -246,6 +247,7 @@ pub fn list(k: &Kernel) -> Vec<ModuleInfo> {
                 wasm_bytes,
                 preferred,
                 native_off,
+                params: st.map_or_else(Vec::new, |s| s.params.clone()),
             }
         })
         .collect()
@@ -331,6 +333,7 @@ fn apply_runtime(k: &mut Kernel, slots: &mut [Slot], start: bool, pending: &[Str
                         kind: ModuleKind::Native,
                         state: String::from("runtime"),
                         restarts: 0,
+                        params: Vec::new(),
                     });
                 }
                 Ok(_) => kprintln!("modules: \"{}\" must be a runtime module", RUNTIME),
@@ -451,7 +454,7 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
         let caps = if kind == ModuleKind::Wasm { caps & (Caps::NET | Caps::KV | Caps::PACKET | Caps::CONSOLE) } else { caps };
         set_slot(k, id, leaked, caps);
         kprintln!("modules: {} started ({}, {} KiB)", name, kind.as_str(), image.len() / 1024);
-        k.app_status.push(ModuleStatus { name: leaked, kind, state: String::from("running"), restarts: 0 });
+        k.app_status.push(ModuleStatus { name: leaked, kind, state: String::from("running"), restarts: 0, params: Vec::new() });
         call(k, slots, id, |app, ctx| app.start(ctx));
     }
 }
@@ -466,6 +469,10 @@ pub fn refresh_status(k: &mut Kernel, slots: &mut [Slot]) {
         if let (Some(app), Some(st)) = (slot.app(), k.app_status.iter_mut().find(|s| s.name == name)) {
             st.state = app.status();
             st.restarts = app.restarts();
+            let params = app.params();
+            if st.params.len() != params.len() || st.params.iter().zip(params).any(|(a, b)| a.key != b.key) {
+                st.params = params.iter().map(rustros_api::ParamInfo::from).collect();
+            }
         }
     }
 }

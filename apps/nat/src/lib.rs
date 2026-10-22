@@ -40,7 +40,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Frame, Module, Packet, Sys, Verdict, say};
+use rustros_api::{Caps, Frame, Module, Packet, Param, Sys, Verdict, say};
 use rustros_util::wire::{Ip, IpFmt, parse_ip};
 use nat_core::{Config, Drop, Inbound, Nat, PortForward, StaticNat, icmp_error};
 
@@ -387,9 +387,27 @@ impl NatModule {
     }
 }
 
+/// The settings, for user interfaces (`Module::params`).
+const PARAMS: &[Param] = &[
+    Param { key: "inside", kind: "list", default: "", help: "NICs whose hosts are translated (none: idle)" },
+    Param { key: "outside", kind: "list", default: "every interface with a gateway", help: "only traffic leaving through these is translated" },
+    Param { key: "egress", kind: "address", default: "NIC 0's address", help: "default egress address" },
+    Param { key: "mss", kind: "number", default: "", help: "clamp TCP MSS (tunnels)" },
+    Param { key: "ports", kind: "text", default: "10000-49151", help: "external port range" },
+    Param { key: "egress.<host>", kind: "address", default: "", help: "egress address of one inside host" },
+    Param { key: "srcnat.<address>", kind: "address", default: "", help: "static NAT: this source address becomes the value" },
+    Param { key: "dstnat.tcp.<address:port>", kind: "text", default: "", help: "TCP port forward to a.b.c.d[:port] (a range keeps its offset)" },
+    Param { key: "dstnat.udp.<address:port>", kind: "text", default: "", help: "UDP port forward to a.b.c.d[:port]" },
+    Param { key: "dstnat.<address>", kind: "address", default: "", help: "static NAT: this destination address becomes the value" },
+];
+
 impl Module for NatModule {
     fn name(&self) -> &'static str {
         "nat"
+    }
+
+    fn params(&self) -> &'static [Param] {
+        PARAMS
     }
 
     /// Big segments are translated as they are (partial checksums kept).

@@ -230,7 +230,15 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             blks.push(d);
         }
     });
-    let disks: Vec<_> = blks.iter().filter_map(virtio_blk::VirtioBlk::new).collect();
+    let mut disks: Vec<_> = blks.iter().filter_map(virtio_blk::VirtioBlk::new).collect();
+    // "rustros.disktest=<lba>,<sectors>": exercise the first disk on a spare
+    // area (its content is put back), for new hardware
+    if let (Some(spec), Some(d)) = (cmdline_get(&cmdline, "rustros.disktest"), disks.first_mut()) {
+        let mut it = spec.split(',').map(|v| v.parse::<u64>().ok());
+        if let (Some(Some(lba)), Some(Some(n))) = (it.next(), it.next()) {
+            disk_test(d, lba, n);
+        }
+    }
     let boot = match slots::Updater::new(&cmdline, disks) {
         Ok((mut disk, upd)) => {
             kprintln!("disk: running slot {}{}", upd.slot, if upd.trial { " (trial boot)" } else { "" });
@@ -807,4 +815,38 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     crash(format_args!("panic: {}", info))
+}
+
+/// Write and read back patterns of many sizes (and buffer alignments) on
+/// `[lba, lba+n)`, then restore what was there.
+fn disk_test(d: &mut dyn devices::BlockDevice, lba: u64, n: u64) {
+    let len = (n * 512) as usize;
+    let mut orig = alloc::vec![0u8; len];
+    if !d.read(lba, &mut orig) {
+        kprintln!("disktest: reading the area failed");
+        return;
+    }
+    let (mut ok, mut bad) = (0, 0);
+    for size in [512usize, 4096, 65536, 65536 + 512, 131072, 184320, len] {
+        for skew in [0usize, 3, 512] {
+            if size > len {
+                continue;
+            }
+            let mut w = alloc::vec![0u8; size + skew];
+            for (i, b) in w[skew..].iter_mut().enumerate() {
+                *b = (i as u32).wrapping_mul(2_654_435_761).wrapping_add((size + skew) as u32).to_le_bytes()[1];
+            }
+            let mut r = alloc::vec![0u8; size + skew + 7];
+            let good = d.write(lba, &w[skew..]) && d.read(lba, &mut r[skew + 7..]) && r[skew + 7..] == w[skew..];
+            if good {
+                ok += 1;
+            } else {
+                bad += 1;
+                kprintln!("disktest: {} bytes (buffer offset {}) FAILED", size, skew);
+            }
+        }
+    }
+    let mut back = alloc::vec![0u8; len];
+    let restored = d.write(lba, &orig) && d.read(lba, &mut back) && back == orig;
+    kprintln!("disktest: {} of {} cases ok{}, area {}", ok, ok + bad, if bad == 0 { "" } else { " (FAILURES above)" }, if restored { "restored" } else { "NOT restored" });
 }

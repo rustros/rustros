@@ -87,6 +87,41 @@ impl ModuleKind {
     }
 }
 
+/// A setting a module takes (`cfg <module> <key> <value>`), described for
+/// user interfaces, which build their forms from these (see `Module::params`).
+///
+/// `key` is a pattern: `<x>` stands for a name the user picks, an instance
+/// when more follows (`<i>.listen`) or an entry of a table when it ends the
+/// key (`user.<name>`); `[<i>.]` is an optional instance prefix (without
+/// it: the default instance). A placeholder at the end may contain dots.
+///
+/// `kind`: text, number, switch (on/off), secret (a password: never shown),
+/// choice:a|b|c, address (a.b.c.d or an interface), network (a.b.c.d/n),
+/// list (comma separated).
+#[derive(Clone, Copy)]
+pub struct Param {
+    pub key: &'static str,
+    pub kind: &'static str,
+    /// What applies when it is not set ("" for nothing).
+    pub default: &'static str,
+    pub help: &'static str,
+}
+
+/// `Param`, owned (it outlives the module that described it).
+#[derive(Clone, Debug, Default)]
+pub struct ParamInfo {
+    pub key: String,
+    pub kind: String,
+    pub default: String,
+    pub help: String,
+}
+
+impl From<&Param> for ParamInfo {
+    fn from(p: &Param) -> ParamInfo {
+        ParamInfo { key: String::from(p.key), kind: String::from(p.kind), default: String::from(p.default), help: String::from(p.help) }
+    }
+}
+
 /// An installed (not built-in) application.
 pub struct ModuleInfo {
     pub name: String,
@@ -101,6 +136,8 @@ pub struct ModuleInfo {
     pub restarts: u32,
     /// The native form crashed the system and is switched off (with why).
     pub native_off: Option<String>,
+    /// The settings the running module takes (empty if it does not say).
+    pub params: Vec<ParamInfo>,
 }
 
 pub struct NetInfo {
@@ -567,6 +604,10 @@ pub trait Module {
     /// One-line state for listings ("running", "stopped: ..., restart in 4 s").
     fn status(&self) -> String {
         String::from("running")
+    }
+    /// The settings this module takes, for user interfaces (`Param`).
+    fn params(&self) -> &'static [Param] {
+        &[]
     }
     fn restarts(&self) -> u32 {
         0

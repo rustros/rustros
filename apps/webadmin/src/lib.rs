@@ -27,7 +27,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use rustros_api::{Caps, Module, ModuleKind, Sys, TcpListener, say};
+use rustros_api::{Caps, Module, ModuleKind, Param, Sys, TcpListener, say};
 use rustros_util::conn::Conn;
 use rustros_util::sha256::{Hmac, Sha256, ct_eq};
 use rustros_util::wire::{Ip, IpFmt, fmt_ip_list, parse_cidr, parse_ip};
@@ -499,23 +499,48 @@ fn net_state(sys: &mut dyn Sys) -> String {
     )
 }
 
+/// Whether setting `key` is one `pattern` describes (`Param`): `<x>` is one
+/// dotted part (all the rest at the end), `[<i>.]` an optional one.
+fn key_matches(pattern: &str, key: &str) -> bool {
+    if let Some(rest) = pattern.strip_prefix("[<i>.]") {
+        return key_matches(rest, key) || key.split_once('.').is_some_and(|(_, k)| key_matches(rest, k));
+    }
+    match pattern.find('<') {
+        None => pattern == key,
+        Some(i) => {
+            let Some(k) = key.strip_prefix(&pattern[..i]) else { return false };
+            let Some(end) = pattern[i..].find('>') else { return false };
+            let rest = &pattern[i + end + 1..];
+            if rest.is_empty() {
+                return !k.is_empty();
+            }
+            match k.find('.') {
+                Some(d) if d > 0 => key_matches(rest, &k[d..]),
+                _ => false,
+            }
+        }
+    }
+}
+
 fn modules(sys: &mut dyn Sys) -> String {
     let builtin: Vec<String> = sys.modules().iter().map(|m| js(m)).collect();
     let Some(a) = sys.admin() else { return String::from("{}") };
     let mut o = format!("{{\"running\":[{}],\"modules\":[", builtin.join(","));
     for (i, m) in a.module_list().iter().enumerate() {
+        let secret = |k: &str| rustros_util::secret::is_secret(k) || m.params.iter().any(|p| p.kind == "secret" && key_matches(&p.key, k));
         let cfg: Vec<String> = a
             .module_config(&m.name)
             .iter()
             .map(|(k, v)| {
-                // the password hash is nobody's business
-                let v = if rustros_util::secret::is_secret(k) { "(set)" } else { v.as_str() };
+                // passwords (and the password hash) are nobody's business
+                let v = if secret(k) { "(set)" } else { v.as_str() };
                 format!("[{},{}]", js(k), js(v))
             })
             .collect();
+        let params: Vec<String> = m.params.iter().map(|p| format!("[{},{},{},{}]", js(&p.key), js(&p.kind), js(&p.default), js(&p.help))).collect();
         let _ = write!(
             o,
-            "{}{{\"name\":{},\"running\":{},\"state\":{},\"preferred\":{},\"native\":{},\"wasm\":{},\"restarts\":{},\"off\":{},\"config\":[{}]}}",
+            "{}{{\"name\":{},\"running\":{},\"state\":{},\"preferred\":{},\"native\":{},\"wasm\":{},\"restarts\":{},\"off\":{},\"config\":[{}],\"params\":[{}]}}",
             if i > 0 { "," } else { "" },
             js(&m.name),
             m.running.map_or(String::from("null"), |k| js(k.as_str())),
@@ -525,16 +550,28 @@ fn modules(sys: &mut dyn Sys) -> String {
             m.wasm_bytes.map_or(String::from("null"), |b| b.to_string()),
             m.restarts,
             m.native_off.as_deref().map_or(String::from("null"), js),
-            cfg.join(",")
+            cfg.join(","),
+            params.join(",")
         );
     }
     o += "]}";
     o
 }
 
+/// The settings, for user interfaces (`Module::params`).
+const PARAMS: &[Param] = &[
+    Param { key: "password", kind: "secret", default: "", help: "the login password (stored hashed)" },
+    Param { key: "port", kind: "number", default: "8080", help: "listening port" },
+    Param { key: "allow", kind: "list", default: "networks of interfaces without a gateway", help: "who may connect: interfaces or networks" },
+];
+
 impl Module for WebAdmin {
     fn name(&self) -> &'static str {
         "webadmin"
+    }
+
+    fn params(&self) -> &'static [Param] {
+        PARAMS
     }
 
     fn caps(&self) -> Caps {

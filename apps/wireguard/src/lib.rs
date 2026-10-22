@@ -41,7 +41,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nat_core::{Inbound, Nat};
-use rustros_api::{Caps, Frame, Module, Offload, Packet, Sys, Verdict, say};
+use rustros_api::{Caps, Frame, Module, Offload, Packet, Param, Sys, Verdict, say};
 use rustros_util::wire::{Ip, IpFmt, checksum, parse_cidr, parse_ip};
 use wg_core::{Device, Endpoint, Out, PeerConfig, Received, key_from_base64, key_to_base64, public_key};
 
@@ -534,9 +534,31 @@ impl WireGuard {
     }
 }
 
+/// The settings, for user interfaces (`Module::params`).
+const PARAMS: &[Param] = &[
+    Param { key: "<if>.private", kind: "secret", default: "", help: "our private key (base64)" },
+    Param { key: "<if>.address", kind: "network", default: "", help: "our address in the tunnel network, e.g. 10.8.0.1/24" },
+    Param { key: "<if>.listen", kind: "number", default: "51820", help: "UDP port" },
+    Param { key: "<if>.bind", kind: "address", default: "", help: "the address to serve on (default: any of ours)" },
+    Param { key: "<if>.forward", kind: "choice:nat|route|off", default: "nat", help: "peers' traffic beyond us and them" },
+    Param { key: "<if>.egress", kind: "address", default: "", help: "NAT address for that (default: towards the default route)" },
+    Param { key: "<if>.hosts", kind: "list", default: "", help: "LAN hosts or networks that go out through the tunnel" },
+    Param { key: "<if>.nat", kind: "switch", default: "on", help: "those translated to our tunnel address" },
+    Param { key: "<if>.peer.<n>.public", kind: "text", default: "", help: "the peer's public key (base64)" },
+    Param { key: "<if>.peer.<n>.allowed", kind: "list", default: "", help: "its networks, e.g. 10.8.0.2/32 (0.0.0.0/0: everything)" },
+    Param { key: "<if>.peer.<n>.endpoint", kind: "text", default: "", help: "a.b.c.d:port (none: it must call us first)" },
+    Param { key: "<if>.peer.<n>.keepalive", kind: "number", default: "", help: "seconds between keepalives" },
+    Param { key: "<if>.peer.<n>.psk", kind: "secret", default: "", help: "preshared key (base64)" },
+    Param { key: "<if>.peer.<n>.reserved", kind: "text", default: "", help: "reserved header bytes: a,b,c or base64 (WARP client id)" },
+];
+
 impl Module for WireGuard {
     fn name(&self) -> &'static str {
         "wireguard"
+    }
+
+    fn params(&self) -> &'static [Param] {
+        PARAMS
     }
 
     fn caps(&self) -> Caps {

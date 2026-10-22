@@ -32,7 +32,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Module, Net, NetError, SocketAddr, Sys, TcpListener, UdpSocket, say};
+use rustros_api::{Caps, Module, Net, NetError, Param, SocketAddr, Sys, TcpListener, UdpSocket, say};
 use rustros_util::conn::Conn;
 use rustros_util::dns;
 use rustros_util::wire::{Ip, IpFmt, parse_cidr, parse_ip};
@@ -743,9 +743,26 @@ fn connect(cl: &mut Client, inst: &Instance, net: &mut dyn Net, ip: Ip, now: u64
     }
 }
 
+/// The settings, for user interfaces (`Module::params`).
+const PARAMS: &[Param] = &[
+    Param { key: "<i>.listen", kind: "number", default: "", help: "the port (an instance without one is off)" },
+    Param { key: "<i>.type", kind: "choice:mixed|socks5|http", default: "mixed", help: "socks5, http, or both on one port" },
+    Param { key: "<i>.bind", kind: "address", default: "", help: "only connections to this address of ours (or interface)" },
+    Param { key: "<i>.egress", kind: "address", default: "", help: "connect out from this address (its WAN)" },
+    Param { key: "<i>.allow", kind: "list", default: "LAN networks", help: "who may use it: interfaces, networks, addresses, any" },
+    Param { key: "<i>.user.<name>", kind: "secret", default: "", help: "logins (none: no login asked)" },
+    Param { key: "<i>.dns", kind: "address", default: "1.1.1.1", help: "resolver for names" },
+    Param { key: "<i>.max", kind: "number", default: "256", help: "connections at once" },
+    Param { key: "<i>.log", kind: "switch", default: "off", help: "print each connection" },
+];
+
 impl Module for Proxy {
     fn name(&self) -> &'static str {
         "proxy"
+    }
+
+    fn params(&self) -> &'static [Param] {
+        PARAMS
     }
 
     fn caps(&self) -> Caps {

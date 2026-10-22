@@ -55,7 +55,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Frame, Module, Offload, Packet, Sys, Verdict, say};
+use rustros_api::{Caps, Frame, Module, Offload, Packet, Param, Sys, Verdict, say};
 use rustros_util::wire::{Ip, IpFmt, checksum, parse_cidr, parse_ip};
 use l2tp_core::{Account, Client, ClientConfig, ClientEvent, Config, DATA_HEADER, Data, Event, Peer, Server, data_header};
 use nat_core::{Inbound, Nat, icmp_error};
@@ -934,9 +934,30 @@ impl L2tpModule {
     }
 }
 
+/// The settings, for user interfaces (`Module::params`).
+const PARAMS: &[Param] = &[
+    Param { key: "client.<name>.server", kind: "text", default: "", help: "the server to dial, a.b.c.d[:port]" },
+    Param { key: "client.<name>.user", kind: "text", default: "", help: "" },
+    Param { key: "client.<name>.password", kind: "secret", default: "", help: "PAP or CHAP-MD5" },
+    Param { key: "client.<name>.hosts", kind: "list", default: "", help: "LAN hosts or networks whose traffic goes through it" },
+    Param { key: "client.<name>.nat", kind: "switch", default: "on", help: "translate them to the tunnel's address (off: route them in)" },
+    Param { key: "client.<name>.src", kind: "address", default: "", help: "our address to dial from" },
+    Param { key: "client.<name>.mtu", kind: "number", default: "1400", help: "" },
+    Param { key: "[<i>.]bind", kind: "text", default: "", help: "the address to serve, or off (default instance: the ones no other binds)" },
+    Param { key: "[<i>.]user.<name>", kind: "secret", default: "", help: "accounts: password[@egress] (none at all: anyone may connect!)" },
+    Param { key: "[<i>.]egress", kind: "address", default: "", help: "default egress (default: the bind address)" },
+    Param { key: "[<i>.]pool", kind: "address", default: "10.0.0.0", help: "client /24, server at .1" },
+    Param { key: "[<i>.]dns", kind: "list", default: "8.8.8.8,1.1.1.1", help: "" },
+    Param { key: "[<i>.]mtu", kind: "number", default: "1400", help: "tunnel MTU (TCP MSS clamped to it)" },
+];
+
 impl Module for L2tpModule {
     fn name(&self) -> &'static str {
         "l2tp"
+    }
+
+    fn params(&self) -> &'static [Param] {
+        PARAMS
     }
 
     fn order(&self) -> i32 {

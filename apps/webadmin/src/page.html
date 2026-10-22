@@ -34,6 +34,18 @@ button.d{color:var(--bad);border-color:var(--bad)}
 .banner{padding:10px 14px;border-radius:8px;margin-bottom:14px;border:1px solid var(--warn);color:var(--warn)}
 #login{max-width:360px;margin:12vh auto}
 .tbl{overflow-x:auto}
+a{color:var(--acc)}
+.form{display:grid;grid-template-columns:minmax(120px,max-content) minmax(0,1fr);gap:8px 14px;align-items:start}
+.form label{padding-top:6px;color:var(--mut);word-break:break-all}
+.form .f{display:flex;flex-direction:column;gap:2px}
+.form .f input:not([type=checkbox]),.form .f select{width:100%;max-width:420px}
+.form .h{font-size:12px;color:var(--mut)}
+.inst{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:10px 0}
+.inst h4{margin:0 0 8px;font-size:14px;display:flex;gap:8px;align-items:center}
+.inst h4 .sp{flex:1}
+.sub{margin:10px 0 4px;font-weight:600}
+.dirty{outline:2px solid var(--warn)}
+@media (max-width:600px){.form{grid-template-columns:1fr}.form label{padding-top:0}}
 </style>
 </head>
 <body>
@@ -70,7 +82,8 @@ button.d{color:var(--bad);border-color:var(--bad)}
 
 <section id="t-mods" hidden>
   <div class="card"><h3>模块</h3><div class="tbl"><table id="modt"></table></div></div>
-  <div class="card"><h3>模块设置</h3>
+  <div id="modpage"></div>
+  <div class="card"><h3>原始设置（键值）</h3>
     <div class="row"><select id="mname"></select><input id="mkey" placeholder="设置项，如 srcnat.10.20.0.1"><input id="mval" class="grow" placeholder="值（留空则删除）"><button class="b p" id="mset">设置</button></div>
     <div id="mcfg"></div>
   </div>
@@ -140,14 +153,15 @@ $("out").onclick=async()=>{await api("/api/logout",{});showLogin()};
 
 // each page has its own address (#net, #mods, ...): reload, back and forward work
 const TABS=["status","net","mods","log","sys"];
-const fromHash=()=>{const h=location.hash.slice(1);return TABS.includes(h)?h:"status"};
+const fromHash=()=>{const h=location.hash.slice(1).split("/")[0];return TABS.includes(h)?h:"status"};
+const hashMod=()=>decodeURIComponent(location.hash.slice(1).split("/")[1]||"");
 let cur=fromHash(),timer=null;
 function tab(t){cur=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
   ["status","net","mods","log","sys"].forEach(x=>$("t-"+x).hidden=x!==t);
   clearInterval(timer);const f={status:loadStatus,net:loadNet,mods:loadMods,log:loadLog,sys:()=>{}}[t];
   f().catch(()=>{});if(t==="status"||t==="log"||t==="net")timer=setInterval(()=>f().catch(()=>{}),t==="net"?3000:2000)}
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{location.hash=b.dataset.t});
-window.addEventListener("hashchange",()=>{if(!$("app").hidden)tab(fromHash())});
+window.addEventListener("hashchange",()=>{if($("app").hidden)return;if(fromHash()===cur&&cur==="mods")modPage(mods.find(m=>m.name===hashMod()));else tab(fromHash())});
 
 const fmtUp=s=>`${Math.floor(s/86400)}天 ${String(Math.floor(s/3600)%24).padStart(2,"0")}:${String(Math.floor(s/60)%60).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
 async function loadStatus(){
@@ -190,11 +204,12 @@ async function loadMods(){
   const d=await api("/api/modules");mods=d.modules;
   const kb=b=>b==null?"-":Math.ceil(b/1024)+" KiB";
   $("modt").innerHTML="<tr><th>模块</th><th>运行</th><th>状态</th><th>native</th><th>wasm</th><th>重启</th><th></th></tr>"+mods.map(m=>
-    `<tr><td>${esc(m.name)}</td><td>${m.running?esc(m.running):"<span class=bad>未运行</span>"}</td><td>${esc(m.state)}${m.off?`<div class=bad>native 因崩溃已停用：${esc(m.off)}</div>`:""}</td><td>${kb(m.native)}</td><td>${kb(m.wasm)}</td><td>${m.restarts}</td><td>`+
+    `<tr><td><a href="#mods/${encodeURIComponent(m.name)}">${esc(m.name)}</a></td><td>${m.running?esc(m.running):"<span class=bad>未运行</span>"}</td><td>${esc(m.state)}${m.off?`<div class=bad>native 因崩溃已停用：${esc(m.off)}</div>`:""}</td><td>${kb(m.native)}</td><td>${kb(m.wasm)}</td><td>${m.restarts}</td><td>`+
     (m.native!=null&&m.running!=="native"?`<button class="b" onclick="modAct('${esc(m.name)}','native')">切到 native</button>`:"")+
     (m.wasm!=null&&m.running!=="wasm"?`<button class="b" onclick="modAct('${esc(m.name)}','wasm')">切到 wasm</button>`:"")+`</td></tr>`).join("")+
     `<tr><td colspan=7 class=mut>内置：${esc(d.running.filter(n=>!mods.some(m=>m.name===n)).join(", "))}</td></tr>`;
-  const sel=$("mname"),keep=sel.value;sel.innerHTML=mods.map(m=>`<option>${esc(m.name)}</option>`).join("");if(keep)sel.value=keep;showCfg()}
+  const sel=$("mname"),keep=hashMod()||sel.value;sel.innerHTML=mods.map(m=>`<option>${esc(m.name)}</option>`).join("");if(keep)sel.value=keep;showCfg();
+  modPage(mods.find(m=>m.name===hashMod()))}
 function showCfg(){const m=mods.find(x=>x.name===$("mname").value);
   $("mcfg").innerHTML=m&&m.config.length?"<table>"+m.config.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td><td><button class="b" onclick="editCfg(this)" data-k="${esc(k)}" data-v="${esc(v)}">编辑</button> <button class="b d" onclick="delCfg(this)" data-k="${esc(k)}">删除</button></td></tr>`).join("")+"</table>":"<p class=mut>没有设置</p>"}
 $("mname").onchange=showCfg;
@@ -205,6 +220,108 @@ function editCfg(b){$("mkey").value=b.dataset.k;$("mkey").oninput();$("mval").va
 async function delCfg(b){if(!confirm("删除设置 "+b.dataset.k+"？"))return;await modCall({name:$("mname").value,action:"del",key:b.dataset.k})}
 $("mset").onclick=()=>{const k=$("mkey").value.trim(),v=$("mval").value.trim();if(!k)return;modCall({name:$("mname").value,action:v?"set":"del",key:k,value:v})};
 async function modCall(f){try{const r=await api("/api/module",f);if(!r.ok)alert(r.out)}catch(e){alert(e.message)}setTimeout(()=>loadMods().catch(()=>{}),600)}
+// ---- module pages, generated from the settings each module describes (params)
+// a param: [key pattern, kind, default, help]; "<x>" a name the user picks
+// (an instance when more follows, a table row at the end), "[<i>.]" an
+// optional instance prefix (none: the default instance)
+const KIND={text:"文本",number:"数字",switch:"开关",secret:"密码",address:"地址或接口",network:"网段",list:"列表（逗号分隔）"};
+function compile(p,i){
+  let k=p[0],opt=false;if(k.startsWith("[<i>.]")){opt=true;k="<i>."+k.slice(6)}
+  const segs=[];let rest=k;
+  while(rest){const m=rest.match(/^<[^>]*>/);if(m){segs.push({hole:m[0].slice(1,-1)});rest=rest.slice(m[0].length)}
+    else{const j=rest.indexOf("<");segs.push({lit:j<0?rest:rest.slice(0,j)});rest=j<0?"":rest.slice(j)}}
+  const re=segs.map((g,n)=>g.lit!=null?g.lit.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"):(n===segs.length-1?"(.+)":(opt&&n===0?"([^.]+)?":"([^.]+)"))).join("");
+  const src=opt?re.replace(/^\(\[\^\.\]\+\)\?\\\./,"(?:([^.]+)\\.)?"):re;
+  const lits=segs.reduce((a,g)=>a+(g.lit||"").length,0);
+  return {i,key:p[0],kind:p[1],def:p[2],help:p[3],segs,opt,re:new RegExp("^"+src+"$"),lits}}
+// the tree of a module's page: fields, tables (maps) and instance groups (colls)
+function tree(ps){
+  const root={fields:[],maps:[],colls:[]};
+  for(const p of ps){let node=root,lit="",n=0,depth=0;
+    for(;n<p.segs.length;n++){const g=p.segs[n];
+      if(g.lit!=null){lit+=g.lit;continue}
+      if(n===p.segs.length-1){node.maps.push({p,lit,depth});break}
+      let c=node.colls.find(c=>c.lit===lit&&c.hole===g.hole);
+      if(!c){c={lit,hole:g.hole,opt:p.opt&&depth===0&&lit==="",depth,fields:[],maps:[],colls:[]};node.colls.push(c)}
+      node=c;lit="";depth++;
+      // the dot after the name belongs to the instance
+      if(p.segs[n+1]&&p.segs[n+1].lit&&p.segs[n+1].lit.startsWith(".")){p.segs[n+1]={lit:p.segs[n+1].lit.slice(1)}}}
+    if(n===p.segs.length)node.fields.push({p,lit})}
+  return root}
+function modPage(m){
+  const box=$("modpage");
+  if(!m){box.innerHTML="";return}
+  const ps=m.params.map(compile),cfg=Object.fromEntries(m.config);
+  // which setting each stored key is (the most specific pattern first)
+  const order=[...ps].sort((a,b)=>b.lits-a.lits),hit={},other=[];
+  for(const [k] of m.config){let f=null;for(const p of order){const x=k.match(p.re);if(x){f={p,caps:x.slice(1)};break}}
+    if(f)hit[k]=f;else other.push(k)}
+  const t=tree(ps);
+  const head=`<h3>${esc(m.name)} <span class="mut" style="font-weight:400">· ${esc(m.state)}</span></h3>`;
+  if(!ps.length){box.innerHTML=`<div class="card">${head}<p class="mut">这个模块没有声明它的设置项，请用下面的原始设置。</p></div>`;return}
+  COLLS.length=0;
+  const html=renderNode(t,"",[],cfg,hit,m.name);
+  const oth=other.length?`<div class="sub">其他设置</div><table>${other.map(k=>`<tr><td>${esc(k)}</td><td>${esc(cfg[k])}</td></tr>`).join("")}</table>`:"";
+  box.innerHTML=`<div class="card" id="mp">${head}${html}${oth}<div class="row"><button class="b p" id="mpsave">保存修改</button><span id="mpmsg" class="mut"></span></div></div>`;
+  box.querySelectorAll("[data-k]").forEach(e=>e.addEventListener("input",()=>e.classList.toggle("dirty",val(e)!==e.dataset.o)));
+  $("mpsave").onclick=()=>saveForm(m.name)}
+function fieldHtml(key,p,cfg){
+  const v=cfg[key],id="f"+Math.random().toString(36).slice(2),def=p.def?`默认：${p.def}`:"";
+  let inp;
+  if(p.kind==="switch"){const on=(v??p.def)==="on";inp=`<label style="padding:0"><input type=checkbox id=${id} data-k="${esc(key)}" data-sw=1 data-o="${v==null?"":on?"on":"off"}" ${on?"checked":""}> 启用</label>`}
+  else if(p.kind==="secret")inp=`<input type=password id=${id} data-k="${esc(key)}" data-sec=1 data-o="" autocomplete="new-password" placeholder="${v!=null?"已设置（留空不修改）":"未设置"}">`;
+  else if(p.kind.startsWith("choice:")){const opts=p.kind.slice(7).split("|");inp=`<select id=${id} data-k="${esc(key)}" data-o="${esc(v??"")}"><option value="">${esc(def||"（不设置）")}</option>${opts.map(o=>`<option ${v===o?"selected":""}>${esc(o)}</option>`).join("")}</select>`}
+  else inp=`<input ${p.kind==="number"?"type=number":""} id=${id} data-k="${esc(key)}" data-o="${esc(v??"")}" value="${esc(v??"")}" placeholder="${esc(def)}">`;
+  const h=[p.help,KIND[p.kind]&&p.kind!=="text"?KIND[p.kind]:"",p.kind!=="secret"&&p.kind!=="switch"&&!p.kind.startsWith("choice")?"":""].filter(Boolean).join(" · ");
+  return `<label for=${id}>${esc(key.split(".").pop()===""?key:p.key.replace(/^.*\.(?=[^.<]*$)/,""))}</label><div class=f>${inp}${h?`<span class=h>${esc(h)}</span>`:""}</div>`}
+function renderNode(node,prefix,caps,cfg,hit,mod){
+  let o="";
+  if(node.fields.length)o+=`<div class=form>${node.fields.map(f=>fieldHtml(prefix+f.lit,f.p,cfg)).join("")}</div>`;
+  for(const mp of node.maps){
+    const names=Object.entries(hit).filter(([k,h])=>h.p===mp.p&&same(h.caps,caps)).map(([k,h])=>[k,h.caps[h.caps.length-1]]);
+    const base=prefix+mp.lit,hole=mp.p.segs[mp.p.segs.length-1].hole;
+    o+=`<div class="sub">${esc(base+"<"+hole+">")} <span class="h mut" style="font-weight:400">${esc(mp.p.help||"")}</span></div><table>`+
+      names.map(([k,n])=>`<tr><td>${esc(n)}</td><td>${mp.p.kind==="secret"?`<input type=password data-k="${esc(k)}" data-sec=1 data-o="" placeholder="已设置（留空不修改）">`:`<input data-k="${esc(k)}" data-o="${esc(cfg[k])}" value="${esc(cfg[k])}">`}</td><td><button class="b d" onclick="delKey('${esc(mod)}','${esc(k)}')">删除</button></td></tr>`).join("")+
+      `<tr><td><input placeholder="${esc(hole)}" data-new="${esc(base)}"></td><td><input ${mp.p.kind==="secret"?"type=password":""} placeholder="${esc(mp.p.def||KIND[mp.p.kind]||"")}" data-newv=1></td><td><button class="b" onclick="addRow(this,'${esc(mod)}')">添加</button></td></tr></table>`}
+  for(const c of node.colls){
+    const ps=allParams(c),seen=new Set();
+    for(const h of Object.values(hit))if(ps.includes(h.p)&&same(h.caps.slice(0,caps.length),caps))seen.add(h.caps[caps.length]??"");
+    if(c.opt)seen.add("");
+    const label=c.lit?`${c.lit}<${c.hole}>`:`<${c.hole}>`;
+    o+=`<div class="sub">${esc(label)}：${c.opt?"实例（未命名的是默认实例）":"实例"}</div>`;
+    for(const inst of [...seen].sort()){
+      const pre=prefix+c.lit+(inst===""?"":inst+".");
+      o+=`<div class=inst><h4>${inst===""?"默认实例":esc(inst)}<span class=sp></span>${`<button class="b d" onclick="delInst('${esc(mod)}','${esc(pre)}',${inst===""})">删除实例</button>`}</h4>${renderNode(c,pre,[...caps,inst===""?undefined:inst],cfg,hit,mod)}</div>`}
+    COLLS.push(c);
+    o+=`<div class=row><input placeholder="新${esc(c.hole)}名称" data-ninst="${esc(prefix+c.lit)}"><button class="b" onclick="newInst(this,${COLLS.length-1})">新建实例</button></div>`}
+  return o}
+// the instance groups of the page shown, for "new instance" buttons
+const COLLS=[];
+const same=(a,b)=>a.length>=b.length&&b.every((x,i)=>(x??"")===(a[i]??""));
+const allParams=n=>[...n.fields.map(f=>f.p),...n.maps.map(m=>m.p),...n.colls.flatMap(allParams)];
+const val=e=>e.dataset.sw?(e.checked?"on":"off"):e.value.trim();
+async function saveForm(mod){
+  const ch=[...$("mp").querySelectorAll("[data-k]")].filter(e=>val(e)!==e.dataset.o&&!(e.dataset.sec&&!e.value));
+  if(!ch.length){$("mpmsg").textContent="没有修改";return}
+  $("mpmsg").textContent="保存中…";
+  for(const e of ch){const v=val(e);const r=await api("/api/module",{name:mod,action:v?"set":"del",key:e.dataset.k,value:v});if(!r.ok){alert(e.dataset.k+": "+r.out);break}}
+  $("mpmsg").textContent=`已保存 ${ch.length} 项`;setTimeout(()=>loadMods().catch(()=>{}),600)}
+async function addRow(b,mod){const tr=b.closest("tr"),n=tr.querySelector("[data-new]"),v=tr.querySelector("[data-newv]");
+  if(!n.value.trim()||!v.value.trim()){alert("名称和值都要填");return}
+  await modCall({name:mod,action:"set",key:n.dataset.new+"."+n.value.trim(),value:v.value.trim()})}
+async function delKey(mod,k){if(confirm("删除 "+k+"？"))await modCall({name:mod,action:"del",key:k})}
+async function delInst(mod,pre,def){
+  const m=mods.find(x=>x.name===mod),ps=m.params.map(compile);
+  // the default instance's keys have no prefix: only those its settings describe
+  const keys=m.config.map(c=>c[0]).filter(k=>def?ps.some(p=>p.opt&&k.match(p.re)&&!k.match(p.re)[1]):k.startsWith(pre));
+  if(!keys.length||!confirm(`删除这个实例的 ${keys.length} 项设置？\n`+keys.join("\n")))return;
+  for(const k of keys)await api("/api/module",{name:mod,action:"del",key:k});setTimeout(()=>loadMods().catch(()=>{}),600)}
+function newInst(b,ci){const i=b.previousElementSibling,n=i.value.trim();if(!/^[A-Za-z0-9_-]+$/.test(n)){alert("名称只能用字母、数字、- 和 _");return}
+  // an empty instance card: its settings get stored once saved
+  const pre=i.dataset.ninst+n+".",m=mods.find(x=>x.name===hashMod()||x.name===$("mname").value);
+  const div=document.createElement("div");div.className="inst";
+  div.innerHTML=`<h4>${esc(n)}（新）</h4>`+renderNode(COLLS[ci],pre,[n],{},{},m.name);
+  b.parentElement.before(div);div.querySelectorAll("[data-k]").forEach(e=>e.addEventListener("input",()=>e.classList.toggle("dirty",val(e)!==e.dataset.o)))}
 function modAct(n,a){if(confirm(`把 ${n} 切到 ${a}？`))modCall({name:n,action:a})}
 
 async function loadLog(){
