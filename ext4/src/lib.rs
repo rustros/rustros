@@ -15,13 +15,17 @@
 //! What it makes: 4 KiB blocks, 128 MiB block groups, 256-byte inodes,
 //! files and directories mapped by extents (trees of any depth), linear
 //! directories, a journal sized as mke2fs sizes it; features `extents`,
-//! `filetype`, `sparse_super`, `large_file`, `extra_isize`, `has_journal`;
-//! no checksums yet.
+//! `filetype`, `sparse_super`, `large_file`, `huge_file`, `dir_nlink`,
+//! `extra_isize`, `has_journal`, `64bit`, `metadata_csum` (with its seed)
+//! — what mke2fs makes by default, less dir_index and flex_bg.
 //!
-//! What it reads: also file systems Linux made (flex_bg, 64-bit, checksums
-//! are ignored when reading; their journal is replayed, in memory if the
-//! disk is not ours to write). It writes only to those whose features it
-//! keeps up (it refuses the rest instead of damaging them).
+//! What it reads and writes: also file systems Linux made with its
+//! defaults (flex_bg, groups left uninitialised, hash-indexed directories,
+//! which become plain ones when they change; an orphan list is finished at
+//! mount). Checksums are kept, not checked when reading. It refuses to
+//! write what it does not keep up (orphan_file with orphans in it, quota,
+//! inline data, encryption, case folding, bigalloc, meta_bg ...), and
+//! replays their journal in memory only.
 //!
 //! Mounted writable with a journal, the file system is marked as needing
 //! recovery until `close` (as Linux does while it has one mounted).
@@ -31,12 +35,14 @@
 extern crate alloc;
 
 mod cache;
+mod csum;
 mod dir;
 mod extent;
 mod file;
 mod journal;
 mod ns;
 
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -61,14 +67,18 @@ const INCOMPAT_RECOVER: u32 = 0x4;
 const INCOMPAT_EXTENTS: u32 = 0x40;
 const INCOMPAT_64BIT: u32 = 0x80;
 const INCOMPAT_FLEX_BG: u32 = 0x200;
+const INCOMPAT_CSUM_SEED: u32 = 0x2000;
 const RO_SPARSE_SUPER: u32 = 0x1;
 const RO_LARGE_FILE: u32 = 0x2;
 const RO_HUGE_FILE: u32 = 0x8;
 const RO_DIR_NLINK: u32 = 0x20;
 const RO_EXTRA_ISIZE: u32 = 0x40;
+const RO_METADATA_CSUM: u32 = 0x400;
 /// What this code keeps right when it writes.
-const INCOMPAT_WRITABLE: u32 = INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_FLEX_BG;
-const RO_WRITABLE: u32 = RO_SPARSE_SUPER | RO_LARGE_FILE | RO_HUGE_FILE | RO_DIR_NLINK | RO_EXTRA_ISIZE;
+const INCOMPAT_WRITABLE: u32 = INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_FLEX_BG | INCOMPAT_64BIT | INCOMPAT_CSUM_SEED;
+const RO_WRITABLE: u32 = RO_SPARSE_SUPER | RO_LARGE_FILE | RO_HUGE_FILE | RO_DIR_NLINK | RO_EXTRA_ISIZE | RO_METADATA_CSUM;
+/// The descriptor size of the file systems made here (64-bit).
+const DESC_SIZE: usize = 64;
 
 const S_IFMT: u16 = 0xF000;
 const EXT4_EXTENTS_FL: u32 = 0x80000;
@@ -223,6 +233,13 @@ struct Group {
     free_blocks: u32,
     free_inodes: u32,
     used_dirs: u32,
+    /// BG_INODE_UNINIT, BG_BLOCK_UNINIT, ...
+    flags: u16,
+    /// inodes at the end of the table never used
+    itable_unused: u32,
+    /// bitmap checksums (metadata_csum)
+    bb_csum: u32,
+    ib_csum: u32,
 }
 
 /// A mounted ext4.
@@ -242,6 +259,12 @@ pub struct Fs {
     /// the superblock or group descriptors changed since the last sync
     meta_dirty: bool,
     journal: Option<journal::Journal>,
+    /// metadata_csum: the checksum seed
+    csum: Option<u32>,
+    /// groups whose bitmaps changed since the last sync
+    csum_groups: BTreeSet<usize>,
+    /// the group descriptors as read (fields this code does not know are kept)
+    desc_raw: Vec<u8>,
 }
 
 /// An inode as read from its table.
@@ -425,7 +448,7 @@ impl Fs {
         }
         let groups = blocks.div_ceil(BLOCKS_PER_GROUP as u64) as u32;
         // a last group too small for its metadata is left out
-        let gdt_blocks = (groups as usize * 32).div_ceil(BLOCK) as u64;
+        let gdt_blocks = (groups as usize * DESC_SIZE).div_ceil(BLOCK) as u64;
         let itable_blocks = (INODES_PER_GROUP as usize * INODE_SIZE / BLOCK) as u64;
         let mut groups = groups;
         let mut blocks = blocks;
@@ -446,6 +469,10 @@ impl Fs {
                 free_blocks: 0,
                 free_inodes: INODES_PER_GROUP,
                 used_dirs: 0,
+                flags: 0,
+                itable_unused: 0,
+                bb_csum: 0,
+                ib_csum: 0,
             });
         }
         let mut fs = Fs {
@@ -455,13 +482,16 @@ impl Fs {
             blocks_per_group: BLOCKS_PER_GROUP,
             inodes_per_group: INODES_PER_GROUP,
             inode_size: INODE_SIZE,
-            desc_size: 32,
+            desc_size: DESC_SIZE,
             first_data_block: 0,
             writable: true,
             auto_sync: true,
             cache: cache::Cache::default(),
             meta_dirty: true,
             journal: None,
+            csum: Some(journal::crc32c(!0, &uuid)),
+            csum_groups: (0..groups as usize).collect(),
+            desc_raw: Vec::new(),
         };
         // bitmaps and empty inode tables (straight to the disk: nothing is cached yet)
         let zero = vec![0u8; BLOCK * 16];
@@ -523,8 +553,11 @@ impl Fs {
         put32(sb, 0x54, FIRST_INO);
         put16(sb, 0x58, INODE_SIZE as u16);
         put32(sb, 0x5C, 0); // compat
-        put32(sb, 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
-        put32(sb, 0x64, RO_SPARSE_SUPER | RO_LARGE_FILE | RO_EXTRA_ISIZE);
+        put32(sb, 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_CSUM_SEED);
+        put32(sb, 0x64, RO_SPARSE_SUPER | RO_LARGE_FILE | RO_EXTRA_ISIZE | RO_METADATA_CSUM | RO_HUGE_FILE | RO_DIR_NLINK);
+        put16(sb, 0xFE, DESC_SIZE as u16);
+        sb[0x175] = 1; // crc32c
+        put32(sb, 0x270, journal::crc32c(!0, &uuid)); // the checksum seed, kept should the UUID change
         sb[0x68..0x78].copy_from_slice(&uuid);
         let l = label.as_bytes();
         sb[0x78..0x78 + l.len().min(16)].copy_from_slice(&l[..l.len().min(16)]);
@@ -574,6 +607,10 @@ impl Fs {
                 // until close: what is on the disk may need the log
                 fs.set_recover(v, true)?;
             }
+        }
+        if fs.writable && le32(&fs.sb, 0xE8) != 0 {
+            let now = le32(&fs.sb, 0x30);
+            fs.change(v, |fs, v| fs.process_orphans(v, now))?;
         }
         Ok(fs)
     }
@@ -629,11 +666,17 @@ impl Fs {
                     free_blocks: le16(d, 0xC) as u32 | hi16(d, 0x2C) << 16,
                     free_inodes: le16(d, 0xE) as u32 | hi16(d, 0x2E) << 16,
                     used_dirs: le16(d, 0x10) as u32 | hi16(d, 0x30) << 16,
+                    flags: le16(d, 0x12),
+                    itable_unused: le16(d, 0x1C) as u32 | hi16(d, 0x32) << 16,
+                    bb_csum: le16(d, 0x18) as u32 | hi16(d, 0x38) << 16,
+                    ib_csum: le16(d, 0x1A) as u32 | hi16(d, 0x3A) << 16,
                 }
             })
             .collect();
         // writable only with what this code keeps up (the journal may say otherwise)
-        let writable = (incompat & !INCOMPAT_RECOVER) & !INCOMPAT_WRITABLE == 0 && ro & !RO_WRITABLE == 0 && !bit64;
+        let writable = (incompat & !INCOMPAT_RECOVER) & !INCOMPAT_WRITABLE == 0 && ro & !RO_WRITABLE == 0 && (!bit64 || desc_size >= 64);
+        let csum = (ro & RO_METADATA_CSUM != 0).then(|| if incompat & INCOMPAT_CSUM_SEED != 0 { le32(&sb, 0x270) } else { journal::crc32c(!0, &sb[0x68..0x78]) });
+        gdt.truncate(ngroups * desc_size);
         Ok(Fs {
             sb,
             groups,
@@ -648,6 +691,9 @@ impl Fs {
             cache: cache::Cache::default(),
             meta_dirty: false,
             journal: None,
+            csum,
+            csum_groups: BTreeSet::new(),
+            desc_raw: gdt,
         })
     }
 
@@ -672,6 +718,7 @@ impl Fs {
         put32(&mut self.sb, 0x60, f);
         let mut b0 = v.block(0)?;
         put32(&mut b0, 1024 + 0x60, f);
+        self.seal_sb(&mut b0[1024..2048]);
         v.write(0, &b0)?;
         self.forget(0, 1);
         Ok(())
@@ -687,13 +734,14 @@ impl Fs {
     /// The superblock (in block 0) and the group descriptors into the cache,
     /// to go out with the rest at sync.
     fn render_meta(&mut self, v: &mut Vol) -> R<()> {
-        let free_blocks: u64 = self.groups.iter().map(|g| g.free_blocks as u64).sum();
-        let free_inodes: u32 = self.groups.iter().map(|g| g.free_inodes).sum();
-        put32(&mut self.sb, 0x0C, free_blocks as u32);
-        put32(&mut self.sb, 0x10, free_inodes);
+        for g in core::mem::take(&mut self.csum_groups) {
+            self.bitmap_csums(v, g)?;
+        }
+        self.count_free();
         let gdt = self.gdt();
         let mut sb = self.sb.clone();
         put16(&mut sb, 0x5A, 0);
+        self.seal_sb(&mut sb);
         let off = if self.first_data_block == 0 { 1024 } else { 0 };
         let b0 = self.mread(v, self.first_data_block)?;
         if b0[off..off + 1024] != sb[..] {
@@ -706,27 +754,60 @@ impl Fs {
         Ok(())
     }
 
+    /// The free counts into the superblock.
+    fn count_free(&mut self) {
+        let free_blocks: u64 = self.groups.iter().map(|g| g.free_blocks as u64).sum();
+        let free_inodes: u32 = self.groups.iter().map(|g| g.free_inodes).sum();
+        put32(&mut self.sb, 0x0C, free_blocks as u32);
+        put32(&mut self.sb, 0x10, free_inodes);
+        if self.desc_size >= 64 {
+            put32(&mut self.sb, 0x158, (free_blocks >> 32) as u32);
+        }
+    }
+
+    /// The group descriptor table (fields not kept here as they were read).
     fn gdt(&self) -> Vec<u8> {
         let gdt_blocks = (self.groups.len() * self.desc_size).div_ceil(BLOCK);
         let mut gdt = vec![0u8; gdt_blocks * BLOCK];
+        gdt[..self.desc_raw.len()].copy_from_slice(&self.desc_raw);
+        let wide = self.desc_size >= 64;
         for (i, g) in self.groups.iter().enumerate() {
             let d = &mut gdt[i * self.desc_size..(i + 1) * self.desc_size];
-            put32(d, 0, g.block_bitmap as u32);
-            put32(d, 4, g.inode_bitmap as u32);
-            put32(d, 8, g.inode_table as u32);
-            put16(d, 0xC, g.free_blocks as u16);
-            put16(d, 0xE, g.free_inodes as u16);
-            put16(d, 0x10, g.used_dirs as u16);
+            let lo_hi32 = |d: &mut [u8], lo: usize, hi: usize, x: u64| {
+                put32(d, lo, x as u32);
+                if wide {
+                    put32(d, hi, (x >> 32) as u32);
+                }
+            };
+            lo_hi32(d, 0, 0x20, g.block_bitmap);
+            lo_hi32(d, 4, 0x24, g.inode_bitmap);
+            lo_hi32(d, 8, 0x28, g.inode_table);
+            let lo_hi16 = |d: &mut [u8], lo: usize, hi: usize, x: u32| {
+                put16(d, lo, x as u16);
+                if wide {
+                    put16(d, hi, (x >> 16) as u16);
+                }
+            };
+            lo_hi16(d, 0xC, 0x2C, g.free_blocks);
+            lo_hi16(d, 0xE, 0x2E, g.free_inodes);
+            lo_hi16(d, 0x10, 0x30, g.used_dirs);
+            put16(d, 0x12, g.flags);
+            lo_hi16(d, 0x1C, 0x32, g.itable_unused);
+            if self.csum.is_some() {
+                lo_hi16(d, 0x18, 0x38, g.bb_csum);
+                lo_hi16(d, 0x1A, 0x3A, g.ib_csum);
+            }
+            self.seal_desc(d, i);
         }
         gdt
     }
 
     /// Group descriptors and the superblock to disk (`backups`: also the copies).
     fn write_meta(&mut self, v: &mut Vol, backups: bool) -> R<()> {
-        let free_blocks: u64 = self.groups.iter().map(|g| g.free_blocks as u64).sum();
-        let free_inodes: u32 = self.groups.iter().map(|g| g.free_inodes).sum();
-        put32(&mut self.sb, 0x0C, free_blocks as u32);
-        put32(&mut self.sb, 0x10, free_inodes);
+        for g in core::mem::take(&mut self.csum_groups) {
+            self.bitmap_csums(v, g)?;
+        }
+        self.count_free();
         let gdt = self.gdt();
         let ngroups = if backups { self.groups.len() as u32 } else { 1 };
         for g in (0..ngroups).filter(|&g| has_super(g)) {
@@ -735,6 +816,7 @@ impl Fs {
             let off = if g == 0 { 1024 } else { 0 };
             let mut sb = self.sb.clone();
             put16(&mut sb, 0x5A, g as u16); // block group number of this copy
+            self.seal_sb(&mut sb);
             b[off..off + 1024].copy_from_slice(&sb);
             v.write(first, &b)?;
             v.write(first + 1, &gdt)?;
@@ -771,8 +853,10 @@ impl Fs {
 
     fn write_inode(&mut self, v: &mut Vol, i: &Inode) -> R<()> {
         let (b, off) = self.inode_loc(i.ino);
+        let mut raw = i.raw.clone();
+        self.seal_inode(&mut raw, i.ino);
         let size = self.inode_size;
-        self.mmod(v, b)?[off..off + size].copy_from_slice(&i.raw);
+        self.mmod(v, b)?[off..off + size].copy_from_slice(&raw);
         Ok(())
     }
 
@@ -800,6 +884,11 @@ impl Fs {
         let i = (ino - 1) as usize;
         let g = i / self.inodes_per_group as usize;
         let bit = i % self.inodes_per_group as usize;
+        self.init_group(g)?;
+        if used {
+            self.note_itable_use(g, bit as u32);
+        }
+        self.bitmaps_changed(g);
         let bm = self.mmod(v, self.groups[g].inode_bitmap)?;
         let was = bm[bit / 8] & (1 << (bit % 8)) != 0;
         if used {
@@ -827,6 +916,17 @@ impl Fs {
         Ok(())
     }
 
+    /// Where a new directory in `parent` goes: one in the root to the group
+    /// with the most free inodes (spread out, as Linux does), others near
+    /// their parent.
+    fn dir_group(&self, parent: u32) -> usize {
+        if parent != ROOT {
+            return self.group_of_ino(parent);
+        }
+        let avg = self.groups.iter().map(|g| g.free_blocks as u64).sum::<u64>() / self.groups.len() as u64;
+        (0..self.groups.len()).filter(|&g| self.groups[g].free_blocks as u64 >= avg).max_by_key(|&g| (self.groups[g].free_inodes, core::cmp::Reverse(g))).unwrap_or(0)
+    }
+
     /// A free inode, looking from group `near` on.
     fn alloc_inode(&mut self, v: &mut Vol, dir: bool, near: usize) -> R<u32> {
         let n = self.groups.len();
@@ -836,6 +936,7 @@ impl Fs {
                 continue;
             }
             let ipg = self.inodes_per_group as usize;
+            self.init_group(g)?;
             let bm = self.mread(v, self.groups[g].inode_bitmap)?;
             let found = (0..ipg).find(|&bit| bm[bit / 8] & (1 << (bit % 8)) == 0 && (g * ipg + bit + 1) as u32 >= FIRST_INO);
             if let Some(bit) = found {
@@ -867,7 +968,8 @@ impl Fs {
             if self.groups[g].free_blocks == 0 || from >= to {
                 continue;
             }
-            let bm = self.mread(v, self.groups[g].block_bitmap)?;
+            self.init_group(g)?;
+            let bm = self.mread(v, self.groups[g].block_bitmap)?.to_vec();
             let mut run_start = None;
             let mut bit = from;
             while bit <= to {
@@ -907,7 +1009,7 @@ impl Fs {
             bm[b / 8] |= 1 << (b % 8);
         }
         self.groups[g].free_blocks -= len;
-        self.meta_dirty = true;
+        self.bitmaps_changed(g);
         Ok((len, self.group_first_block(g) + first_bit as u64))
     }
 
@@ -919,6 +1021,8 @@ impl Fs {
             let g = (rel / self.blocks_per_group as u64) as usize;
             let bit = (rel % self.blocks_per_group as u64) as usize;
             let n = (first + len - b).min((self.blocks_per_group as usize - bit) as u64) as usize;
+            self.init_group(g)?;
+            self.bitmaps_changed(g);
             let bm = self.mmod(v, self.groups[g].block_bitmap)?;
             for k in bit..bit + n {
                 bm[k / 8] &= !(1 << (k % 8));
@@ -953,6 +1057,7 @@ impl Fs {
                 self.free_blocks(v, xb, 1)?;
             } else {
                 put32(blk, 4, refs - 1);
+                self.seal_xattr(v, xb)?;
             }
         }
         i.set_links(0);

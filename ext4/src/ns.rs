@@ -101,7 +101,7 @@ impl Fs {
         if self.read_inode(v, dir)?.links() >= MAX_LINKS {
             return Err(Error::TooManyLinks);
         }
-        let ino = self.alloc_inode(v, true, self.group_of_ino(dir))?;
+        let ino = self.alloc_inode(v, true, self.dir_group(dir))?;
         let mut i = self.blank_inode(ino, Kind::Dir, perm, uid, gid, now);
         if let Err(e) = self.init_dir(v, &mut i, dir) {
             self.mark_inode(v, ino, false, true)?;

@@ -189,6 +189,12 @@ impl Fs {
                 for (k, e) in es.iter().enumerate() {
                     node[12 + k * 12..24 + k * 12].copy_from_slice(e);
                 }
+                if let Some(seed) = self.csum.map(|_| self.seed_of(i)) {
+                    // the checksum tail after the entries
+                    let t = 12 + 12 * PER_BLOCK;
+                    let c = crate::journal::crc32c(seed, &node[..t]);
+                    put32(&mut node, t, c);
+                }
                 if fresh.contains(&b) {
                     self.mzero(b).copy_from_slice(&node);
                 } else {

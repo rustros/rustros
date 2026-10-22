@@ -36,8 +36,10 @@ const TAG_LAST: u32 = 8;
 
 /// The journal's inode.
 pub(crate) const JOURNAL_INO: u32 = 8;
-/// Tags in one of our descriptor blocks (8 bytes each; the first one has the UUID after it).
-const TAGS_PER_DESCRIPTOR: usize = (BLOCK - 12 - 16) / 8;
+/// Tags in one of our descriptor blocks (the first one has the UUID after it).
+fn tags_per_descriptor(tag_size: usize) -> usize {
+    (BLOCK - 12 - 16) / tag_size
+}
 
 fn be32(b: &[u8], o: usize) -> u32 {
     u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
@@ -83,6 +85,8 @@ pub(crate) struct Journal {
     tid: u32,
     /// it can take our transactions (else it is only replayed)
     usable: bool,
+    /// our tags carry 64-bit block numbers (the file system is 64-bit)
+    tag64: bool,
 }
 
 impl Journal {
@@ -217,7 +221,11 @@ impl Fs {
         sb[0x30..0x40].copy_from_slice(uuid);
         put_be32(&mut sb, 0x40, 1); // users
         sb[0x100..0x110].copy_from_slice(uuid);
-        let mut j = Journal { map, sb, len, first: 1, tid: 1, usable: true };
+        let tag64 = self.desc_size >= 64;
+        if tag64 {
+            put_be32(&mut sb, 0x28, INCOMPAT_64BIT);
+        }
+        let mut j = Journal { map, sb, len, first: 1, tid: 1, usable: true, tag64 };
         j.write_sb(v, 0, 1)?;
         Ok(Some((j, i)))
     }
@@ -248,7 +256,8 @@ impl Fs {
             return Err(Error::Corrupt("bad journal superblock"));
         }
         let incompat = if kind == SUPERBLOCK_V2 { be32(&sb, 0x28) } else { 0 };
-        let mut j = Journal { map, len: be32(&sb, 0x10), first: be32(&sb, 0x14), tid: be32(&sb, 0x18), usable: incompat & !INCOMPAT_KNOWN == 0, sb };
+        let tag64 = self.desc_size >= 64;
+        let mut j = Journal { map, len: be32(&sb, 0x10), first: be32(&sb, 0x14), tid: be32(&sb, 0x18), usable: incompat & !INCOMPAT_KNOWN == 0, sb, tag64 };
         if j.first == 0 || j.first >= j.len {
             return Err(Error::Corrupt("bad journal superblock"));
         }
@@ -277,13 +286,17 @@ impl Fs {
             j.tid = next;
         }
         if mine {
-            // from now on, logs as we write them (no checksums, 32-bit tags);
-            // Linux sets its own features again when it mounts
-            if start != 0 || j.incompat() & (INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3 | INCOMPAT_64BIT) != 0 {
+            // from now on, logs as we write them (no checksums; 64-bit tags on
+            // a 64-bit file system); Linux sets its own features again when it mounts
+            let ours = if j.tag64 { INCOMPAT_64BIT } else { 0 };
+            if start != 0 || j.incompat() != ours {
                 if kind == SUPERBLOCK_V2 {
                     for o in [0x24, 0x28, 0x2C, 0xFC] {
                         put_be32(&mut j.sb, o, 0);
                     }
+                    put_be32(&mut j.sb, 0x28, ours);
+                } else if j.tag64 {
+                    return Err(Error::Corrupt("a version 1 journal cannot take 64-bit tags"));
                 }
                 let tid = j.tid;
                 j.write_sb(v, 0, tid)?;
@@ -389,13 +402,15 @@ impl Fs {
     }
 
     fn commit_in(&mut self, v: &mut Vol, j: &mut Journal, dirty: &[u64]) -> R<()> {
+        let tag_size = if j.tag64 { 12 } else { 8 };
+        let tags = tags_per_descriptor(tag_size);
         let room = (j.len - j.first - 1) as usize; // blocks for descriptors and copies, less the commit block
-        let per = room / (TAGS_PER_DESCRIPTOR + 1) * TAGS_PER_DESCRIPTOR + (room % (TAGS_PER_DESCRIPTOR + 1)).saturating_sub(1);
+        let per = room / (tags + 1) * tags + (room % (tags + 1)).saturating_sub(1);
         let uuid = self.sb[0x68..0x78].to_vec();
         for part in dirty.chunks(per.max(1)) {
             let tid = j.tid;
-            let mut log = Vec::with_capacity((part.len() + part.len().div_ceil(TAGS_PER_DESCRIPTOR)) * BLOCK);
-            for group in part.chunks(TAGS_PER_DESCRIPTOR) {
+            let mut log = Vec::with_capacity((part.len() + part.len().div_ceil(tags)) * BLOCK);
+            for group in part.chunks(tags) {
                 let mut d = vec![0u8; BLOCK];
                 put_be32(&mut d, 0, MAGIC);
                 put_be32(&mut d, 4, DESCRIPTOR);
@@ -417,7 +432,10 @@ impl Fs {
                     }
                     put_be32(&mut d, at, b as u32);
                     d[at + 6..at + 8].copy_from_slice(&(flags as u16).to_be_bytes());
-                    at += 8;
+                    if j.tag64 {
+                        put_be32(&mut d, at + 8, (b >> 32) as u32);
+                    }
+                    at += tag_size;
                     if k == 0 {
                         d[at..at + 16].copy_from_slice(&uuid);
                         at += 16;

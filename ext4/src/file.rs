@@ -190,7 +190,8 @@ impl Fs {
         if size.div_ceil(B) > u32::MAX as u64 {
             return Err(Error::TooBig);
         }
-        if size < i.size() {
+        // (the same length too: blocks past it, as an unfinished truncate leaves them)
+        if size <= i.size() {
             let keep = size.div_ceil(B);
             let mut out = Vec::new();
             for e in self.runs(v, i)? {

@@ -55,11 +55,22 @@ impl Sparse {
     }
 
     pub fn load(path: &str) -> Sparse {
-        let data = std::fs::read(path).unwrap();
-        let mut d = Sparse { sectors: BTreeMap::new(), size: data.len() as u64 / 512 };
-        for (i, c) in data.chunks(512).enumerate() {
-            if c.iter().any(|&b| b != 0) {
-                d.sectors.insert(i as u64, c.try_into().unwrap());
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).unwrap();
+        let len = f.metadata().unwrap().len();
+        let mut d = Sparse { sectors: BTreeMap::new(), size: len / 512 };
+        let mut buf = vec![0u8; 1 << 20];
+        let mut lba = 0u64;
+        loop {
+            let n = f.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            for c in buf[..n].chunks(512) {
+                if c.iter().any(|&b| b != 0) {
+                    d.sectors.insert(lba, c.try_into().unwrap());
+                }
+                lba += 1;
             }
         }
         d
@@ -832,4 +843,69 @@ fn journal_added_to_a_file_system_without_one() {
     check(&mut fs, &mut v).unwrap();
     assert_eq!(file_bytes(&mut fs, &mut v, "before").unwrap(), b"no journal yet");
     assert_eq!(file_bytes(&mut fs, &mut v, "after").unwrap(), b"journaled");
+}
+
+/// EXT4_BIG_IN=<file>: a bigger file system Linux made with its defaults
+/// (several groups mke2fs left uninitialised): filled across them.
+#[test]
+fn fill_linux_made_groups() {
+    let Ok(path) = std::env::var("EXT4_BIG_IN") else { return };
+    let mut d = Sparse::load(&path);
+    let mut v = Vol { dev: &mut d, start: 0 };
+    let mut fs = Fs::mount(&mut v).unwrap();
+    assert!(fs.writable);
+    let uninit = fs.groups.iter().filter(|g| g.flags & csum::BG_BLOCK_UNINIT != 0).count();
+    let uninit_i = fs.groups.iter().filter(|g| g.flags & csum::BG_INODE_UNINIT != 0).count();
+    println!("{} groups, {uninit} with uninitialised block bitmaps, {uninit_i} inode bitmaps", fs.groups.len());
+    let v = &mut v;
+    let big = fs.create(v, ROOT, "big", Kind::File, 0o644, 0, 0, (0, 0), NOW).unwrap();
+    let chunk = pattern(1 << 20, 5);
+    for k in 0..300u64 {
+        fs.pwrite(v, big, k << 20, &chunk, NOW).unwrap();
+    }
+    // directories (and so inodes) in every group
+    for g in 0..fs.groups.len() as u32 * 3 {
+        let dir = fs.mkdir(v, ROOT, &format!("d{g}"), 0o755, 0, 0, NOW).unwrap();
+        for k in 0..30 {
+            fs.write_file(v, &format!("d{g}/f{k}"), &pattern(5000, k as u8), NOW).unwrap();
+        }
+        let _ = dir;
+    }
+    let st = fs.getattr(v, big).unwrap();
+    assert_eq!(st.size, 300 << 20);
+    println!("left uninitialised: {} block, {} inode bitmaps", fs.groups.iter().filter(|g| g.flags & csum::BG_BLOCK_UNINIT != 0).count(), fs.groups.iter().filter(|g| g.flags & csum::BG_INODE_UNINIT != 0).count());
+    fs.close(v).unwrap();
+    d.save(&path);
+}
+
+#[test]
+fn orphans_left_by_linux_are_finished() {
+    let mut d = Sparse::new(64);
+    let mut v = Vol { dev: &mut d, start: 0 };
+    let mut fs = Fs::format(&mut v, 64 * 2048, [14; 16], "orphans", NOW).unwrap();
+    let free0 = fs.usage().1;
+    let v = &mut v;
+    // one deleted while still open (no links, blocks still held), one being truncated
+    let gone = fs.create(v, ROOT, "gone", Kind::File, 0o644, 0, 0, (0, 0), NOW).unwrap();
+    fs.pwrite(v, gone, 0, &pattern(100_000, 1), NOW).unwrap();
+    let cut = fs.create(v, ROOT, "cut", Kind::File, 0o644, 0, 0, (0, 0), NOW).unwrap();
+    fs.pwrite(v, cut, 0, &pattern(200_000, 2), NOW).unwrap();
+    fs.dir_remove(v, ROOT, "gone", NOW).unwrap();
+    let mut i = fs.read_inode(v, gone).unwrap();
+    i.set_links(0);
+    put32(&mut i.raw, 0x14, cut); // the next orphan
+    fs.write_inode(v, &i).unwrap();
+    let mut i = fs.read_inode(v, cut).unwrap();
+    i.set_size(5000);
+    fs.write_inode(v, &i).unwrap();
+    put32(&mut fs.sb, 0xE8, gone);
+    fs.meta_dirty = true;
+    fs.close(v).unwrap();
+    let mut fs = Fs::mount(v).unwrap();
+    assert_eq!(le32(&fs.sb, 0xE8), 0);
+    check(&mut fs, v).unwrap();
+    assert_eq!(whole(&mut fs, v, cut), pattern(200_000, 2)[..5000]);
+    assert_eq!(fs.getattr(v, cut).unwrap().blocks, 2 * 8);
+    fs.unlink(v, ROOT, "cut", NOW).unwrap();
+    assert_eq!(fs.usage().1, free0);
 }
