@@ -33,6 +33,9 @@ button.d{color:var(--bad);border-color:var(--bad)}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}
 .banner{padding:10px 14px;border-radius:8px;margin-bottom:14px;border:1px solid var(--warn);color:var(--warn)}
 #login{max-width:360px;margin:12vh auto}
+#err{position:fixed;left:16px;right:16px;bottom:16px;max-width:760px;margin:0 auto;display:flex;gap:10px;align-items:flex-start;background:var(--card);border:1px solid var(--bad);color:var(--bad);padding:10px 14px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.18);z-index:10}
+#err[hidden]{display:none}
+#errtxt{flex:1;word-break:break-word;white-space:pre-wrap}
 .tbl{overflow-x:auto}
 a{color:var(--acc)}
 .form{display:grid;grid-template-columns:minmax(120px,max-content) minmax(0,1fr);gap:8px 14px;align-items:start}
@@ -113,6 +116,7 @@ table.cards tr.note{border:0;padding:0}}
 </section>
 </main>
 </div>
+<div id="err" role="alert" hidden><span id="errtxt"></span><button class="b" id="errx">关闭</button></div>
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
@@ -137,13 +141,25 @@ const hex=b=>Array.from(b,x=>x.toString(16).padStart(2,"0")).join("");
 function hmac(key,msg){const k=new Uint8Array(64);k.set(key.length>64?sha256(key):key);const cat=(a,b)=>{const c=new Uint8Array(a.length+b.length);c.set(a);c.set(b,a.length);return c};
   return sha256(cat(k.map(x=>x^0x5c),sha256(cat(k.map(x=>x^0x36),msg))))}
 
+// errors are shown, never swallowed: a red bar at the bottom says what failed and why
+let errFrom="";
+function oops(where,e){
+  if(e&&e.message==="login")return; // the login page is shown instead
+  const m=e instanceof Error?e.message:String(e);
+  $("errtxt").textContent=(where?where+"：":"")+m;$("err").hidden=false;errFrom=where;console.error(where,e)}
+function oopsClear(where){if(errFrom===where){$("err").hidden=true;errFrom=""}}
+$("errx").onclick=()=>{$("err").hidden=true;errFrom=""};
+window.addEventListener("error",ev=>oops("页面脚本出错",ev.error||ev.message));
+window.addEventListener("unhandledrejection",ev=>oops("页面脚本出错",ev.reason));
 async function api(path,form){
   const o=form?{method:"POST",headers:{"X-RustROS":"1","Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams(form)}:{headers:{"X-RustROS":"1"}};
-  const r=await fetch(path,o);
+  let r;
+  try{r=await fetch(path,o)}catch(e){throw new Error(`连不上 RustROS（${path}：${e.message}）`)}
   if(r.status==401){showLogin();throw new Error("login")}
   const ct=r.headers.get("Content-Type")||"";
-  const d=ct.includes("json")?await r.json():await r.text();
-  if(!r.ok)throw new Error(d.error||r.status);
+  let d;
+  try{d=ct.includes("json")?await r.json():await r.text()}catch(e){throw new Error(`${path} 的回答读不了：${e.message}`)}
+  if(!r.ok)throw new Error(`${path} 失败（HTTP ${r.status}）${d&&d.error?"："+d.error:""}`);
   return d}
 
 // cards on narrow screens: every cell gets its column's title
@@ -173,7 +189,8 @@ let cur=fromHash(),timer=null;
 function tab(t){cur=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
   ["status","net","mods","log","sys"].forEach(x=>$("t-"+x).hidden=x!==t);
   clearInterval(timer);const f={status:loadStatus,net:loadNet,mods:loadMods,log:loadLog,sys:async()=>{}}[t];
-  f().catch(()=>{});if(t==="status"||t==="log"||t==="net")timer=setInterval(()=>f().catch(()=>{}),t==="net"?3000:2000)}
+  const run=()=>f().then(()=>oopsClear("刷新失败"),e=>oops("刷新失败",e));
+  run();if(t==="status"||t==="log"||t==="net")timer=setInterval(run,t==="net"?3000:2000)}
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{location.hash=b.dataset.t});
 window.addEventListener("hashchange",()=>{if($("app").hidden)return;if(fromHash()===cur&&cur==="mods")modPage(mods.find(m=>m.name===hashMod()));else tab(fromHash())});
 
@@ -205,11 +222,11 @@ async function netCmd(c){
     // like iptables-apply: can a new connection still reach us?
     try{await api("/api/net");out.textContent+="\n新连接正常。满意就点“保留（确认）”，否则会自动回滚。"}catch(e){}
   }
-  loadNet().catch(()=>{})}
+  loadNet().catch(e=>oops("刷新失败",e))}
 $("run").onclick=()=>netCmd($("cmd").value.trim());$("cmd").onkeydown=e=>{if(e.key==="Enter")$("run").click()};
 $("cand").onclick=()=>netCmd("cand");
 $("apply").onclick=async()=>{try{const d=await api("/api/net");if(!d.has_cand){netCmd("cand");return}
-  if(confirm("应用以下候选配置？30 秒内不确认会自动回滚。\n\n"+d.cand))netCmd("apply 30")}catch(e){}};
+  if(confirm("应用以下候选配置？30 秒内不确认会自动回滚。\n\n"+d.cand))netCmd("apply 30")}catch(e){oops("应用失败",e)}};
 $("confirm").onclick=()=>netCmd("confirm");$("revert").onclick=()=>netCmd("revert");
 $("discard").onclick=()=>{if(confirm("丢弃候选配置（已应用的会先回滚）？"))netCmd("discard")};
 $("save").onclick=()=>{if(confirm("把当前运行的网络配置保存为开机配置？"))netCmd("save")};
@@ -235,7 +252,7 @@ $("mkey").oninput=()=>{$("mval").type=isSecret($("mkey").value.trim())?"password
 function editCfg(b){$("mkey").value=b.dataset.k;$("mkey").oninput();$("mval").value=b.dataset.v==="(set)"?"":b.dataset.v;$("mval").focus()}
 async function delCfg(b){if(!confirm("删除设置 "+b.dataset.k+"？"))return;await modCall({name:$("mname").value,action:"del",key:b.dataset.k})}
 $("mset").onclick=()=>{const k=$("mkey").value.trim(),v=$("mval").value.trim();if(!k)return;modCall({name:$("mname").value,action:v?"set":"del",key:k,value:v})};
-async function modCall(f){try{const r=await api("/api/module",f);if(!r.ok)alert(r.out)}catch(e){alert(e.message)}setTimeout(()=>loadMods().catch(()=>{}),600)}
+async function modCall(f){try{const r=await api("/api/module",f);if(!r.ok)throw new Error(r.out)}catch(e){oops(`${f.name} ${f.action} ${f.key||""} 失败`,e)}setTimeout(()=>loadMods().catch(e=>oops("刷新失败",e)),600)}
 // ---- module pages, generated from the settings each module describes (params)
 // a param: [key pattern, kind, default, help]; "<x>" a name the user picks
 // (an instance when more follows, a table row at the end), "[<i>.]" an
@@ -338,8 +355,12 @@ async function saveForm(mod){
   const ch=[...$("mp").querySelectorAll("[data-k]")].filter(e=>val(e)!==e.dataset.o&&!(e.dataset.sec&&!e.value));
   if(!ch.length){$("mpmsg").textContent="没有修改";return}
   $("mpmsg").textContent="保存中…";
-  for(const e of ch){const v=val(e);const r=await api("/api/module",{name:mod,action:v?"set":"del",key:e.dataset.k,value:v});if(!r.ok){alert(e.dataset.k+": "+r.out);break}}
-  $("mpmsg").textContent=`已保存 ${ch.length} 项`;setTimeout(()=>loadMods().catch(()=>{}),600)}
+  let n=0;
+  for(const e of ch){const v=val(e),k=e.dataset.k;
+    try{const r=await api("/api/module",{name:mod,action:v?"set":"del",key:k,value:v});if(!r.ok)throw new Error(r.out)}
+    catch(err){$("mpmsg").textContent=`保存了 ${n} 项，${k} 失败`;oops(`保存 ${k} 失败（之前的 ${n} 项已保存）`,err);loadMods().catch(()=>{});return}
+    n++}
+  $("mpmsg").textContent=`已保存 ${ch.length} 项`;setTimeout(()=>loadMods().catch(e=>oops("刷新失败",e)),600)}
 async function addRow(b,mod){const tr=b.closest("tr"),n=tr.querySelector("[data-new]"),v=tr.querySelector("[data-newv]");
   if(!n.value.trim()||!v.value.trim()){alert("名称和值都要填");return}
   await modCall({name:mod,action:"set",key:n.dataset.new+"."+n.value.trim(),value:v.value.trim()})}
@@ -349,7 +370,10 @@ async function delInst(mod,pre,def){
   // the default instance's keys have no prefix: only those its settings describe
   const keys=m.config.map(c=>c[0]).filter(k=>def?ps.some(p=>p.opt&&k.match(p.re)&&!k.match(p.re)[1]):k.startsWith(pre));
   if(!keys.length||!confirm(`删除这个实例的 ${keys.length} 项设置？\n`+keys.join("\n")))return;
-  for(const k of keys)await api("/api/module",{name:mod,action:"del",key:k});setTimeout(()=>loadMods().catch(()=>{}),600)}
+  let n=0;
+  try{for(const k of keys){const r=await api("/api/module",{name:mod,action:"del",key:k});if(!r.ok)throw new Error(k+"："+r.out);n++}}
+  catch(e){oops(`删除实例失败（已删 ${n}/${keys.length} 项）`,e)}
+  setTimeout(()=>loadMods().catch(e=>oops("刷新失败",e)),600)}
 function newInst(b,ci){const i=b.previousElementSibling,n=i.value.trim();if(!/^[A-Za-z0-9_-]+$/.test(n)){alert("名称只能用字母、数字、- 和 _");return}
   // an empty instance card: its settings get stored once saved
   const pre=i.dataset.ninst+n+".",m=mods.find(x=>x.name===hashMod()||x.name===$("mname").value);
@@ -368,9 +392,9 @@ $("lrefresh").onclick=()=>loadLog();$("boots").onchange=()=>loadLog();
 document.querySelectorAll("[data-a]").forEach(b=>b.onclick=async()=>{
   const a=b.dataset.a,txt={reboot:"重启",poweroff:"关机"}[a];
   if(txt&&!confirm(`确定要${txt}吗？`))return;
-  try{const r=await api("/api/system",{action:a});alert(r.out)}catch(e){alert(e.message)}});
+  try{const r=await api("/api/system",{action:a});alert(r.out)}catch(e){oops(`${b.textContent}失败`,e)}});
 
-api("/api/status").then(()=>{$("app").hidden=false;tab(cur)}).catch(e=>{if(e.message!=="login")showLogin()});
+api("/api/status").then(()=>{$("app").hidden=false;tab(cur)}).catch(e=>{if(e.message==="login")return;showLogin();oops("打开管理页面失败",e)});
 </script>
 </body>
 </html>
