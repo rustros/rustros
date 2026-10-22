@@ -127,7 +127,7 @@ async function login(){
   $("lerr").textContent="";
   try{
     const c=await (await fetch("/api/challenge")).json();
-    if(!c.password){$("lerr").textContent="还没有设置密码：module-config webadmin password ...";return}
+    if(!c.password){$("lerr").textContent="还没有设置密码：在控制台输入 cfg webadmin password 密码";return}
     const key=sha256(utf8("rustros-web:"+$("pw").value));
     const proof=hex(hmac(key,utf8(c.nonce)));
     const r=await fetch("/api/login",{method:"POST",headers:{"X-RustROS":"1","Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({nonce:c.nonce,proof})});

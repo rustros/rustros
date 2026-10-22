@@ -9,7 +9,8 @@
 //! HttpOnly and SameSite=Strict, and changes need a custom header (no
 //! cross-site requests).
 //!
-//! Settings (`module-config webadmin <key> <value>`):
+//! Settings (console `cfg webadmin <key> <value>`, or `rustros-update.py HOST
+//! module-config webadmin <key> <value>`):
 //!
 //! ```text
 //! password   <text>             set the password (stored hashed, then removed)
@@ -264,7 +265,7 @@ impl WebAdmin {
             match net.tcp_listen(port) {
                 Ok(l) => {
                     self.listener = Some((l, port));
-                    say!(sys, "webadmin: http on port {}{}\n", port, if self.pw.is_none() { " (no password yet: module-config webadmin password ...)" } else { "" });
+                    say!(sys, "webadmin: http on port {}{}\n", port, if self.pw.is_none() { " (no password yet: cfg webadmin password <text>)" } else { "" });
                 }
                 Err(e) => say!(sys, "webadmin: cannot listen on {}: {:?}\n", port, e),
             }
@@ -413,7 +414,7 @@ impl WebAdmin {
         if now < self.locked_until {
             return error("429 Too Many Requests", "too many failed logins: wait a minute");
         }
-        let Some(pw) = self.pw else { return error("403 Forbidden", "no password set: module-config webadmin password ...") };
+        let Some(pw) = self.pw else { return error("403 Forbidden", "no password set: cfg webadmin password <text>") };
         let form = core::str::from_utf8(r.body).unwrap_or("");
         let nonce = field(form, "nonce").and_then(|n| unhex16(&n));
         let proof = field(form, "proof").unwrap_or_default();
