@@ -941,6 +941,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sites"
+version = "0.1.0"
+dependencies = [
+ "rustros-api",
+ "rustros-util",
+ "tls",
+]
+
+[[package]]
+name = "sites-mod"
+version = "0.1.0"
+dependencies = [
+ "rustros-module",
+ "sites",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

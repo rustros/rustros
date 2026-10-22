@@ -75,6 +75,48 @@ pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>,
     Ok(Arc::new(config))
 }
 
+/// Certificates chosen by the name the client asks for (SNI): each entry
+/// is (its names, chain PEM, key PEM); a name not listed gets the first.
+/// Names may be "*.example.com".
+pub fn server_config_sni(certs: &[(Vec<String>, String, String)]) -> Result<Arc<ServerConfig>, String> {
+    if certs.is_empty() {
+        return Err(String::from("no certificate"));
+    }
+    let provider = provider::provider();
+    let mut keys = Vec::new();
+    for (names, cert_pem, key_pem) in certs {
+        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<_, _>>().map_err(|e| format!("certificate: {e:?}"))?;
+        if chain.is_empty() {
+            return Err(String::from("no certificate in the PEM"));
+        }
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).map_err(|e| format!("private key: {e:?}"))?;
+        let signer = provider.key_provider.load_private_key(key).map_err(|e| format!("{e}"))?;
+        let names: Vec<String> = names.iter().map(|n| n.trim().trim_end_matches('.').to_ascii_lowercase()).collect();
+        keys.push((names, Arc::new(rustls::sign::CertifiedKey::new(chain, signer))));
+    }
+    let config = ServerConfig::builder_with_details(Arc::new(provider), provider::time_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| format!("{e}"))?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(BySni(keys)));
+    Ok(Arc::new(config))
+}
+
+#[derive(Debug)]
+struct BySni(Vec<(Vec<String>, Arc<rustls::sign::CertifiedKey>)>);
+
+impl rustls::server::ResolvesServerCert for BySni {
+    fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let want = hello.server_name().map(|n| n.to_ascii_lowercase());
+        let hit = want.as_deref().and_then(|w| {
+            self.0.iter().find(|(names, _)| {
+                names.iter().any(|n| n == w || n.strip_prefix("*.").is_some_and(|base| w.strip_suffix(base).is_some_and(|l| l.ends_with('.') && !l[..l.len() - 1].contains('.'))))
+            })
+        });
+        Some(hit.unwrap_or(&self.0[0]).1.clone())
+    }
+}
+
 impl Tls {
     /// Start a handshake with `host` (the name the certificate must carry).
     pub fn new(host: &str) -> Result<Tls, String> {

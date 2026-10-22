@@ -1,0 +1,14 @@
+[package]
+name = "sites-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sites"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+sites = { path = "../../apps/sites" }
