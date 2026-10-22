@@ -291,6 +291,9 @@ impl Stack {
                 },
                 owner: self.owner_names.get(s.owner).copied(),
             })
+            // what waits: TCP listeners ("LISTEN") and bound UDP sockets ("UDP")
+            .chain(self.listeners.iter().map(|&(port, owner)| ConnInfo { local_port: port, remote: SocketAddr { ip: 0, port: 0 }, state: "LISTEN", owner: self.owner_names.get(owner).copied() }))
+            .chain(self.udp.iter().map(|u| ConnInfo { local_port: u.port, remote: SocketAddr { ip: 0, port: 0 }, state: "UDP", owner: self.owner_names.get(u.owner).copied() }))
             .collect()
     }
 

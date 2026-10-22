@@ -612,6 +612,50 @@ fn import(sys: &mut dyn Sys, text: &str, replace: bool, net: bool) -> (bool, Str
     (errors == 0, head + &report)
 }
 
+/// What waits for connections or packets: [proto, port, app, note] each.
+/// Sockets come from the stack; WireGuard and L2TP take their UDP on the
+/// packet path (no socket), so theirs are read from their settings.
+fn listening(sys: &mut dyn Sys) -> Vec<String> {
+    let mut l: Vec<(String, u16, String, String)> = Vec::new();
+    if let Some(net) = sys.net() {
+        for c in net.tcp_connections() {
+            let proto = match c.state {
+                "LISTEN" => "TCP",
+                "UDP" => "UDP",
+                _ => continue,
+            };
+            let note = if proto == "UDP" && c.local_port >= 49152 { "临时（对外查询用）" } else { "" };
+            l.push((String::from(proto), c.local_port, String::from(c.owner.unwrap_or("system")), String::from(note)));
+        }
+    }
+    if let Some(a) = sys.admin() {
+        let running: Vec<String> = a.module_list().into_iter().filter(|m| m.running.is_some()).map(|m| m.name).collect();
+        if running.iter().any(|m| m == "wireguard") {
+            let cfg = a.module_config("wireguard");
+            let ifs: Vec<&str> = cfg.iter().filter_map(|(k, _)| k.strip_suffix(".private")).collect();
+            for (n, i) in ifs.iter().enumerate() {
+                let port = cfg.iter().find(|(k, _)| *k == format!("{i}.listen")).and_then(|(_, v)| v.parse().ok()).unwrap_or(51820 + n as u16);
+                let bind = cfg.iter().find(|(k, _)| *k == format!("{i}.bind")).map(|(_, v)| format!("，只在 {v}")).unwrap_or_default();
+                l.push((String::from("UDP"), port, String::from("wireguard"), format!("接口 {i}（包路径）{bind}")));
+            }
+        }
+        if running.iter().any(|m| m == "l2tp") {
+            let cfg = a.module_config("l2tp");
+            let binds: Vec<String> = cfg.iter().filter(|(k, v)| (k == "bind" || k.ends_with(".bind")) && v != "off").map(|(_, v)| v.clone()).collect();
+            // the default instance: any unprefixed setting makes it, unless "bind off"
+            let unprefixed = cfg.iter().any(|(k, _)| matches!(k.as_str(), "bind" | "egress" | "pool" | "dns" | "mtu") || k.starts_with("user."));
+            let default_on = unprefixed && !cfg.iter().any(|(k, v)| k == "bind" && v == "off");
+            if !binds.is_empty() || default_on {
+                let on = if binds.is_empty() { String::from("所有地址") } else { binds.join("、") };
+                l.push((String::from("UDP"), 1701, String::from("l2tp"), format!("服务端（包路径），在 {on}")));
+            }
+        }
+    }
+    l.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
+    l.dedup();
+    l.iter().map(|(p, port, app, note)| format!("[{},{},{},{}]", js(p), port, js(app), js(note))).collect()
+}
+
 fn status(sys: &mut dyn Sys) -> String {
     let mut o = format!("{{\"uptime\":{}", sys.now_ms() / 1000);
     if let Some(u) = sys.update_info() {
@@ -642,6 +686,7 @@ fn status(sys: &mut dyn Sys) -> String {
     o += "]";
     let perf = sys.admin().map(|a| a.perf_report()).unwrap_or_default();
     let _ = write!(o, ",\"perf\":{}", js(&perf));
+    let _ = write!(o, ",\"listen\":[{}]", listening(sys).join(","));
     let running: Vec<String> = sys.modules().iter().map(|m| js(m)).collect();
     let _ = write!(o, ",\"running\":[{}]", running.join(","));
     let storage = sys.kv().and_then(|k| k.storage_info()).map_or(String::from("none"), |s| format!("{} MiB partition, {} bytes live", s.partition_bytes >> 20, s.live_bytes));

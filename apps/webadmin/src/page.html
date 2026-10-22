@@ -79,6 +79,8 @@ table.cards tr.note{border:0;padding:0}}
 <section id="t-status">
   <div class="card"><h3>概况</h3><div class="kv" id="sum"></div></div>
   <div class="card"><h3>接口</h3><div class="tbl"><table id="ifs" class="cards"></table></div></div>
+  <div class="card"><h3>监听端口</h3><div class="tbl"><table id="ports" class="cards"></table></div>
+    <p class="mut">TCP 监听和 UDP 套接字来自协议栈；WireGuard、L2TP 在包路径上直接收 UDP，按它们的设置列出。</p></div>
   <div class="card"><h3>性能（CPU、速率与峰值）</h3><pre id="perf"></pre></div>
 </section>
 
@@ -223,7 +225,10 @@ async function loadStatus(){
   $("ifs").innerHTML="<tr><th>接口</th><th>地址</th><th>网关</th><th>附加地址</th><th>MTU</th><th class=n>收</th><th class=n>发</th><th class=n>丢弃 收/发</th></tr>"+
     d.ifaces.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.ip)}</td><td>${i.gw==="0.0.0.0"?"":esc(i.gw)}</td><td>${esc(i.extra)}</td><td>${i.mtu}</td><td class=n>${i.rx}</td><td class=n>${i.tx}</td><td class=n>${i.rxd} / ${i.txd}</td></tr>`).join("");
   labelCells($("ifs"));
-  $("perf").textContent=d.perf}
+  $("perf").textContent=d.perf;
+  $("ports").innerHTML="<tr><th>协议</th><th class=n>端口</th><th>应用</th><th>说明</th></tr>"+
+    (d.listen||[]).map(([p,port,app,note])=>`<tr><td>${esc(p)}</td><td class=n>${port}</td><td>${esc(app)}</td><td class=mut>${esc(note)}</td></tr>`).join("");
+  labelCells($("ports"))}
 
 let applyEnd=0;
 async function loadNet(){
