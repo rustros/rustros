@@ -432,6 +432,11 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     const _: () = assert!(devices::HEADROOM == HEADROOM);
     let mut warned = false;
     let mut status_at = 0;
+    // a test boot from another system's boot loader (the installer): back to it after a while
+    let testboot = rustros_util::wire::cmdline_get(&k.cmdline, "rustros.testboot").and_then(|v| v.parse::<u64>().ok()).map(|s| arch::now_ms() + s * 1000);
+    if let Some(t) = testboot {
+        kprintln!("test boot: the disk is not touched; restarting into the previous system in {} s", (t - arch::now_ms()) / 1000);
+    }
     let mut force_rescue = false;
     let mut stable = false;
     let mut shown_owner = None;
@@ -496,6 +501,10 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
         if k.net_deadline.is_some_and(|t| arch::now_ms() >= t) && k.net_revert() {
             kprintln!("net: apply not confirmed in time, previous configuration restored (the candidate is kept)");
+        }
+        if testboot.is_some_and(|t| arch::now_ms() >= t) {
+            kprintln!("test boot over: restarting into the previous system");
+            arch::reboot();
         }
         if acpi::power_button() {
             kprintln!("power button pressed, powering off...");

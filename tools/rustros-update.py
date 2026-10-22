@@ -96,8 +96,9 @@ def command(host, port, key, cmd, payload=b"", encrypt=False):
     return reply.decode(errors="replace").strip(), slot, trial
 
 
-# The EFI partition, as tools/mkimg.py lays it out.
-ESP_FIRST, ESP_LAST = 576, 4096 - 34
+# The EFI partition, as tools/mkimg.py lays it out: where it starts (its
+# length is in its FAT boot sector: 2 MiB images and 8 MiB ones differ).
+ESP_FIRST = 576
 ESP_CHUNK = 128
 
 
@@ -109,9 +110,14 @@ def esp_read(a, key, lba, n):
 
 
 def esp_get(a, key):
+    boot = esp_read(a, key, ESP_FIRST, 1)
+    total = struct.unpack_from("<H", boot, 19)[0] or struct.unpack_from("<I", boot, 32)[0]
+    if boot[510:512] != b"\x55\xaa" or not total:
+        sys.exit("esp: no FAT boot sector where the EFI partition should start")
+    last = ESP_FIRST + total - 1
     data = b""
-    for lba in range(ESP_FIRST, ESP_LAST + 1, ESP_CHUNK):
-        data += esp_read(a, key, lba, min(ESP_CHUNK, ESP_LAST + 1 - lba))
+    for lba in range(ESP_FIRST, last + 1, ESP_CHUNK):
+        data += esp_read(a, key, lba, min(ESP_CHUNK, last + 1 - lba))
     return data
 
 

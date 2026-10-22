@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Build a 2 MiB raw disk image for RustROS that boots on both BIOS and UEFI.
+"""Build an 8 MiB raw disk image for RustROS that boots on both BIOS and UEFI.
 
 GPT layout (512-byte sectors):
   LBA 0            protective MBR, carrying GRUB's boot.img for BIOS
   LBA 1..33        GPT header + 128 partition entries
   LBA 64..575      partition 1: BIOS boot partition (GRUB core.img)
-  LBA 576..4062    partition 2: EFI System Partition, FAT12:
+  LBA 576..16350   partition 2: EFI System Partition, FAT16:
                      /EFI/BOOT/BOOTX64.EFI   GRUB for UEFI
                      /boot/grub/grub.cfg
                      /boot/grub/grubenv      boot_slot / try_slot / saved network
-                     /boot/kernel-a.elf      kernel slot A (preallocated, contiguous)
+                     /boot/kernel-a.elf      kernel slot A (preallocated, contiguous, 1 MiB)
                      /boot/kernel-b.elf      kernel slot B
-  LBA 4063..4095   backup GPT (the kernel moves it to the real end of the disk)
+  LBA 16351..16383 backup GPT (the kernel moves it to the real end of the disk)
+
+(Images made before were 2 MiB with a FAT12 ESP and 256 KiB slots; they
+keep working as they are.)
 
 Everything below 64 MiB is the boot area: images may grow up to there. On
 first boot the kernel creates a cache partition at 64 - 512 MiB and the
@@ -34,7 +37,7 @@ import zlib
 
 GRUB_LIB = "/usr/lib/grub"
 SECTOR = 512
-IMAGE_SECTORS = 4096           # 2 MiB
+IMAGE_SECTORS = 16384          # 8 MiB
 BOOT_AREA_SECTORS = 64 * 2048  # images must stay below the data partition
 BIOS_FIRST, BIOS_LAST = 64, 575
 ESP_FIRST, ESP_LAST = 576, IMAGE_SECTORS - 34
@@ -207,17 +210,24 @@ def main():
     ap.add_argument("--mtu", type=int, default=0, help="default interface MTU (default 1500)")
     ap.add_argument("--key", default="", help="online update key (empty: generate one)")
     ap.add_argument("--key-file", help="read/store the update key in this file")
-    ap.add_argument("--slot-kb", type=int, default=256, help="size of each kernel slot in KiB")
+    ap.add_argument("--slot-kb", type=int, default=1024, help="size of each kernel slot in KiB")
     ap.add_argument("--timeout", type=int, default=2, help="GRUB menu timeout in seconds")
     ap.add_argument("--bundle", action="append", default=[], metavar="NAME=FILE",
                     help="a module the image carries (installed at first boot), e.g. panel=build/modules/panel.mod")
     ap.add_argument("--panel", default="", help="the panel this image's machines connect to (rustros.panel=)")
+    ap.add_argument("--template", action="store_true",
+                    help="an image for the installer: no key, network or panel in it; they come from its "
+                         "grubenv (update_key, net_ip, net_gw, net_mtu, panel_url), the bundle after it is optional")
     a = ap.parse_args()
     assert IMAGE_SECTORS <= BOOT_AREA_SECTORS, "the image must stay inside the 64 MiB boot area"
     bundle = make_bundle(a.bundle)
     assert IMAGE_SECTORS + len(bundle) // SECTOR <= BOOT_AREA_SECTORS, "the bundle must fit in the 64 MiB boot area"
 
     key = a.key
+    if a.template:
+        if a.key or a.key_file or a.ip or a.gw or a.panel or a.bundle:
+            sys.exit("mkimg: a template carries no key, network, panel or bundle (the installer adds them)")
+        key = "$update_key"
     if not key and a.key_file and os.path.exists(a.key_file):
         key = open(a.key_file).read().strip()
     if not key:
@@ -255,7 +265,7 @@ def main():
         esp_sectors = ESP_LAST - ESP_FIRST + 1
         with open(esp, "wb") as f:
             f.truncate(esp_sectors * SECTOR)
-        run("mkfs.fat", "-F", "12", "-s", "1", "-n", "RUSTROS", esp)
+        run("mkfs.fat", "-F", "16", "-s", "1", "-n", "RUSTROS", esp)
         open(t("kernel-a.elf"), "wb").write(slot_image)
         open(t("grubenv"), "wb").write(grubenv("a"))
         mt = ["-i", esp]
@@ -274,10 +284,12 @@ def main():
         slot_sectors = slot_bytes // SECTOR
 
         disk = f"rustros.slots={a_lba},{b_lba},{slot_sectors} rustros.env={env_lba}"
-        if bundle:
+        if bundle or a.template:
             disk += f" rustros.bundle={IMAGE_SECTORS}"
         if a.panel:
             disk += f" rustros.panel={a.panel}"
+        if a.template:
+            disk += " $panelarg"
         net = f"$netargs key={key}"
         defaults = "".join(
             f'if [ -z "$net_{k}" ]; then set net_{k}={v}; fi\n'
@@ -295,7 +307,9 @@ set fallback=1
 
 load_env
 # Network settings: saved ones (shell 'save' -> grubenv) win over the image defaults.
-{defaults}set netargs=
+{defaults}set panelarg=
+if [ -n "$panel_url" ]; then set panelarg="rustros.panel=$panel_url"; fi
+set netargs=
 if [ -n "$net_ip" ]; then set netargs="ip=$net_ip gw=$net_gw"; fi
 if [ -n "$net_mtu" ]; then set netargs="$netargs mtu=$net_mtu"; fi
 if [ -z "$boot_slot" ]; then set boot_slot=a; fi
@@ -383,7 +397,11 @@ menuentry "RustROS (slot $boot_slot, fallback)" {{
     print(f"  kernel {len(kernel)} bytes in {a.slot_kb} KiB slots: A @ LBA {a_lba}, B @ LBA {b_lba}; grubenv @ LBA {env_lba}")
     print(f"  first boot creates cache 64-512 MiB and data 512 MiB-1 GiB; beyond 1 GiB is free (NAS)")
     print(f"  network: {a.ip or 'DHCP (or set ip/save on the console)'}" + (f" gw {a.gw}" if a.gw else "") + (f" mtu {a.mtu}" if a.mtu else ""))
-    print(f"  update key: {key}" + (f" (saved in {a.key_file})" if a.key_file else ""))
+    if a.template:
+        print("  template: key, network and panel from grubenv (update_key, net_*, panel_url)")
+    else:
+        # printed only when it is nowhere else
+        print(f"  update key: saved in {a.key_file}" if a.key_file else f"  update key: {key}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RustROS Docs</title>
+<meta name="description" content="Installing and running RustROS: the installer, the console, apps and pkg, online updates, the web admin, the panel, storage.">
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header><div class="wrap">
+  <a class="logo" href="/">Rust<span>ROS</span></a>
+  <nav><a class="on" href="/docs/"><span data-l="zh">文档</span><span data-l="en">Docs</span></a><a href="/releases/"><span data-l="zh">发布</span><span data-l="en">Releases</span></a><a class="opt" href="https://github.com/rustros/rustros">GitHub</a></nav>
+  <button class="lang" id="lang" type="button">EN</button>
+</div></header>
+
+<main class="wrap docs">
+<aside class="toc">
+  <div data-l="zh">
+    <a href="#install">安装到云主机</a><a href="#qemu">在 QEMU 里试</a><a href="#console">控制台</a><a href="#network">网络设置</a><a href="#apps">应用与 pkg</a><a href="#update">在线更新</a><a href="#webadmin">网页管理</a><a href="#panel">面板</a><a href="#storage">存储</a><a href="#security">安全</a><a href="#build">从源码构建</a>
+  </div>
+  <div data-l="en">
+    <a href="#install">Install on a VPS</a><a href="#qemu">Try it in QEMU</a><a href="#console">The console</a><a href="#network">Network settings</a><a href="#apps">Apps and pkg</a><a href="#update">Online updates</a><a href="#webadmin">Web admin</a><a href="#panel">Panel</a><a href="#storage">Storage</a><a href="#security">Security</a><a href="#build">Build from source</a>
+  </div>
+</aside>
+
+<article>
+<!-- ============================================================ 中文 -->
+<div data-l="zh">
+<h2 id="install">安装到云主机</h2>
+<p>在一台装着 Linux、用 GRUB 启动的 x86_64 云主机（KVM，virtio 磁盘和网卡）上，以 root 运行：</p>
+<div class="cmd"><pre>curl -fsSL https://rustros.com/install.sh | sh</pre></div>
+<p>安装分两步，中间可以停下来：</p>
+<ol>
+<li><b>准备并试启动。</b>脚本下载最新发布版，用内置的公钥校验签名、逐个核对 SHA-256，按这台机器现在的网络（Linux 用 DHCP 就用 DHCP，否则沿用当前的静态地址）做出磁盘镜像，生成更新密钥，然后让 GRUB 只引导 RustROS 一次。试启动<b>不写磁盘</b>，5 分钟后自动重启回 Linux。这段时间里它应该能 ping 通；云控制台（VNC）上能看到它识别到的网卡和地址。</li>
+<li><b>写盘。</b>回到 Linux 后确认没问题，再运行：
+<div class="cmd"><pre>python3 /root/rustros/install.py --write</pre></div>
+它会要求输入 <code>yes</code>，然后把镜像写到系统盘并重启进 RustROS。<b>这块盘上原来的一切都会丢失。</b>UEFI 机器会先把固件自己的磁盘启动项排到最前面。</li>
+</ol>
+<div class="note">更新密钥会打印出来，也保存在 <code>/root/rustros/update.key</code>。写盘后 Linux 就没了，<b>先把密钥复制到别处</b>——在线更新和远程管理都要用它。</div>
+<h3>要求</h3>
+<ul>
+<li>x86_64，至少 2 GiB 的系统盘（根文件系统直接在磁盘分区上，不支持 LVM/RAID）</li>
+<li>GRUB 2 引导；BIOS 或 UEFI 都行，UEFI 要关掉 Secure Boot</li>
+<li>python3 和 OpenSSL 3（Debian 12、Ubuntu 22.04 及以后都自带）</li>
+<li>virtio 网卡和磁盘（KVM 云主机基本都是）。有多块网卡时 RustROS 用第一块</li>
+</ul>
+<h3>选项</h3>
+<p>通过 <code>sh -s --</code> 传给脚本，例如 <code>curl -fsSL https://rustros.com/install.sh | sh -s -- --apps shell,webadmin</code>：</p>
+<table>
+<tr><th>选项</th><th>作用</th></tr>
+<tr><td><code>--apps a,b</code></td><td>首次启动时安装的应用（默认 <code>shell</code>）</td></tr>
+<tr><td><code>--ip A/N --gw G</code></td><td>静态地址</td></tr>
+<tr><td><code>--dhcp</code></td><td>用 DHCP</td></tr>
+<tr><td><code>--panel URL</code></td><td>接入管理面板</td></tr>
+<tr><td><code>--key K</code></td><td>指定更新密钥（默认随机生成）</td></tr>
+<tr><td><code>--no-test</code></td><td>跳过试启动</td></tr>
+<tr><td><code>--yes</code></td><td>不询问（试启动后直接重启；写盘时不要求输入 yes）</td></tr>
+</table>
+
+<h2 id="qemu">在 QEMU 里试</h2>
+<p>每个发布版都有一个磁盘镜像 <code>rustros-x86_64.img</code>（发布页上有链接）。把它扩到 2 GiB 以上再启动：</p>
+<div class="cmd"><pre>truncate -s 2G rustros-x86_64.img
+qemu-system-x86_64 -m 256 -nographic \
+  -drive file=rustros-x86_64.img,format=raw,if=virtio \
+  -nic user,model=virtio-net-pci</pre></div>
+<p>它会用 DHCP 取地址。这个镜像里没有更新密钥，所以在线更新不可用；控制台和其他功能都正常。</p>
+
+<h2 id="console">控制台</h2>
+<p>串口和显示器上都是同一个控制台。开机先进 <b>rescue</b>（内置的救援控制台）；装了 <code>shell</code> 应用后控制台交给它，提示符变成 <code>rustros&gt;</code>。<b>Ctrl-]</b> 在两者之间切换。<code>help</code> 列出命令。</p>
+<p>shell 常用命令：</p>
+<table>
+<tr><td><code>ip</code> / <code>arp</code> / <code>conns</code></td><td>网卡与计数、ARP 表、连接和监听端口</td></tr>
+<tr><td><code>ping</code> / <code>curl</code></td><td>连通性测试；curl 支持 HTTPS</td></tr>
+<tr><td><code>mod</code> / <code>modules</code></td><td>已安装 / 正在运行的模块</td></tr>
+<tr><td><code>cfg &lt;应用&gt; [键 [值 | -]]</code></td><td>查看、设置、删除应用的设置；密码类的键不带值时会隐藏输入</td></tr>
+<tr><td><code>pkg ...</code></td><td>包管理，见下文</td></tr>
+<tr><td><code>log</code> / <code>crash</code></td><td>每次启动的控制台日志（保存在磁盘上）/ 最近一次崩溃</td></tr>
+<tr><td><code>slot</code> / <code>confirm</code></td><td>内核 A/B 槽；确认正在试运行的内核</td></tr>
+<tr><td><code>df</code> / <code>uptime</code> / <code>date</code></td><td>存储用量、运行时间、时间</td></tr>
+<tr><td><code>reboot</code> / <code>poweroff</code></td><td></td></tr>
+</table>
+
+<h2 id="network">网络设置</h2>
+<p>改网络有“候选配置”保护，改错了不会把自己锁在外面：</p>
+<div class="cmd"><pre>cand ip nic0 203.0.113.10/24 203.0.113.1
+apply          # 生效，然后问你要不要保留；10 秒内不回答 yes 就恢复原样
+save           # 写进 GRUB 环境块，重启后也用它</pre></div>
+<p>直接 <code>ip nic0 A/N GW</code> 立即生效但不保存，重启恢复。<code>ip nic0 add A</code> 给网卡加额外地址（NAT 出口用）。</p>
+
+<h2 id="apps">应用与 pkg</h2>
+<p>功能都在应用里，内核只带 rescue、dhcp 和 updater。应用从签名的发布版安装：</p>
+<div class="cmd"><pre>pkg update            # 读取最新清单并校验签名
+pkg list              # 已装版本、可用版本、哪些能升级
+pkg install nat router wireguard
+pkg upgrade           # 升级所有能升级的应用
+pkg upgrade kernel    # 新内核写进备用槽，重启试运行，confirm 后保留
+pkg remove cake</pre></div>
+<p id="applist" class="mut">正在读取应用列表…</p>
+<p>应用的设置都用 <code>cfg</code> 查看和修改，例如 <code>cfg nat</code> 列出 NAT 的所有设置和说明。</p>
+
+<h2 id="update">在线更新与远程管理</h2>
+<p>用 <a href="/tools/rustros-update.py"><code>rustros-update.py</code></a>（Python 3，无依赖）从另一台机器管理，流量用更新密钥加密：</p>
+<div class="cmd"><pre>export RUSTROS_KEY=$(cat update.key)
+python3 rustros-update.py 203.0.113.10 info
+python3 rustros-update.py 203.0.113.10 upload rustros-x86_64.elf --wait
+python3 rustros-update.py 203.0.113.10 module-install nat nat-x86_64.mod
+python3 rustros-update.py 203.0.113.10 module-config webadmin allow 198.51.100.7
+python3 rustros-update.py 203.0.113.10 log prev</pre></div>
+<p><code>upload --wait</code> 把内核写进备用槽，重启试运行一次，起来后自动确认。新内核起不来或没确认，下次启动就回到原来的内核；连续三次启动不稳定会进安全模式，第四次换回另一个槽。</p>
+
+<h2 id="webadmin">网页管理</h2>
+<p>装上 <code>webadmin</code> 后在 8080 端口提供网页管理，每个应用的设置页按它声明的参数自动生成。默认只允许没有网关的网卡所在网段访问，所以在云主机上要先放行自己的地址并设置密码：</p>
+<div class="cmd"><pre>pkg install webadmin
+cfg webadmin allow 198.51.100.7
+cfg webadmin password      # 输入两次，不回显</pre></div>
+
+<h2 id="panel">面板</h2>
+<p><code>panel</code> 应用把机器接入管理面板：面板可以查看状态、安装和配置应用、更新内核。安装时用 <code>--panel https://面板地址</code>，或者之后 <code>cfg panel url https://面板地址</code>。第一次连接时控制台会显示认领码，在面板上输入即可认领。面板下发的下载只能来自 <code>cfg panel downloads</code> 指定的前缀（默认 https://rustros.com/）。</p>
+
+<h2 id="storage">存储</h2>
+<table>
+<tr><th>位置</th><th>内容</th></tr>
+<tr><td>0 – 64 MiB</td><td>引导区：GPT、GRUB、两个内核槽、随镜像带的应用</td></tr>
+<tr><td>64 – 512 MiB</td><td>缓存分区：每次启动的控制台日志</td></tr>
+<tr><td>512 MiB – 1 GiB</td><td>数据分区：崩溃安全的键值存储（设置、已安装的应用）</td></tr>
+<tr><td>1 GiB – 磁盘末尾</td><td>文件分区：标准 ext4，带 jbd2 日志和元数据校验（metadata_csum、64bit），应用各有自己的目录</td></tr>
+</table>
+<p>分区都在第一次启动时创建。文件分区可以拿到 Linux 上直接挂载和 e2fsck；Linux 用默认参数格式化的 ext4，RustROS 也能读写。</p>
+
+<h2 id="security">安全</h2>
+<ul>
+<li>发布清单用 Ed25519 签名，公钥内置在安装脚本、<code>pkg</code> 和面板应用里；每个文件都核对 SHA-256。</li>
+<li>在线更新和远程管理的流量用更新密钥认证和加密。</li>
+<li>更新密钥以明文保存在磁盘的 GRUB 配置里：能读这块盘的人就能拿到它。</li>
+<li>内核之外的代码都是 <code>#![forbid(unsafe_code)]</code> 的 Rust。</li>
+</ul>
+
+<h2 id="build">从源码构建</h2>
+<div class="cmd"><pre>git clone https://github.com/rustros/rustros && cd rustros
+make            # 内核和磁盘镜像 build/rustros.img（需要 Rust、nasm、GRUB、mtools）
+make modules    # 应用：build/modules/*.mod
+make run-bios   # 在 QEMU 里运行</pre></div>
+</div>
+
+<!-- ============================================================ English -->
+<div data-l="en">
+<h2 id="install-en">Install on a VPS</h2>
+<p>On an x86_64 VPS running Linux and booting with GRUB (KVM, virtio disk and NIC), as root:</p>
+<div class="cmd"><pre>curl -fsSL https://rustros.com/install.sh | sh</pre></div>
+<p>It goes in two steps, with a stop in between:</p>
+<ol>
+<li><b>Prepare and test-boot.</b> The script downloads the latest release, checks its signature against the key built into it and every file's SHA-256, makes the disk image with this machine's network (DHCP if Linux uses DHCP, else the static address it has now), makes an update key, and has GRUB boot RustROS once. The test boot <b>does not write the disk</b> and restarts into Linux after 5 minutes. Meanwhile it should answer ping; the cloud console (VNC) shows the NICs and address it found.</li>
+<li><b>Write the disk.</b> Back in Linux, if it worked:
+<div class="cmd"><pre>python3 /root/rustros/install.py --write</pre></div>
+It asks you to type <code>yes</code>, writes the image over the system disk and restarts into RustROS. <b>Everything on that disk is lost.</b> On UEFI machines the firmware's own disk entries are put first in the boot order.</li>
+</ol>
+<div class="note">The update key is printed and kept in <code>/root/rustros/update.key</code>. Once the disk is written Linux is gone: <b>copy the key somewhere else first</b> — online updates and remote management need it.</div>
+<h3>Requirements</h3>
+<ul>
+<li>x86_64, a system disk of 2 GiB or more (the root file system on a plain partition: no LVM or RAID)</li>
+<li>GRUB 2; BIOS or UEFI, with Secure Boot off</li>
+<li>python3 and OpenSSL 3 (Debian 12, Ubuntu 22.04 and later have them)</li>
+<li>virtio NIC and disk (as KVM clouds give). With several NICs RustROS uses the first</li>
+</ul>
+<h3>Options</h3>
+<p>Passed through <code>sh -s --</code>, e.g. <code>curl -fsSL https://rustros.com/install.sh | sh -s -- --apps shell,webadmin</code>:</p>
+<table>
+<tr><th>Option</th><th>What it does</th></tr>
+<tr><td><code>--apps a,b</code></td><td>apps installed at first boot (default <code>shell</code>)</td></tr>
+<tr><td><code>--ip A/N --gw G</code></td><td>a static address</td></tr>
+<tr><td><code>--dhcp</code></td><td>DHCP</td></tr>
+<tr><td><code>--panel URL</code></td><td>connect to a management panel</td></tr>
+<tr><td><code>--key K</code></td><td>the update key (default: a new random one)</td></tr>
+<tr><td><code>--no-test</code></td><td>no test boot</td></tr>
+<tr><td><code>--yes</code></td><td>do not ask (reboot for the test straight away; no typed yes before writing)</td></tr>
+</table>
+
+<h2 id="qemu-en">Try it in QEMU</h2>
+<p>Every release has a disk image, <code>rustros-x86_64.img</code> (linked on the releases page). Grow it to 2 GiB or more and boot it:</p>
+<div class="cmd"><pre>truncate -s 2G rustros-x86_64.img
+qemu-system-x86_64 -m 256 -nographic \
+  -drive file=rustros-x86_64.img,format=raw,if=virtio \
+  -nic user,model=virtio-net-pci</pre></div>
+<p>It gets its address by DHCP. The image has no update key, so online updates are off; the console and everything else work.</p>
+
+<h2 id="console-en">The console</h2>
+<p>The serial port and the screen show the same console. It starts in <b>rescue</b>, the built-in console; once the <code>shell</code> app is installed the console is its, with the prompt <code>rustros&gt;</code>. <b>Ctrl-]</b> switches between them. <code>help</code> lists the commands.</p>
+<p>The shell's everyday commands:</p>
+<table>
+<tr><td><code>ip</code> / <code>arp</code> / <code>conns</code></td><td>NICs and counters, the ARP table, connections and listening ports</td></tr>
+<tr><td><code>ping</code> / <code>curl</code></td><td>connectivity; curl speaks HTTPS</td></tr>
+<tr><td><code>mod</code> / <code>modules</code></td><td>installed / running modules</td></tr>
+<tr><td><code>cfg &lt;app&gt; [key [value | -]]</code></td><td>show, set or remove an app's settings; a password key without a value asks for it, hidden</td></tr>
+<tr><td><code>pkg ...</code></td><td>the package manager, below</td></tr>
+<tr><td><code>log</code> / <code>crash</code></td><td>each boot's console log (kept on disk) / the last crash</td></tr>
+<tr><td><code>slot</code> / <code>confirm</code></td><td>the A/B kernel slots; keep a kernel on trial</td></tr>
+<tr><td><code>df</code> / <code>uptime</code> / <code>date</code></td><td>storage use, uptime, the time</td></tr>
+<tr><td><code>reboot</code> / <code>poweroff</code></td><td></td></tr>
+</table>
+
+<h2 id="network-en">Network settings</h2>
+<p>Network changes go through a candidate, so a mistake does not lock you out:</p>
+<div class="cmd"><pre>cand ip nic0 203.0.113.10/24 203.0.113.1
+apply          # in effect, then it asks; no "yes" within 10 s and it goes back
+save           # into the GRUB environment block: kept across reboots</pre></div>
+<p><code>ip nic0 A/N GW</code> applies at once but is not saved. <code>ip nic0 add A</code> adds an address (for NAT egress).</p>
+
+<h2 id="apps-en">Apps and pkg</h2>
+<p>What RustROS does is in apps; the kernel carries only rescue, dhcp and the updater. Apps come from the signed releases:</p>
+<div class="cmd"><pre>pkg update            # the latest manifest, signature checked
+pkg list              # installed and available versions, what can be upgraded
+pkg install nat router wireguard
+pkg upgrade           # every app with a newer version
+pkg upgrade kernel    # the new kernel into the spare slot: reboot to try it, confirm to keep it
+pkg remove cake</pre></div>
+<p id="applist-en" class="mut">Reading the list of apps…</p>
+<p>Every app's settings are shown and changed with <code>cfg</code>: <code>cfg nat</code> lists NAT's settings with what each does.</p>
+
+<h2 id="update-en">Online updates and remote management</h2>
+<p><a href="/tools/rustros-update.py"><code>rustros-update.py</code></a> (Python 3, no dependencies) manages a machine from another one; the traffic is authenticated and encrypted with the update key:</p>
+<div class="cmd"><pre>export RUSTROS_KEY=$(cat update.key)
+python3 rustros-update.py 203.0.113.10 info
+python3 rustros-update.py 203.0.113.10 upload rustros-x86_64.elf --wait
+python3 rustros-update.py 203.0.113.10 module-install nat nat-x86_64.mod
+python3 rustros-update.py 203.0.113.10 module-config webadmin allow 198.51.100.7
+python3 rustros-update.py 203.0.113.10 log prev</pre></div>
+<p><code>upload --wait</code> writes the kernel into the spare slot, boots it once and confirms it once it is up. A kernel that does not come up, or is not confirmed, is followed by the old one at the next boot; after three unstable boots it starts in safe mode, at the fourth the other slot takes over.</p>
+
+<h2 id="webadmin-en">Web admin</h2>
+<p>The <code>webadmin</code> app serves a web admin on port 8080; each app's page is generated from the settings it declares. By default only the networks of NICs without a gateway may connect, so on a VPS allow your own address and set a password first:</p>
+<div class="cmd"><pre>pkg install webadmin
+cfg webadmin allow 198.51.100.7
+cfg webadmin password      # asked twice, not shown</pre></div>
+
+<h2 id="panel-en">Panel</h2>
+<p>The <code>panel</code> app connects the machine to a management panel, which shows its state, installs and configures apps and updates the kernel. Install with <code>--panel https://your-panel</code>, or later <code>cfg panel url https://your-panel</code>. On first contact the console shows a claim code to enter in the panel. What the panel has it download must come from <code>cfg panel downloads</code> (default https://rustros.com/).</p>
+
+<h2 id="storage-en">Storage</h2>
+<table>
+<tr><th>Where</th><th>What</th></tr>
+<tr><td>0 – 64 MiB</td><td>the boot area: GPT, GRUB, two kernel slots, apps carried by the image</td></tr>
+<tr><td>64 – 512 MiB</td><td>cache partition: each boot's console log</td></tr>
+<tr><td>512 MiB – 1 GiB</td><td>data partition: a crash-safe key-value store (settings, installed apps)</td></tr>
+<tr><td>1 GiB – the end</td><td>files partition: a standard ext4 with a jbd2 journal and metadata checksums (metadata_csum, 64bit); each app has its own directory</td></tr>
+</table>
+<p>The partitions are made at first boot. Linux mounts and e2fscks the files partition as it is, and RustROS reads and writes ext4 that Linux formatted with its defaults.</p>
+
+<h2 id="security-en">Security</h2>
+<ul>
+<li>Release manifests are signed with Ed25519; the public key is built into the installer, <code>pkg</code> and the panel app; every file's SHA-256 is checked.</li>
+<li>Online updates and remote management are authenticated and encrypted with the update key.</li>
+<li>The update key is kept in plain text in GRUB's configuration on the disk: whoever reads the disk has it.</li>
+<li>Outside the kernel, all code is Rust with <code>#![forbid(unsafe_code)]</code>.</li>
+</ul>
+
+<h2 id="build-en">Build from source</h2>
+<div class="cmd"><pre>git clone https://github.com/rustros/rustros && cd rustros
+make            # the kernel and the disk image build/rustros.img (Rust, nasm, GRUB, mtools)
+make modules    # the apps: build/modules/*.mod
+make run-bios   # run it in QEMU</pre></div>
+</div>
+</article>
+</main>
+
+<footer><div class="wrap">RustROS · <a href="https://github.com/rustros/rustros">github.com/rustros/rustros</a> · <a href="/releases/">releases</a></div></footer>
+
+<script src="/site.js"></script>
+<script>
+// English headings carry -en ids; the table of contents follows the language
+for (const a of document.querySelectorAll('.toc [data-l="en"] a')) a.href = a.getAttribute("href") + "-en";
+latest().then(m => {
+  const rows = Object.entries(m.modules || {}).sort().map(([n, e]) => `<tr><td><code>${esc(n)}</code></td><td>${esc(e.description || "")}</td></tr>`).join("");
+  const t = `<table><tr><th>app</th><th></th></tr>${rows}</table>`;
+  for (const id of ["applist", "applist-en"]) { const el = document.getElementById(id); el.className = ""; el.innerHTML = t; }
+}).catch(() => {
+  document.getElementById("applist").textContent = "（应用列表暂时读不到）";
+  document.getElementById("applist-en").textContent = "(the list of apps could not be read)";
+});
+</script>
+</body>
+</html>

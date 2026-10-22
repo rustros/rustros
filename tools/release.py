@@ -3,22 +3,27 @@
 sites app.
 
   release.py --host <origin address> [--version 2026.10.22.1] [--no-build]
+             [--notes-zh TEXT] [--notes-en TEXT]
              [--site rustros.com] [--key build/release.key] [--token-file build/sites.token]
 
 It builds the kernel and the modules with RUSTROS_BUILD=<version> (unless
 --no-build: then it checks the built files carry that version), writes
-releases/<version>/ with the kernel and every app, the manifest
-releases/latest.json signed with the release key (Ed25519, by openssl:
-releases/latest.json.sig, base64url) and the public key releases/key.pub,
-and uploads them and site/ over HTTPS (PUT /_sites/files/...).
+releases/<version>/ with the kernel, every app and the installer's disk
+image (tools/mkimg.py --template), the manifest releases/latest.json signed
+with the release key (Ed25519, by openssl: releases/latest.json.sig,
+base64url; a copy of both in releases/<version>/) and the public key
+releases/key.pub; adds the release to releases/index.json (the history the
+website shows, with its notes); and uploads them, site/ and
+tools/rustros-update.py over HTTPS (PUT /_sites/files/...).
 
 The manifest is what the panel and `pkg` read:
   {"format":1, "version", "date",
    "kernel":{"version", "x86_64":{"url","sha256","size"}},
+   "image":{"x86_64":{"url","sha256","size"}},
    "modules":{"<name>":{"version","kind","description","requires",
                         "native":{"x86_64":{"url","sha256","size"}}}}}
 """
-import argparse, base64, datetime, hashlib, http.client, json, os, socket, ssl, subprocess, sys
+import argparse, base64, datetime, hashlib, http.client, json, os, socket, ssl, subprocess, sys, urllib.error, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -69,6 +74,8 @@ def main():
     ap.add_argument("--key", default=f"{ROOT}/build/release.key")
     ap.add_argument("--token-file", default=f"{ROOT}/build/sites.token")
     ap.add_argument("--dry-run", action="store_true", help="build and sign, upload nothing")
+    ap.add_argument("--notes-zh", default="", help="what is new, in Chinese (the releases page)")
+    ap.add_argument("--notes-en", default="", help="what is new, in English")
     a = ap.parse_args()
 
     version = a.version or datetime.datetime.now(datetime.timezone.utc).strftime("%Y.%m.%d") + ".1"
@@ -77,8 +84,13 @@ def main():
         subprocess.run(["touch", f"{ROOT}/api/src/lib.rs"], check=True)
         subprocess.run(["make", "-C", ROOT, "all", "modules"], env=env, check=True, stdout=subprocess.DEVNULL)
     kernel = open(f"{ROOT}/build/rustros.elf", "rb").read()
+    # the installer's disk image: no key, network or apps in it
+    tmpl = f"{ROOT}/build/rustros-x86_64.img"
+    subprocess.run(["python3", f"{ROOT}/tools/mkimg.py", f"{ROOT}/build/rustros.elf", tmpl, "--template"], check=True, stdout=subprocess.DEVNULL)
+    image = open(tmpl, "rb").read()
     files = {}  # published path (under releases/<version>/) -> bytes
     files["rustros-x86_64.elf"] = kernel
+    files["rustros-x86_64.img"] = image
     mods = {}
     for name, desc in APPS.items():
         data = open(f"{ROOT}/build/modules/{name}.mod", "rb").read()
@@ -92,6 +104,7 @@ def main():
         "version": version,
         "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "kernel": {"version": version, "x86_64": {"url": f"https://{a.site}/releases/{version}/rustros-x86_64.elf", "sha256": sha256(kernel), "size": len(kernel)}},
+        "image": {"x86_64": {"url": f"https://{a.site}/releases/{version}/rustros-x86_64.img", "sha256": sha256(image), "size": len(image)}},
         "modules": mods,
     }
     body = (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode()
@@ -107,6 +120,18 @@ def main():
     if "Successfully" not in v.stdout + v.stderr:
         raise SystemExit("the manifest's signature does not verify")
     print(f"release {version}: kernel {len(kernel)} bytes, {len(mods)} apps, manifest signed by {base64.b64encode(pub).decode()}")
+    # the history: this release added (or replaced), newest first
+    try:
+        req = urllib.request.Request(f"https://{a.site}/releases/index.json", headers={"User-Agent": "rustros-release/1", "Cache-Control": "no-cache"})
+        history = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        history = []
+    history = [h for h in history if h.get("version") != version]
+    history.insert(0, {"version": version, "date": manifest["date"], "notes": {"zh": a.notes_zh, "en": a.notes_en},
+                       "kernel": len(kernel), "image": len(image), "apps": sorted(mods)})
+    index = (json.dumps(history, indent=1, ensure_ascii=False) + "\n").encode()
     if a.dry_run:
         return
     token = open(a.token_file).read().strip()
@@ -115,6 +140,9 @@ def main():
     for name, data in files.items():
         up(f"releases/{version}/{name}", data)
         print(f"  releases/{version}/{name} ({len(data)} bytes)")
+    up(f"releases/{version}/manifest.json", body)
+    up(f"releases/{version}/manifest.json.sig", b64u(sig).encode())
+    up("tools/rustros-update.py", open(f"{ROOT}/tools/rustros-update.py", "rb").read())
     for d, _, fs in os.walk(f"{ROOT}/site"):
         for f in fs:
             p = os.path.join(d, f)
@@ -124,7 +152,8 @@ def main():
     # the manifest last: what it names is there before it is announced
     up("releases/latest.json.sig", b64u(sig).encode())
     up("releases/latest.json", body)
-    print(f"  releases/latest.json (+ .sig, key.pub)\nhttps://{a.site}/releases/latest.json")
+    up("releases/index.json", index)
+    print(f"  releases/latest.json (+ .sig, key.pub), releases/index.json ({len(history)} releases)\nhttps://{a.site}/releases/latest.json")
 
 
 if __name__ == "__main__":

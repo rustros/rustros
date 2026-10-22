@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RustROS Releases</title>
+<meta name="description" content="Every RustROS release: what is new, the kernel, the disk image and the apps, with their checksums.">
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header><div class="wrap">
+  <a class="logo" href="/">Rust<span>ROS</span></a>
+  <nav><a href="/docs/"><span data-l="zh">文档</span><span data-l="en">Docs</span></a><a class="on" href="/releases/"><span data-l="zh">发布</span><span data-l="en">Releases</span></a><a class="opt" href="https://github.com/rustros/rustros">GitHub</a></nav>
+  <button class="lang" id="lang" type="button">EN</button>
+</div></header>
+
+<main class="wrap" style="padding:36px 20px 60px">
+  <h2 style="margin-top:0" data-l="zh">发布记录</h2><h2 style="margin-top:0" data-l="en">Releases</h2>
+  <p class="mut" data-l="zh">每个版本的清单都用 Ed25519 签名（公钥见<a href="/">首页</a>）；已部署的机器用 <code>pkg upgrade</code> 或面板升级，新机器用<a href="/docs/#install">安装脚本</a>。</p>
+  <p class="mut" data-l="en">Each release's manifest is signed with Ed25519 (the key is on the <a href="/">home page</a>); running machines upgrade with <code>pkg upgrade</code> or the panel, new ones with <a href="/docs/#install-en">the installer</a>.</p>
+  <div id="list"><p class="mut"><span data-l="zh">正在读取…</span><span data-l="en">Reading…</span></p></div>
+</main>
+
+<footer><div class="wrap">RustROS · <a href="https://github.com/rustros/rustros">github.com/rustros/rustros</a> · <a href="/docs/">docs</a></div></footer>
+
+<script src="/site.js"></script>
+<script>
+const kib = n => Math.round(n / 1024) + " KiB";
+async function files(v) {
+  // the release's own manifest (older ones may have none)
+  const r = await fetch(`/releases/${encodeURIComponent(v)}/manifest.json`);
+  if (!r.ok) return "";
+  const m = await r.json();
+  const row = (name, e) => `<tr><td><a href="${esc(e.url)}">${esc(name)}</a></td><td>${kib(e.size)}</td><td><code>${esc(e.sha256.slice(0, 16))}…</code></td></tr>`;
+  let t = "";
+  if (m.kernel && m.kernel.x86_64) t += row("rustros-x86_64.elf", m.kernel.x86_64);
+  if (m.image && m.image.x86_64) t += row("rustros-x86_64.img", m.image.x86_64);
+  for (const [n, e] of Object.entries(m.modules || {}).sort()) if (e.native && e.native.x86_64) t += row(`${n}-x86_64.mod`, e.native.x86_64);
+  return `<table>${t}</table><p class="mut" style="font-size:14px"><a href="/releases/${esc(v)}/manifest.json">manifest.json</a> · <a href="/releases/${esc(v)}/manifest.json.sig">.sig</a></p>`;
+}
+fetch("/releases/index.json", { cache: "no-cache" }).then(r => r.ok ? r.json() : Promise.reject(r.status)).then(list => {
+  const el = document.getElementById("list");
+  el.innerHTML = list.map((h, i) => {
+    const notes = both(esc((h.notes && h.notes.zh) || ""), esc((h.notes && h.notes.en) || ""));
+    const meta = both(`${(h.date || "").slice(0, 10)} · 内核 ${kib(h.kernel)} · ${(h.apps || []).length} 个应用`, `${(h.date || "").slice(0, 10)} · kernel ${kib(h.kernel)} · ${(h.apps || []).length} apps`);
+    return `<div class="rel"><h3>${esc(h.version)}${i === 0 ? both(" · 最新", " · latest") : ""}</h3><p class="meta">${meta}</p><p>${notes}</p>
+      <details${i === 0 ? " open" : ""} data-v="${esc(h.version)}"><summary>${both("文件", "Files")}</summary><div class="files mut">…</div></details></div>`;
+  }).join("") || both("还没有发布版。", "No release yet.");
+  for (const d of el.querySelectorAll("details")) {
+    const load = () => { if (d.dataset.done) return; d.dataset.done = 1; files(d.dataset.v).then(t => d.querySelector(".files").outerHTML = t || both("（这个版本没有单独的清单）", "(no manifest kept for this release)")); };
+    if (d.open) load(); d.addEventListener("toggle", load);
+  }
+}).catch(() => {
+  // before the history began: the latest release alone
+  latest().then(m => { document.getElementById("list").innerHTML = `<div class="rel"><h3>${esc(m.version)}</h3><p class="meta">${(m.date || "").slice(0, 10)}</p></div>`; });
+});
+</script>
+</body>
+</html>

@@ -32,10 +32,17 @@ pub struct Console {
     esc_num: u8,
     /// output escape sequence for the screen: 1 after ESC, 2 after ESC [
     out_esc: u8,
-    /// nobody drains the serial port: output to it is dropped (the screen
-    /// and the log keep everything) until it has room again
+    /// nobody drains the serial port: no more waiting for it (output
+    /// queues in `sbuf`) until it has room again
     serial_stuck: bool,
+    /// serial output not sent yet: a ring, the oldest dropped when full
+    /// (the screen and the log keep everything)
+    sbuf: [u8; SBUF],
+    shead: usize,
+    slen: usize,
 }
+
+const SBUF: usize = 16384;
 
 static CON: Global<Console> = Global::new(Console {
     serial: false,
@@ -50,6 +57,9 @@ static CON: Global<Console> = Global::new(Console {
     esc_num: 0,
     out_esc: 0,
     serial_stuck: false,
+    sbuf: [0; SBUF],
+    shead: 0,
+    slen: 0,
 });
 
 fn con() -> &'static mut Console {
@@ -270,27 +280,40 @@ impl Console {
         if !self.serial {
             return;
         }
-        unsafe {
-            // never wait long: a serial line nobody reads (a host's
-            // unconnected or full console backend) must not stall the system
-            if self.serial_stuck {
-                if inb(COM1 + 5) & 0x20 == 0 {
+        if self.slen == SBUF {
+            self.shead = (self.shead + 1) % SBUF;
+            self.slen -= 1;
+        }
+        self.sbuf[(self.shead + self.slen) % SBUF] = ch;
+        self.slen += 1;
+    }
+
+    /// Queued output to the UART, 16 bytes (its FIFO) whenever it is empty.
+    /// `patient`: wait a little for it (never long: a serial line nobody
+    /// reads must not stall the system); else only what it takes now.
+    fn serial_drain(&mut self, patient: bool) {
+        while self.slen > 0 {
+            unsafe {
+                let mut ready = inb(COM1 + 5) & 0x20 != 0;
+                if !ready && patient && !self.serial_stuck {
+                    for _ in 0..2000 {
+                        if inb(COM1 + 5) & 0x20 != 0 {
+                            ready = true;
+                            break;
+                        }
+                    }
+                    self.serial_stuck = !ready;
+                }
+                if !ready {
                     return;
                 }
                 self.serial_stuck = false;
-            }
-            let mut ready = false;
-            for _ in 0..2000 {
-                if inb(COM1 + 5) & 0x20 != 0 {
-                    ready = true;
-                    break;
+                for _ in 0..self.slen.min(16) {
+                    outb(COM1, self.sbuf[self.shead]);
+                    self.shead = (self.shead + 1) % SBUF;
+                    self.slen -= 1;
                 }
             }
-            if !ready {
-                self.serial_stuck = true;
-                return;
-            }
-            outb(COM1, ch);
         }
     }
 
@@ -309,6 +332,7 @@ impl Console {
             self.serial_putc(ch);
             self.screen_putc(ch);
         }
+        self.serial_drain(true);
         self.cursor(true);
     }
 
@@ -379,6 +403,10 @@ pub fn write_str(s: &str) {
 /// Non-blocking read from serial or keyboard.
 pub fn getc() -> Option<u8> {
     let c = con();
+    // (called every pass of the main loop: queued output goes out as the line takes it)
+    if c.slen > 0 {
+        c.serial_drain(false);
+    }
     if c.serial && unsafe { inb(COM1 + 5) } & 1 != 0 {
         let ch = unsafe { inb(COM1) };
         // cursor keys arrive as ESC [ A..D / H / F, ESC [ n ~, or ESC O x
