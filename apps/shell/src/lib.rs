@@ -6,6 +6,8 @@ extern crate alloc;
 
 mod curl;
 #[cfg(feature = "tls")]
+mod pkg;
+#[cfg(feature = "tls")]
 mod warp;
 
 use alloc::string::String;
@@ -99,6 +101,8 @@ pub struct Shell {
     curl: Option<curl::Curl>,
     #[cfg(feature = "tls")]
     warp: Option<warp::Warp>,
+    #[cfg(feature = "tls")]
+    pkg: Option<pkg::Pkg>,
     /// asking for a secret setting: (module, key, the first entry)
     secret: Option<(String, String, Option<String>)>,
 }
@@ -118,7 +122,7 @@ impl Shell {
         match cmd {
             "help" => say!(
                 sys,
-                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping [-c n] [-i s] [-q] [-I nicN|ip] <ip>   ICMP echo (Ctrl-C stops; -i 0:\n                      back to back; -I: the interface or our address to\n                      send from, an extra one too)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  curl [-i] [-I] [-v] [-m s] [--interface nicN|ip] [--dns-servers ip] [http[s]://]host[:port][/path]\n                      HTTP from the command line (DNS: cfg shell dns <ip>, default 1.1.1.1;\n                      also -X method, -H header, -d data)\n  warp [<if>]         register a Cloudflare WARP device, set up WireGuard <if> (warp)\n  warp <if> license <key> | show | remove\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  date                the time (UTC, from the real-time clock)\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
+                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping [-c n] [-i s] [-q] [-I nicN|ip] <ip>   ICMP echo (Ctrl-C stops; -i 0:\n                      back to back; -I: the interface or our address to\n                      send from, an extra one too)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  curl [-i] [-I] [-v] [-m s] [--interface nicN|ip] [--dns-servers ip] [http[s]://]host[:port][/path]\n                      HTTP from the command line (DNS: cfg shell dns <ip>, default 1.1.1.1;\n                      also -X method, -H header, -d data)\n  warp [<if>]         register a Cloudflare WARP device, set up WireGuard <if> (warp)\n  warp <if> license <key> | show | remove\n  pkg update | list | info <app> | install <app>... | upgrade [kernel] | remove <app>\n                      apps and the kernel from the signed release (cfg shell repo <url>)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  date                the time (UTC, from the real-time clock)\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
             ),
             "cfg" => match (args.next(), args.next(), args.next()) {
                 (Some(m), None, _) => {
@@ -260,6 +264,16 @@ impl Shell {
                     Err(e) => say!(sys, "{}", e),
                 }
             }
+            #[cfg(feature = "tls")]
+            "pkg" => {
+                let rest: Vec<&str> = args.collect();
+                match pkg::Pkg::start(sys, &rest) {
+                    Ok(p) => self.pkg = p,
+                    Err(e) => say!(sys, "{}", e),
+                }
+            }
+            #[cfg(not(feature = "tls"))]
+            "pkg" => say!(sys, "pkg: this shell was built without TLS (the loadable shell module has it)\n"),
             #[cfg(not(feature = "tls"))]
             "warp" => say!(sys, "warp: this shell was built without TLS (the loadable shell module has it)\n"),
             "curl" => {
@@ -575,6 +589,11 @@ impl Module for Shell {
             self.warp = None;
             self.prompt(sys);
         }
+        #[cfg(feature = "tls")]
+        if self.pkg.as_mut().is_some_and(|p| p.poll(sys)) {
+            self.pkg = None;
+            self.prompt(sys);
+        }
     }
 
     fn key(&mut self, sys: &mut dyn Sys, c: u8) {
@@ -598,6 +617,8 @@ impl Module for Shell {
                 let curl = self.curl.take().map(|mut c| c.abort(sys)).is_some();
                 #[cfg(feature = "tls")]
                 let curl = self.warp.take().map(|mut w| w.abort(sys)).is_some() | curl;
+                #[cfg(feature = "tls")]
+                let curl = self.pkg.take().map(|mut p| p.abort(sys)).is_some() | curl;
                 if http | curl {
                     say!(sys, "^C\n");
                     self.prompt(sys);
@@ -605,7 +626,7 @@ impl Module for Shell {
             }
             _ => {
                 const COMMANDS: &[&str] = &[
-                    "help", "warp", "ip", "mtu", "cand", "apply", "revert", "confirm", "discard", "save", "arp", "conns", "modules", "ping", "http", "curl", "date", "kv", "df", "crash",
+                    "help", "warp", "pkg", "ip", "mtu", "cand", "apply", "revert", "confirm", "discard", "save", "arp", "conns", "modules", "ping", "http", "curl", "date", "kv", "df", "crash",
                     "mod", "cfg", "uptime", "slot", "log", "reboot", "poweroff",
                 ];
                 if let Some(line) = self.edit.key(sys, c, "rustros> ", &|s, w| netcmd::complete(s, w, COMMANDS)) {
@@ -631,7 +652,7 @@ impl Module for Shell {
                         self.command(sys, &line);
                     }
                     #[cfg(feature = "tls")]
-                    let busy = self.warp.is_some();
+                    let busy = self.warp.is_some() || self.pkg.is_some();
                     #[cfg(not(feature = "tls"))]
                     let busy = false;
                     if self.ping.is_none() && self.http.is_none() && self.curl.is_none() && self.ask.is_none() && self.secret.is_none() && !busy {
