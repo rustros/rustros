@@ -1,0 +1,14 @@
+[package]
+name = "dhcp-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dhcp"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+dhcp = { path = "../../apps/dhcp" }

@@ -100,6 +100,11 @@ impl Updater {
         Err("boot disk not found among virtio-blk devices")
     }
 
+    /// The running kernel's slot: (first sector, sectors).
+    pub fn running(&self) -> (u64, u64) {
+        (self.lba[if self.slot == 'a' { 0 } else { 1 }], self.sectors)
+    }
+
     fn target_lba(&self) -> u64 {
         self.lba[if other(self.slot) == 'a' { 0 } else { 1 }]
     }

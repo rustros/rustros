@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+mod bootmods;
 mod modules;
 mod offload;
 mod klog;
@@ -167,7 +168,9 @@ const SAFE_MODE_AT: u32 = 3;
 /// A trial boot that is not confirmed in time falls back to the old slot.
 const TRIAL_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
-/// The applications built into this image (see the features in Cargo.toml).
+/// Applications built into the kernel itself (features in Cargo.toml; none
+/// by default: rescue, dhcp and the updater are boot modules).
+#[allow(unused_mut)]
 fn make_apps() -> Vec<Box<dyn Module>> {
     let mut apps: Vec<Box<dyn Module>> = Vec::new();
     #[cfg(feature = "rescue")]
@@ -190,6 +193,8 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     mem::HEAP.init();
     let bi = multiboot::parse(magic, info);
     console::init(bi.fb, bi.efi);
+    // the kernel image GRUB loaded again as a module: its boot modules (copied before anything else is loaded)
+    let grub_image: Option<Vec<u8>> = bi.module.map(|m| m.to_vec());
     kprintln!("RustROS {} ({} boot, {})", rustros_api::BUILD, if bi.efi { "UEFI" } else { "BIOS" }, console::describe());
     if magic != multiboot::MAGIC {
         kprintln!("warning: not booted by a multiboot2 loader");
@@ -374,12 +379,35 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
 
     let mut slots: Vec<Slot> = make_apps().into_iter().map(Slot::Builtin).collect();
+    // the boot modules: from GRUB (module2), else read from the running slot
+    let image = grub_image.or_else(|| {
+        let b = k.boot.as_mut()?;
+        let (lba, sectors) = b.upd.running();
+        bootmods::read_slot(&mut *b.disk, lba, sectors)
+    });
+    match image.as_deref().map(bootmods::parse) {
+        Some(Ok(mods)) => {
+            for (name, img) in mods {
+                let name: &'static str = Box::leak(name.into_boxed_str());
+                let before = modules::set_current_native(Some(name));
+                let r = loader::load(&img);
+                modules::set_current_native(before);
+                match r {
+                    Ok(m) if matches!(m.export, Some(rustros_api::module::Export::Module(_))) => slots.push(Slot::Native(m)),
+                    Ok(_) => kprintln!("modules: boot module {} is not an app", name),
+                    Err(e) => kprintln!("modules: boot module {}: {}", name, e),
+                }
+            }
+        }
+        Some(Err(e)) => kprintln!("modules: no boot modules: {}", e),
+        None => kprintln!("modules: no boot modules (no kernel image from GRUB, the slot not readable)"),
+    }
     k.names = slots.iter_mut().map(|s| s.app().map_or("", |a| a.name())).collect();
-    // built-in apps get what they ask for
+    // boot modules get what they ask for
     k.caps = slots.iter_mut().map(|s| s.app().map_or(Caps::NONE, |a| a.caps())).collect();
     k.builtin_names = k.names.clone();
     k.stack.owner_names = k.names.clone();
-    kprintln!("modules: {} (built in)", k.names.join(", "));
+    kprintln!("modules: {} (boot modules)", k.names.join(", "));
     for id in 0..slots.len() {
         modules::call(&mut k, &mut slots, id, |app, ctx| app.start(ctx));
     }

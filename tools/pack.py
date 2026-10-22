@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Pack the kernel into a self-extracting ELF, so a bigger kernel fits a slot.
 
-  pack.py KERNEL.elf OUT.elf
+  pack.py KERNEL.elf OUT.elf [--boot=NAME=FILE ...]
+
+With --boot, the boot modules follow the ELF (4 KiB aligned) in OUT: the
+kernel image a slot holds, GRUB loads (the ELF) and hands over again
+(module2) for the kernel to start them.
 
 The kernel's loadable image (code, read-only data, data) is LZ4-compressed
 and put behind a 32-bit stub. GRUB loads two segments:
@@ -268,13 +272,39 @@ def pack(kernel: bytes) -> bytes:
     return body + bytes(shoff - len(body)) + bytes(64)
 
 
+BUNDLE_MAGIC = b"RRSBNDL1"
+BUNDLE_HEAD = 4096   # magic, count, then 80-byte entries: name (32), offset in sectors (4), bytes (4), SHA-256 (32), pad (8)
+BUNDLE_ENTRY = 80
+
+
+def boot_bundle(specs):
+    """The boot modules, after the kernel ELF (see kernel/src/bootmods.rs)."""
+    import hashlib
+    entries, blobs, at = [], [], BUNDLE_HEAD // 512
+    for spec in specs:
+        name, path = spec.split("=", 1)
+        data = open(path, "rb").read()
+        entries.append(name.encode().ljust(32, b"\0") + struct.pack("<II", at, len(data)) + hashlib.sha256(data).digest() + bytes(8))
+        padded = data + bytes(-len(data) % 512)
+        blobs.append(padded)
+        at += len(padded) // 512
+    head = (BUNDLE_MAGIC + struct.pack("<II", len(entries), 0) + b"".join(entries)).ljust(BUNDLE_HEAD, b"\0")
+    return head + b"".join(blobs)
+
+
 def main():
-    if len(sys.argv) != 3:
+    args = [a for a in sys.argv[1:] if not a.startswith("--boot=")]
+    boot = [a[len("--boot="):] for a in sys.argv[1:] if a.startswith("--boot=")]
+    if len(args) != 2:
         sys.exit(__doc__)
-    kernel = open(sys.argv[1], "rb").read()
+    kernel = open(args[0], "rb").read()
     out = pack(kernel)
-    open(sys.argv[2], "wb").write(out)
-    print(f"pack: {len(kernel)} -> {len(out)} bytes")
+    elf = len(out)
+    if boot:
+        # the kernel image: the ELF, then (4 KiB aligned) its boot modules
+        out += bytes(-len(out) % 4096) + boot_bundle(boot)
+    open(args[1], "wb").write(out)
+    print(f"pack: kernel {len(kernel)} -> {elf} bytes" + (f", with boot modules {len(out)} bytes ({', '.join(b.split('=')[0] for b in boot)})" if boot else ""))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,14 @@
+[package]
+name = "rescue-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rescue"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+rescue = { path = "../../apps/rescue" }

@@ -22,6 +22,8 @@ pub struct BootInfo {
     pub efi: bool,
     /// Copy of the ACPI RSDP (tag 14 or 15)
     pub rsdp: Option<&'static [u8]>,
+    /// The first module GRUB loaded (`module2`): the kernel image again, with its boot modules
+    pub module: Option<&'static [u8]>,
 }
 
 fn rd32(b: &[u8], o: usize) -> u32 {
@@ -29,7 +31,7 @@ fn rd32(b: &[u8], o: usize) -> u32 {
 }
 
 pub fn parse(magic: u32, info: u32) -> BootInfo {
-    let mut bi = BootInfo { cmdline: &[], fb: None, efi: false, rsdp: None };
+    let mut bi = BootInfo { cmdline: &[], fb: None, efi: false, rsdp: None, module: None };
     if magic != MAGIC || info == 0 {
         return bi;
     }
@@ -63,6 +65,13 @@ pub fn parse(magic: u32, info: u32) -> BootInfo {
                     green: (c(34), c(35)),
                     blue: (c(36), c(37)),
                 });
+            }
+            3 if size >= 16 && bi.module.is_none() => {
+                let (start, end) = (rd32(t, 8) as usize, rd32(t, 12) as usize);
+                if end > start {
+                    // Safety: GRUB loaded it there, identity-mapped, and nothing else uses it
+                    bi.module = Some(unsafe { core::slice::from_raw_parts(start as *const u8, end - start) });
+                }
             }
             11 | 12 => bi.efi = true,
             // prefer the ACPI 2.0 RSDP (XSDT) when both are there

@@ -2,7 +2,7 @@
 # unlike the kernel). Built by `make modules`; each module is a static-pie
 # ELF whose entry point is rustros_module_init.
 [workspace]
-members = ["support", "echo", "crashy", "httpd", "shell", "nat", "l2tp", "router", "cake", "wasm", "webadmin", "wireguard", "proxy", "anytls", "panel", "sites", "ext4"]
+members = ["support", "echo", "crashy", "httpd", "shell", "nat", "l2tp", "router", "cake", "wasm", "webadmin", "wireguard", "proxy", "anytls", "panel", "sites", "ext4", "updater", "rescue", "dhcp"]
 resolver = "3"
 
 [workspace.package]
@@ -85,3 +85,17 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.rustros-util]
 opt-level = "s"
+
+# boot modules: carried with the kernel in its slot, optimised for size
+[profile.release.package.updater]
+opt-level = "z"
+[profile.release.package.updater-mod]
+opt-level = "z"
+[profile.release.package.rescue]
+opt-level = "z"
+[profile.release.package.rescue-mod]
+opt-level = "z"
+[profile.release.package.dhcp]
+opt-level = "z"
+[profile.release.package.dhcp-mod]
+opt-level = "z"

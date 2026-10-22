@@ -12,7 +12,8 @@ bench = false
 # Each built-in module is a feature. The WebAssembly runtime is not built in:
 # it is the loadable native module modules/wasm.
 [features]
-default = ["rescue", "dhcp", "updater"]
+# none by default: rescue, dhcp and the updater are boot modules (see bootmods.rs)
+default = []
 
 [dependencies]
 rustros-api = { path = "../api" }

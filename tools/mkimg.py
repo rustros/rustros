@@ -340,11 +340,13 @@ fi
 
 menuentry "RustROS (slot $run_slot)" {{
     multiboot2 /boot/kernel-$run_slot.elf rustros.slot=$run_slot rustros.trial=$trial rustros.boots=$boot_count {disk} {net}
+    module2 /boot/kernel-$run_slot.elf
     boot
 }}
 
 menuentry "RustROS (slot $boot_slot, fallback)" {{
     multiboot2 /boot/kernel-$boot_slot.elf rustros.slot=$boot_slot rustros.trial=0 rustros.boots=$boot_count {disk} {net}
+    module2 /boot/kernel-$boot_slot.elf
     boot
 }}
 """

@@ -13,7 +13,9 @@ GW  ?= 10.0.2.2
 MTU ?=
 KEY ?=
 # Modules built into the kernel (everything else is a loadable module, see modules/):
-APPS ?= rescue dhcp updater
+# apps built into the kernel itself (none: rescue, dhcp and the updater are boot modules)
+APPS ?=
+BOOT_MODULES := rescue dhcp updater
 # The online update key is generated once and kept here:
 KEY_FILE ?= build/update.key
 
@@ -30,15 +32,15 @@ QEMU := qemu-system-x86_64 -m 256 -serial stdio \
 	-drive file=$(IMG),format=raw,if=virtio \
 	-nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:9000-:9000,hostfwd=tcp:127.0.0.1:7777-:7
 
-.PHONY: all kernel $(PACKED) wasm modules run-bios run-uefi update clean
+.PHONY: all kernel bootmods $(PACKED) wasm modules run-bios run-uefi update clean
 all: $(IMG)
 
 kernel:
 	cargo build --release -p rustros-kernel --no-default-features --features "$(APPS)"
 
-$(PACKED): kernel tools/pack.py
+$(PACKED): kernel bootmods tools/pack.py
 	@mkdir -p build
-	python3 tools/pack.py $(KERNEL) $@
+	python3 tools/pack.py $(KERNEL) $@ $(foreach m,$(BOOT_MODULES),--boot=$(m)=build/modules/$(m).mod)
 
 $(IMG): $(PACKED) tools/mkimg.py
 	python3 tools/mkimg.py $(PACKED) $@ $(if $(IP),--ip $(IP)) $(if $(GW),--gw $(GW)) --key-file $(KEY_FILE) $(if $(MTU),--mtu $(MTU)) $(if $(KEY),--key $(KEY))
@@ -47,6 +49,12 @@ wasm:
 	cd wasm && cargo build --release
 	@mkdir -p build/wasm
 	cp wasm/target/wasm32-unknown-unknown/release/*.wasm build/wasm/
+
+# the boot modules, built with the kernel (same API)
+bootmods:
+	cd modules && cargo build --release $(foreach m,$(BOOT_MODULES),-p $(m)-mod)
+	@mkdir -p build/modules
+	@for m in $(BOOT_MODULES); do cp modules/target/x86_64-unknown-none/release/$$m build/modules/$$m.mod; done
 
 modules:
 	cd modules && cargo build --release

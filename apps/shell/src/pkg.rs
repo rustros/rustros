@@ -30,7 +30,8 @@ const REPO: &str = "https://rustros.com/releases/latest.json";
 const RELEASE_KEY: &str = "5JddaWkdvKjJte+tGwE9kn6f33EOUj2ixVBBOj45s38=";
 const ARCH: &str = "x86_64";
 const MAX_MODULE: usize = 1 << 20;
-const MAX_KERNEL: usize = 256 * 1024;
+/// A kernel image (the kernel and its boot modules) at most; the slot it goes to decides in the end.
+const MAX_KERNEL: usize = 4 << 20;
 
 enum Step {
     /// the manifest, then its signature
