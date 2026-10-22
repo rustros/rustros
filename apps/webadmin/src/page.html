@@ -216,7 +216,7 @@ $("save").onclick=()=>{if(confirm("把当前运行的网络配置保存为开机
 
 let mods=[];
 async function loadMods(){
-  const d=await api("/api/modules");mods=d.modules;
+  const [d,st]=await Promise.all([api("/api/modules"),IFS.length?null:api("/api/status")]);mods=d.modules;if(st)IFS=st.ifaces;
   const kb=b=>b==null?"-":Math.ceil(b/1024)+" KiB";
   $("modt").innerHTML="<tr><th>模块</th><th>运行</th><th>状态</th><th>native</th><th>wasm</th><th>重启</th><th></th></tr>"+mods.map(m=>
     `<tr><td><a href="#mods/${encodeURIComponent(m.name)}">${esc(m.name)}</a></td><td>${m.running?esc(m.running):"<span class=bad>未运行</span>"}</td><td>${esc(m.state)}${m.off?`<div class=bad>native 因崩溃已停用：${esc(m.off)}</div>`:""}</td><td>${kb(m.native)}</td><td>${kb(m.wasm)}</td><td>${m.restarts}</td><td>`+
@@ -278,28 +278,45 @@ function modPage(m){
   COLLS.length=0;
   const html=renderNode(t,"",[],cfg,hit,m.name);
   const oth=other.length?`<div class="sub">其他设置</div><table>${other.map(k=>`<tr><td>${esc(k)}</td><td>${esc(cfg[k])}</td></tr>`).join("")}</table>`:"";
-  box.innerHTML=`<div class="card" id="mp">${head}${html}${oth}<div class="row"><button class="b p" id="mpsave">保存修改</button><span id="mpmsg" class="mut"></span></div></div>`;
+  box.innerHTML=`<div class="card" id="mp">${pickLists()}${head}${html}${oth}<div class="row"><button class="b p" id="mpsave">保存修改</button><span id="mpmsg" class="mut"></span></div></div>`;
   box.querySelectorAll("[data-k]").forEach(e=>e.addEventListener("input",()=>e.classList.toggle("dirty",val(e)!==e.dataset.o)));
   $("mpsave").onclick=()=>saveForm(m.name)}
-function fieldHtml(key,p,cfg){
+// the interfaces, for pick lists: [name, address, prefix length, extra addresses]
+let IFS=[];
+const ipn=s=>s.split(".").reduce((a,x)=>a*256+(+x),0),nip=n=>[24,16,8,0].map(b=>Math.floor(n/2**b)%256).join(".");
+// the networks of the interfaces with an address: [a.b.c.d/n, interface]
+const ifNets=()=>IFS.filter(f=>f.ip!=="0.0.0.0/0").map(f=>{const [a,l]=f.ip.split("/"),b=2**(32-l);return [nip(Math.floor(ipn(a)/b)*b%2**32)+"/"+l,f.name]});
+function pickLists(){
+  const used=IFS.filter(f=>f.ip!=="0.0.0.0/0");
+  const addr=[...used.map(f=>[f.name,f.ip.split("/")[0]]),...used.map(f=>[f.ip.split("/")[0],f.name]),
+    ...IFS.flatMap(f=>f.extra.split(",").filter(x=>x&&!x.includes("-")).map(x=>[x.trim(),f.name+" 附加地址"]))];
+  const nets=ifNets();
+  const dl=(id,xs)=>`<datalist id=${id}>${xs.map(([v,l])=>`<option value="${esc(v)}">${esc(l)}</option>`).join("")}</datalist>`;
+  return dl("dl-addr",addr)+dl("dl-if",IFS.map(f=>[f.name,f.ip]))+dl("dl-net",nets)}
+// a list setting: type it, or add interfaces and networks from the menu
+function listPick(sel){const i=sel.previousElementSibling,v=sel.value;sel.value="";if(!v)return;
+  const xs=i.value.split(",").map(x=>x.trim()).filter(Boolean);if(!xs.includes(v))xs.push(v);i.value=xs.join(",");i.dispatchEvent(new Event("input"))}
+function fieldHtml(key,p,cfg,label){
   const v=cfg[key],id="f"+Math.random().toString(36).slice(2),def=p.def?`默认：${p.def}`:"";
   let inp;
   if(p.kind==="switch"){const on=(v??p.def)==="on";inp=`<label style="padding:0"><input type=checkbox id=${id} data-k="${esc(key)}" data-sw=1 data-o="${on?"on":"off"}" ${on?"checked":""}> 启用</label>`}
   else if(p.kind==="secret")inp=`<input type=password id=${id} data-k="${esc(key)}" data-sec=1 data-o="" autocomplete="new-password" placeholder="${v!=null?"已设置（留空不修改）":"未设置"}">`;
   else if(p.kind.startsWith("choice:")){const opts=p.kind.slice(7).split("|");inp=`<select id=${id} data-k="${esc(key)}" data-o="${esc(v??"")}"><option value="">${esc(def||"（不设置）")}</option>${opts.map(o=>`<option ${v===o?"selected":""}>${esc(o)}</option>`).join("")}</select>`}
-  else inp=`<input ${p.kind==="number"?"type=number":""} id=${id} data-k="${esc(key)}" data-o="${esc(v??"")}" value="${esc(v??"")}" placeholder="${esc(def)}">`;
+  else if(p.kind==="list")inp=`<div class=row style="margin:0"><input class=grow style="min-width:160px" id=${id} data-k="${esc(key)}" data-o="${esc(v??"")}" value="${esc(v??"")}" placeholder="${esc(def)}"><select onchange="listPick(this)" style="width:auto;flex:none"><option value="">＋ 选择…</option><optgroup label="接口">${IFS.map(f=>`<option value="${esc(f.name)}">${esc(f.name)}</option>`).join("")}</optgroup><optgroup label="网段">${ifNets().map(([n,f])=>`<option value="${esc(n)}">${esc(n)}（${esc(f)}）</option>`).join("")}</optgroup></select></div>`;
+  else{const dl={address:"dl-addr",network:"dl-net"}[p.kind];
+    inp=`<input ${p.kind==="number"?"type=number":""} ${dl?`list=${dl}`:""} id=${id} data-k="${esc(key)}" data-o="${esc(v??"")}" value="${esc(v??"")}" placeholder="${esc(def)}">`}
   const h=[p.help,KIND[p.kind]&&p.kind!=="text"?KIND[p.kind]:"",p.kind!=="secret"&&p.kind!=="switch"&&!p.kind.startsWith("choice")?"":""].filter(Boolean).join(" · ");
-  return `<label for=${id}>${esc(key.split(".").pop()===""?key:p.key.replace(/^.*\.(?=[^.<]*$)/,""))}</label><div class=f>${inp}${h?`<span class=h>${esc(h)}</span>`:""}</div>`}
+  return `<label for=${id}>${esc(label)}</label><div class=f>${inp}${h?`<span class=h>${esc(h)}</span>`:""}</div>`}
 function renderNode(node,prefix,caps,cfg,hit,mod){
   let o="";
-  if(node.fields.length)o+=`<div class=form>${node.fields.map(f=>fieldHtml(prefix+f.lit,f.p,cfg)).join("")}</div>`;
+  if(node.fields.length)o+=`<div class=form>${node.fields.map(f=>fieldHtml(prefix+f.lit,f.p,cfg,f.lit)).join("")}</div>`;
   for(const mp of node.maps){
     const names=Object.entries(hit).filter(([k,h])=>h.p===mp.p&&same(h.caps,caps)).map(([k,h])=>[k,h.caps[h.caps.length-1]]);
     // "user.<name>": rows are user.<name>; base is "user"
     const base=(prefix+mp.lit).replace(/\.$/,""),hole=mp.p.segs[mp.p.segs.length-1].hole;
     o+=`<div class="sub">${esc(base+".<"+hole+">")} <span class="h mut" style="font-weight:400">${esc(mp.p.help||"")}</span></div><table>`+
       names.map(([k,n])=>`<tr><td>${esc(n)}</td><td>${mp.p.kind==="secret"?`<input type=password data-k="${esc(k)}" data-sec=1 data-o="" placeholder="已设置（留空不修改）">`:`<input data-k="${esc(k)}" data-o="${esc(cfg[k])}" value="${esc(cfg[k])}">`}</td><td><button class="b d" onclick="delKey('${esc(mod)}','${esc(k)}')">删除</button></td></tr>`).join("")+
-      `<tr><td><input placeholder="${esc(hole)}" data-new="${esc(base)}"></td><td><input ${mp.p.kind==="secret"?"type=password":""} placeholder="${esc(mp.p.def||KIND[mp.p.kind]||"")}" data-newv=1></td><td><button class="b" onclick="addRow(this,'${esc(mod)}')">添加</button></td></tr></table>`}
+      `<tr><td><input ${hole==="if"?"list=dl-if":hole==="host"||hole==="address"?"list=dl-addr":""} placeholder="${esc(hole)}" data-new="${esc(base)}"></td><td><input ${mp.p.kind==="secret"?"type=password":mp.p.kind==="address"?"list=dl-addr":""} placeholder="${esc(mp.p.def||KIND[mp.p.kind]||"")}" data-newv=1></td><td><button class="b" onclick="addRow(this,'${esc(mod)}')">添加</button></td></tr></table>`}
   for(const c of node.colls){
     const ps=allParams(c),seen=new Set();
     for(const h of Object.values(hit))if(ps.includes(h.p)&&same(h.caps.slice(0,caps.length),caps))seen.add(h.caps[caps.length]??"");
