@@ -74,6 +74,8 @@ struct Instance {
     conns: usize,
     total: u64,
     bytes: u64,
+    /// connections turned away (not in `allow`, or too many)
+    refused: u64,
 }
 
 impl Instance {
@@ -259,7 +261,7 @@ impl Proxy {
             }
         }
         let mut said = BTreeMap::new();
-        let mut old: BTreeMap<String, (usize, u64, u64)> = self.instances.drain(..).map(|i| (i.name, (i.conns, i.total, i.bytes))).collect();
+        let mut old: BTreeMap<String, (usize, u64, u64, u64)> = self.instances.drain(..).map(|i| (i.name, (i.conns, i.total, i.bytes, i.refused))).collect();
         for (name, s) in &by {
             let Some(port) = get(s, "listen").and_then(|p| p.parse::<u16>().ok()).filter(|&p| p != 0) else {
                 said.insert(String::from(*name), format!("proxy: {name}: off (cfg proxy {name}.listen 1080)\n"));
@@ -306,7 +308,7 @@ impl Proxy {
             }
             let mut line: String = bad.iter().map(|b| format!("proxy: {name}: bad setting '{b}' (an address or an interface)\n")).collect();
             let users: BTreeMap<String, String> = s.iter().filter_map(|(k, v)| Some((String::from(k.strip_prefix("user.")?), String::from(*v)))).collect();
-            let (conns, total, bytes) = old.remove(*name).unwrap_or_default();
+            let (conns, total, bytes, refused) = old.remove(*name).unwrap_or_default();
             let i = Instance {
                 name: String::from(*name),
                 kind,
@@ -321,6 +323,7 @@ impl Proxy {
                 conns,
                 total,
                 bytes,
+                refused,
             };
             let open: String = i.allow.iter().map(|(n, m)| format!("{}/{}", IpFmt(*n), m.count_ones())).collect::<Vec<_>>().join(",");
             line += &format!(
@@ -397,6 +400,11 @@ impl Proxy {
                     continue;
                 };
                 if !inst.allowed(peer.ip) || inst.conns >= inst.max {
+                    inst.refused += 1;
+                    if inst.log {
+                        let why = if inst.conns >= inst.max { "too many connections" } else { "not in allow" };
+                        say!(net, "proxy: {}: refused {} ({})\n", inst.name, IpFmt(peer.ip), why);
+                    }
                     net.tcp_abort(s);
                     continue;
                 }
@@ -823,7 +831,7 @@ impl Module for Proxy {
             .iter()
             .map(|i| {
                 format!(
-                    "{} {:?} {}:{} out {}: {} conns, {} total, {} KB",
+                    "{} {:?} {}:{} out {}: {} conns, {} total, {} KB{}",
                     i.name,
                     i.kind,
                     if i.bind == 0 { String::from("*") } else { format!("{}", IpFmt(i.bind)) },
@@ -831,7 +839,14 @@ impl Module for Proxy {
                     if i.egress == 0 { String::from("route") } else { format!("{}", IpFmt(i.egress)) },
                     i.conns,
                     i.total,
-                    i.bytes / 1024
+                    i.bytes / 1024,
+                    if i.refused == 0 {
+                        String::new()
+                    } else if i.allow.is_empty() {
+                        format!(", {} refused: open to nobody (set {}.allow)", i.refused, i.name)
+                    } else {
+                        format!(", {} refused", i.refused)
+                    }
                 )
             })
             .collect::<Vec<_>>()

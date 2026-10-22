@@ -45,7 +45,18 @@ a{color:var(--acc)}
 .inst h4 .sp{flex:1}
 .sub{margin:10px 0 4px;font-weight:600}
 .dirty{outline:2px solid var(--warn)}
-@media (max-width:600px){.form{grid-template-columns:1fr}.form label{padding-top:0}}
+@media (max-width:600px){.form{grid-template-columns:1fr}.form label{padding-top:0}
+/* wide tables become one card per row: the first cell is its title, the rest "label value" */
+table.cards,table.cards tbody,table.cards tr,table.cards td{display:block;width:100%}
+table.cards tr:first-child{display:none}
+table.cards tr{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:8px 0}
+table.cards td{border:0;padding:2px 0;display:grid;grid-template-columns:7em minmax(0,1fr);gap:8px;text-align:left;word-break:break-word}
+table.cards td::before{content:attr(data-label);color:var(--mut)}
+table.cards td:first-child{font-weight:600;font-size:15px;grid-template-columns:1fr;padding-bottom:4px}
+table.cards td:first-child::before,table.cards td[data-label=""]::before{display:none}
+table.cards td[data-label=""]{grid-template-columns:1fr}
+table.cards td:empty{display:none}
+table.cards tr.note{border:0;padding:0}}
 </style>
 </head>
 <body>
@@ -64,7 +75,7 @@ a{color:var(--acc)}
 
 <section id="t-status">
   <div class="card"><h3>概况</h3><div class="kv" id="sum"></div></div>
-  <div class="card"><h3>接口</h3><div class="tbl"><table id="ifs"></table></div></div>
+  <div class="card"><h3>接口</h3><div class="tbl"><table id="ifs" class="cards"></table></div></div>
   <div class="card"><h3>性能（CPU、速率与峰值）</h3><pre id="perf"></pre></div>
 </section>
 
@@ -81,7 +92,7 @@ a{color:var(--acc)}
 </section>
 
 <section id="t-mods" hidden>
-  <div class="card"><h3>模块</h3><div class="tbl"><table id="modt"></table></div></div>
+  <div class="card"><h3>模块</h3><div class="tbl"><table id="modt" class="cards"></table></div></div>
   <div id="modpage"></div>
   <div class="card"><h3>原始设置（键值）</h3>
     <div class="row"><select id="mname"></select><input id="mkey" placeholder="设置项，如 srcnat.10.20.0.1"><input id="mval" class="grow" placeholder="值（留空则删除）"><button class="b p" id="mset">设置</button></div>
@@ -135,6 +146,9 @@ async function api(path,form){
   if(!r.ok)throw new Error(d.error||r.status);
   return d}
 
+// cards on narrow screens: every cell gets its column's title
+function labelCells(t){const hs=[...t.rows[0].cells].map(c=>c.textContent.trim());
+  for(const row of [...t.rows].slice(1))[...row.cells].forEach((c,i)=>c.dataset.label=row.cells.length===1?"":hs[i]??"")}
 function showLogin(){$("app").hidden=true;$("login").hidden=false;$("pw").focus()}
 async function login(){
   $("lerr").textContent="";
@@ -171,6 +185,7 @@ async function loadStatus(){
   $("sum").innerHTML=kv.map(([k,v])=>`<span class="mut">${k}</span><span>${esc(v)}</span>`).join("");
   $("ifs").innerHTML="<tr><th>接口</th><th>地址</th><th>网关</th><th>附加地址</th><th>MTU</th><th class=n>收</th><th class=n>发</th><th class=n>丢弃 收/发</th></tr>"+
     d.ifaces.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.ip)}</td><td>${i.gw==="0.0.0.0"?"":esc(i.gw)}</td><td>${esc(i.extra)}</td><td>${i.mtu}</td><td class=n>${i.rx}</td><td class=n>${i.tx}</td><td class=n>${i.rxd} / ${i.txd}</td></tr>`).join("");
+  labelCells($("ifs"));
   $("perf").textContent=d.perf}
 
 let applyEnd=0;
@@ -207,7 +222,8 @@ async function loadMods(){
     `<tr><td><a href="#mods/${encodeURIComponent(m.name)}">${esc(m.name)}</a></td><td>${m.running?esc(m.running):"<span class=bad>未运行</span>"}</td><td>${esc(m.state)}${m.off?`<div class=bad>native 因崩溃已停用：${esc(m.off)}</div>`:""}</td><td>${kb(m.native)}</td><td>${kb(m.wasm)}</td><td>${m.restarts}</td><td>`+
     (m.native!=null&&m.running!=="native"?`<button class="b" onclick="modAct('${esc(m.name)}','native')">切到 native</button>`:"")+
     (m.wasm!=null&&m.running!=="wasm"?`<button class="b" onclick="modAct('${esc(m.name)}','wasm')">切到 wasm</button>`:"")+`</td></tr>`).join("")+
-    `<tr><td colspan=7 class=mut>内置：${esc(d.running.filter(n=>!mods.some(m=>m.name===n)).join(", "))}</td></tr>`;
+    `<tr class=note><td colspan=7 class=mut>内置：${esc(d.running.filter(n=>!mods.some(m=>m.name===n)).join(", "))}</td></tr>`;
+  labelCells($("modt"));
   const sel=$("mname"),keep=hashMod()||sel.value;sel.innerHTML=mods.map(m=>`<option>${esc(m.name)}</option>`).join("");if(keep)sel.value=keep;showCfg();
   modPage(mods.find(m=>m.name===hashMod()))}
 function showCfg(){const m=mods.find(x=>x.name===$("mname").value);
