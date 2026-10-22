@@ -11,4 +11,4 @@ bench = false
 
 [dependencies]
 rustros-module = { path = "../support" }
-shell = { path = "../../apps/shell" }
+shell = { path = "../../apps/shell", features = ["tls"] }

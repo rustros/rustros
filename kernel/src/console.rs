@@ -26,8 +26,12 @@ pub struct Console {
     shift: bool,
     ctrl: bool,
     e0: bool,
-    /// serial escape sequence: 1 after ESC, 2 after ESC [
+    /// serial input escape sequence: 1 after ESC, 2 after ESC [ (then the
+    /// number of `ESC [ n ~`), 3 after ESC O
     esc: u8,
+    esc_num: u8,
+    /// output escape sequence for the screen: 1 after ESC, 2 after ESC [
+    out_esc: u8,
     /// nobody drains the serial port: output to it is dropped (the screen
     /// and the log keep everything) until it has room again
     serial_stuck: bool,
@@ -43,6 +47,8 @@ static CON: Global<Console> = Global::new(Console {
     ctrl: false,
     e0: false,
     esc: 0,
+    esc_num: 0,
+    out_esc: 0,
     serial_stuck: false,
 });
 
@@ -201,6 +207,35 @@ impl Console {
         if cols == 0 {
             return;
         }
+        // the line editor's ANSI codes: ESC [ D (left), C (right), K (erase
+        // to the end of the line)
+        match (self.out_esc, ch) {
+            (0, 0x1B) => {
+                self.out_esc = 1;
+                return;
+            }
+            (1, b'[') => {
+                self.out_esc = 2;
+                return;
+            }
+            (2, b'0'..=b'9' | b';') => return,
+            (2, f) => {
+                self.out_esc = 0;
+                match f {
+                    b'D' => self.col = self.col.saturating_sub(1),
+                    b'C' => self.col = (self.col + 1).min(cols - 1),
+                    b'K' => {
+                        for c in self.col..cols {
+                            self.draw(c, self.row, b' ');
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            (1, _) => self.out_esc = 0,
+            _ => {}
+        }
         match ch {
             b'\n' => {
                 self.col = 0;
@@ -302,6 +337,11 @@ impl Console {
             0x1D => self.ctrl = !release,
             0x48 if e0 && !release => return Some(rustros_api::KEY_UP),
             0x50 if e0 && !release => return Some(rustros_api::KEY_DOWN),
+            0x4B if e0 && !release => return Some(rustros_api::KEY_LEFT),
+            0x4D if e0 && !release => return Some(rustros_api::KEY_RIGHT),
+            0x47 if e0 && !release => return Some(rustros_api::KEY_HOME),
+            0x4F if e0 && !release => return Some(rustros_api::KEY_END),
+            0x53 if e0 && !release => return Some(rustros_api::KEY_DELETE),
             _ if release || e0 => {}
             k if (k as usize) < MAP.len() => {
                 let ch = if self.shift { SHIFT[k as usize] } else { MAP[k as usize] };
@@ -341,21 +381,35 @@ pub fn getc() -> Option<u8> {
     let c = con();
     if c.serial && unsafe { inb(COM1 + 5) } & 1 != 0 {
         let ch = unsafe { inb(COM1) };
-        // arrow keys arrive as ESC [ A / ESC [ B
+        // cursor keys arrive as ESC [ A..D / H / F, ESC [ n ~, or ESC O x
+        use rustros_api::{KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
         match (c.esc, ch) {
             (0, 0x1B) => {
                 c.esc = 1;
                 return None;
             }
             (1, b'[') => {
-                c.esc = 2;
+                (c.esc, c.esc_num) = (2, 0);
                 return None;
             }
-            (2, _) => {
+            (1, b'O') => {
+                c.esc = 3;
+                return None;
+            }
+            (2, b'0'..=b'9') => {
+                c.esc_num = c.esc_num.saturating_mul(10).saturating_add(ch - b'0');
+                return None;
+            }
+            (2 | 3, _) => {
                 c.esc = 0;
-                return match ch {
-                    b'A' => Some(rustros_api::KEY_UP),
-                    b'B' => Some(rustros_api::KEY_DOWN),
+                return match (ch, c.esc_num) {
+                    (b'A', _) => Some(KEY_UP),
+                    (b'B', _) => Some(KEY_DOWN),
+                    (b'C', _) => Some(KEY_RIGHT),
+                    (b'D', _) => Some(KEY_LEFT),
+                    (b'H', _) | (b'~', 1 | 7) => Some(KEY_HOME),
+                    (b'F', _) | (b'~', 4 | 8) => Some(KEY_END),
+                    (b'~', 3) => Some(KEY_DELETE),
                     _ => None,
                 };
             }

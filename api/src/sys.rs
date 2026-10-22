@@ -203,9 +203,14 @@ pub struct UpdateInfo {
     pub safe_mode: bool,
 }
 
-/// Keys `Module::key` gets beyond ASCII (from PS/2 and serial arrow keys).
+/// Keys `Module::key` gets beyond ASCII (from PS/2 and serial cursor keys).
 pub const KEY_UP: u8 = 0x80;
 pub const KEY_DOWN: u8 = 0x81;
+pub const KEY_LEFT: u8 = 0x82;
+pub const KEY_RIGHT: u8 = 0x83;
+pub const KEY_HOME: u8 = 0x84;
+pub const KEY_END: u8 = 0x85;
+pub const KEY_DELETE: u8 = 0x86;
 
 /// Capabilities an application can be granted (see `Module::caps`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -257,6 +262,11 @@ pub trait Base {
     /// Microseconds since boot (shapers and timers that need it finer).
     fn now_us(&self) -> u64 {
         self.now_ms() * 1000
+    }
+    /// Seconds since 1970 (UTC), from the machine's real-time clock; 0 if
+    /// unknown.
+    fn unix_time(&self) -> u64 {
+        0
     }
     /// Print to the console (serial + screen).
     fn print(&mut self, s: &str);

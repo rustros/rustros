@@ -338,3 +338,64 @@ pub fn wait_for_interrupt_or_spin() {
     unsafe { asm!("sti", options(nomem, nostack)) }
     core::hint::spin_loop();
 }
+
+/// Wall clock at boot (seconds since 1970, from the CMOS real-time clock;
+/// 0 if it could not be read).
+static BOOT_UNIX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn cmos(reg: u8) -> u8 {
+    // Safety: the CMOS index/data ports; NMI stays enabled (bit 7 clear)
+    unsafe {
+        outb(0x70, reg);
+        inb(0x71)
+    }
+}
+
+/// Read the real-time clock (UTC on KVM) once, at boot.
+pub fn init_wall_clock() {
+    let read = || {
+        while cmos(0x0A) & 0x80 != 0 {} // update in progress
+        [cmos(0x00), cmos(0x02), cmos(0x04), cmos(0x07), cmos(0x08), cmos(0x09), cmos(0x32)]
+    };
+    // twice the same, so no update happened in between
+    let mut r = read();
+    for _ in 0..5 {
+        let again = read();
+        if again == r {
+            break;
+        }
+        r = again;
+    }
+    let b = cmos(0x0B);
+    let bcd = |v: u8| if b & 0x04 == 0 { (v & 0x0F) + (v >> 4) * 10 } else { v };
+    let (sec, min, day, mon, yy) = (bcd(r[0]) as u64, bcd(r[1]) as u64, bcd(r[3]) as u64, bcd(r[4]) as u64, bcd(r[5]) as u64);
+    let mut hour = bcd(r[2] & 0x7F) as u64;
+    if b & 0x02 == 0 && r[2] & 0x80 != 0 {
+        hour = (hour + 12) % 24; // 12-hour clock, PM
+    }
+    let century = match bcd(r[6]) as u64 {
+        c @ 19..=21 => c,
+        _ => 20,
+    };
+    let year = century * 100 + yy;
+    if !(1..=12).contains(&mon) || !(1..=31).contains(&day) || year < 2020 {
+        return;
+    }
+    // days since 1970-01-01 (civil from days, H. Hinnant)
+    let (y, m) = if mon <= 2 { (year - 1, mon + 9) } else { (year, mon - 3) };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let unix = days * 86400 + hour * 3600 + min * 60 + sec;
+    BOOT_UNIX.store(unix - now_ms() / 1000, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Seconds since 1970 (0: unknown).
+pub fn unix_time() -> u64 {
+    match BOOT_UNIX.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => 0,
+        b => b + now_ms() / 1000,
+    }
+}

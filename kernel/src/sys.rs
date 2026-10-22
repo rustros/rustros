@@ -326,6 +326,9 @@ impl Base for Ctx<'_> {
     fn now_us(&self) -> u64 {
         arch::now_us()
     }
+    fn unix_time(&self) -> u64 {
+        arch::unix_time()
+    }
     fn print(&mut self, s: &str) {
         console::write_str(s);
     }

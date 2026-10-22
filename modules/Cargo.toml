@@ -26,3 +26,35 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.wasmparser]
 opt-level = "z"
+
+# TLS (shell's curl): handshakes are rare, optimise for size
+[profile.release.package.rustls]
+opt-level = "z"
+[profile.release.package.rustls-webpki]
+opt-level = "z"
+[profile.release.package.webpki-roots]
+opt-level = "z"
+[profile.release.package.rsa]
+opt-level = "z"
+[profile.release.package.num-bigint-dig]
+opt-level = "z"
+[profile.release.package.p256]
+opt-level = "z"
+[profile.release.package.p384]
+opt-level = "z"
+[profile.release.package.primeorder]
+opt-level = "z"
+[profile.release.package.elliptic-curve]
+opt-level = "z"
+[profile.release.package.ecdsa]
+opt-level = "z"
+[profile.release.package.der]
+opt-level = "z"
+[profile.release.package.spki]
+opt-level = "z"
+[profile.release.package.pkcs1]
+opt-level = "z"
+[profile.release.package.pkcs8]
+opt-level = "z"
+[profile.release.package.tls]
+opt-level = "z"

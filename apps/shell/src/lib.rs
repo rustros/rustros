@@ -32,11 +32,26 @@ struct Ping {
     /// our source address (0: the outgoing interface's)
     src: Ip,
     id: u16,
-    seq: u16,
-    count: u16,
-    received: u16,
+    /// requests sent so far, and how many to send
+    sent: u32,
+    count: u32,
+    received: u32,
+    /// between requests (0: back to back), µs
+    interval_us: u64,
+    /// only the summary
+    quiet: bool,
+    /// Ctrl-C: the summary now, without waiting for answers
+    stopped: bool,
     next_at: u64,
+    /// (sequence number, when sent in µs) of requests not answered yet
     sent_at: Vec<(u16, u64)>,
+    /// round trips: least, most, sum (µs)
+    rtt: (u64, u64, u64),
+}
+
+/// µs as milliseconds with three decimals.
+fn ms3(us: u64) -> alloc::string::String {
+    alloc::format!("{}.{:03}", us / 1000, us % 1000)
 }
 
 /// One line about an installed module (same format as the updater's report).
@@ -99,7 +114,7 @@ impl Shell {
         match cmd {
             "help" => say!(
                 sys,
-                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping [-c n] [-I nicN|ip] <ip>   ICMP echo (Ctrl-C stops; -I: the interface\n                      or our address to send from, an extra one too)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  curl [-i] [-I] [-v] [-m s] [--interface nicN|ip] [--dns-servers ip] [http://]host[:port][/path]\n                      HTTP from the command line (DNS: cfg shell dns <ip>, default 1.1.1.1)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
+                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping [-c n] [-i s] [-q] [-I nicN|ip] <ip>   ICMP echo (Ctrl-C stops; -i 0:\n                      back to back; -I: the interface or our address to\n                      send from, an extra one too)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  curl [-i] [-I] [-v] [-m s] [--interface nicN|ip] [--dns-servers ip] [http[s]://]host[:port][/path]\n                      HTTP from the command line (DNS: cfg shell dns <ip>, default 1.1.1.1)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  date                the time (UTC, from the real-time clock)\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
             ),
             "cfg" => match (args.next(), args.next(), args.next()) {
                 (Some(m), None, _) => {
@@ -143,12 +158,12 @@ impl Shell {
                 say!(sys, "{}\n", apps.join(", "));
             }
             "ping" => {
-                const USAGE: &str = "usage: ping [-c count] [-I nicN|a.b.c.d] a.b.c.d [count]\n";
+                const USAGE: &str = "usage: ping [-c count] [-i secs] [-q] [-I nicN|a.b.c.d] a.b.c.d [count]\n";
                 if self.icmp.is_none() {
                     say!(sys, "ping: no ICMP socket\n");
                     return;
                 }
-                let (mut dst, mut count, mut src) = (None, 4, 0);
+                let (mut dst, mut count, mut src, mut interval_us, mut quiet) = (None, 4u32, 0, 1_000_000u64, false);
                 while let Some(a) = args.next() {
                     if let Some(ip) = parse_ip(a).filter(|_| dst.is_none()) {
                         dst = Some(ip);
@@ -158,10 +173,31 @@ impl Shell {
                         count = c;
                         continue;
                     }
-                    let Some(v) = args.next().filter(|_| matches!(a, "-c" | "-I" | "src" | "interface" | "dev")) else {
+                    if a == "-q" {
+                        quiet = true;
+                        continue;
+                    }
+                    let Some(v) = args.next().filter(|_| matches!(a, "-c" | "-i" | "-I" | "src" | "interface" | "dev")) else {
                         say!(sys, "ping: unknown option '{}'\n{}", a, USAGE);
                         return;
                     };
+                    if a == "-i" {
+                        // seconds, fractions too (0: back to back)
+                        let (whole, frac) = v.split_once('.').unwrap_or((v, ""));
+                        let frac_us = match frac.len() {
+                            0 => Some(0),
+                            n if n <= 6 => frac.parse::<u64>().ok().map(|f| f * 10u64.pow(6 - n as u32)),
+                            _ => None,
+                        };
+                        match (if whole.is_empty() { Ok(0) } else { whole.parse::<u64>() }, frac_us) {
+                            (Ok(w), Some(f)) if w < 3600 => interval_us = w * 1_000_000 + f,
+                            _ => {
+                                say!(sys, "ping: bad interval '{}'\n", v);
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     if a == "-c" {
                         match v.parse() {
                             Ok(c) => count = c,
@@ -194,8 +230,24 @@ impl Shell {
                 } else {
                     say!(sys, "PING {}\n", IpFmt(dst));
                 }
-                self.ping = Some(Ping { dst, src, id: sys.random() as u16, seq: 0, count, received: 0, next_at: 0, sent_at: Vec::new() });
+                self.ping = Some(Ping { dst, src, id: sys.random() as u16, sent: 0, count: count.max(1), received: 0, interval_us, quiet, stopped: false, next_at: 0, sent_at: Vec::new(), rtt: (0, 0, 0) });
             }
+            "date" => match sys.unix_time() {
+                0 => say!(sys, "date: unknown (no real-time clock)\n"),
+                t => {
+                    let (days, secs) = (t / 86400, t % 86400);
+                    // civil from days (H. Hinnant)
+                    let z = days + 719468;
+                    let (era, doe) = (z / 146097, z % 146097);
+                    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                    let mp = (5 * doy + 2) / 153;
+                    let d = doy - (153 * mp + 2) / 5 + 1;
+                    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                    let y = yoe + era * 400 + (m <= 2) as u64;
+                    say!(sys, "{}-{:02}-{:02} {:02}:{:02}:{:02} UTC\n", y, m, d, secs / 3600, secs / 60 % 60, secs % 60);
+                }
+            },
             "curl" => {
                 let rest: Vec<&str> = args.collect();
                 match curl::Curl::start(sys, &rest) {
@@ -388,45 +440,58 @@ impl Shell {
             if let Some(i) = p.sent_at.iter().position(|e| e.0 == seq) {
                 let (_, t) = p.sent_at.swap_remove(i);
                 p.received += 1;
-                let ms = sys.now_ms() - t;
-                say!(sys, "{} bytes from {}: icmp_seq={} ttl={} time={} ms\n", n, IpFmt(src), seq, ttl, ms);
+                let us = sys.now_us().saturating_sub(t);
+                p.rtt = (if p.received == 1 { us } else { p.rtt.0.min(us) }, p.rtt.1.max(us), p.rtt.2 + us);
+                if !p.quiet {
+                    say!(sys, "{} bytes from {}: icmp_seq={} ttl={} time={} ms\n", n, IpFmt(src), seq, ttl, ms3(us));
+                }
             }
         }
         // requests
-        let now = sys.now_ms();
+        let now = sys.now_us();
         let Some(p) = self.ping.as_mut() else { return };
-        if now < p.next_at {
+        if now < p.next_at && !p.stopped {
             return;
         }
-        if p.seq >= p.count {
-            say!(
-                sys,
-                "--- {}: {} sent, {} received, {}% loss\n",
+        // after the last one: wait for the answers (a second at most)
+        if p.sent >= p.count {
+            if !p.stopped && p.received < p.sent && now < p.next_at + 1_000_000 - p.interval_us.min(1_000_000) {
+                return;
+            }
+            let mut sum = alloc::format!(
+                "--- {}: {} sent, {} received, {}% loss",
                 IpFmt(p.dst),
-                p.count,
+                p.sent,
                 p.received,
-                (p.count - p.received) as u32 * 100 / p.count.max(1) as u32
+                (p.sent - p.received) as u64 * 100 / p.sent.max(1) as u64
             );
+            if p.received > 0 {
+                sum += &alloc::format!(", rtt min/avg/max {}/{}/{} ms", ms3(p.rtt.0), ms3(p.rtt.2 / p.received as u64), ms3(p.rtt.1));
+            }
+            say!(sys, "{}\n", sum);
             self.ping = None;
             self.prompt(sys);
             return;
         }
-        p.seq += 1;
+        p.sent += 1;
+        let seq = p.sent as u16;
+        // forget requests that will not be answered any more
+        p.sent_at.retain(|e| now - e.1 < 10_000_000);
         let mut m = Vec::with_capacity(64);
         m.extend_from_slice(&[8, 0, 0, 0]);
         m.extend_from_slice(&p.id.to_be_bytes());
-        m.extend_from_slice(&p.seq.to_be_bytes());
+        m.extend_from_slice(&seq.to_be_bytes());
         m.extend((0..56u8).map(|i| i.wrapping_add(0x20)));
         let c = checksum(&m, 0);
         m[2..4].copy_from_slice(&c.to_be_bytes());
-        p.sent_at.push((p.seq, now));
-        p.next_at = now + 1000;
+        p.sent_at.push((seq, now));
+        p.next_at = now + p.interval_us;
         let (dst, src) = (p.dst, p.src);
         if src != 0 {
             // a whole IP packet from the chosen address, routed by it
             let mut ip = alloc::vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, PROTO_ICMP, 0, 0];
             ip[2..4].copy_from_slice(&((20 + m.len()) as u16).to_be_bytes());
-            ip[4..6].copy_from_slice(&p.seq.to_be_bytes());
+            ip[4..6].copy_from_slice(&seq.to_be_bytes());
             ip.extend_from_slice(&src.to_be_bytes());
             ip.extend_from_slice(&dst.to_be_bytes());
             let c = checksum(&ip, 0);
@@ -489,16 +554,23 @@ impl Module for Shell {
                 self.prompt(sys);
             }
             3 => {
+                // a ping ends with its summary, as on Linux
+                if let Some(p) = self.ping.as_mut() {
+                    p.count = p.sent.max(1);
+                    p.stopped = true;
+                    say!(sys, "^C\n");
+                    return;
+                }
                 let http = self.http.take().map(|mut h| h.conn.abort(net(sys))).is_some();
                 let curl = self.curl.take().map(|mut c| c.abort(sys)).is_some();
-                if self.ping.take().is_some() | http | curl {
+                if http | curl {
                     say!(sys, "^C\n");
                     self.prompt(sys);
                 }
             }
             _ => {
                 const COMMANDS: &[&str] = &[
-                    "help", "ip", "mtu", "cand", "apply", "revert", "confirm", "discard", "save", "arp", "conns", "modules", "ping", "http", "curl", "kv", "df", "crash",
+                    "help", "ip", "mtu", "cand", "apply", "revert", "confirm", "discard", "save", "arp", "conns", "modules", "ping", "http", "curl", "date", "kv", "df", "crash",
                     "mod", "cfg", "uptime", "slot", "log", "reboot", "poweroff",
                 ];
                 if let Some(line) = self.edit.key(sys, c, "rustros> ", &|s, w| netcmd::complete(s, w, COMMANDS)) {

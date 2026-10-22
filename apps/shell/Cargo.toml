@@ -8,5 +8,10 @@ test = false
 bench = false
 
 [dependencies]
+tls = { path = "../tls", optional = true }
 rustros-api = { path = "../../api" }
 rustros-util = { path = "../../util" }
+
+[features]
+# HTTPS for curl (big: the loadable module has it, a shell built into the kernel not)
+tls = ["dep:tls"]

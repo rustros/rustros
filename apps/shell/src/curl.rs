@@ -1,8 +1,9 @@
 //! `curl`: an HTTP GET (or HEAD) with curl's options, through a DNS lookup,
-//! from a chosen local address. Plain HTTP only (no TLS yet).
+//! from a chosen local address; HTTPS through the `tls` crate (TLS 1.3,
+//! certificates checked against the Mozilla roots).
 //!
 //! ```text
-//! curl [-i] [-I] [-v] [-s] [-m secs] [--interface nicN|a.b.c.d] [--dns-servers a.b.c.d] [http://]host[:port][/path]
+//! curl [-i] [-I] [-v] [-s] [-m secs] [--interface nicN|a.b.c.d] [--dns-servers a.b.c.d] [http[s]://]host[:port][/path]
 //! ```
 
 use alloc::format;
@@ -14,7 +15,7 @@ use rustros_util::conn::Conn;
 use rustros_util::dns;
 use rustros_util::wire::{Ip, IpFmt, parse_ip};
 
-pub const USAGE: &str = "usage: curl [-i] [-I] [-v] [-s] [-m secs] [--interface nicN|a.b.c.d] [--dns-servers a.b.c.d] [http://]host[:port][/path]\n";
+pub const USAGE: &str = "usage: curl [-i] [-I] [-v] [-s] [-m secs] [--interface nicN|a.b.c.d] [--dns-servers a.b.c.d] [http[s]://]host[:port][/path]\n";
 /// The resolver if neither `--dns-servers` nor `cfg shell dns` names one.
 const DNS_DEFAULT: Ip = 0x0101_0101;
 const DNS_RETRY_MS: u64 = 2000;
@@ -25,13 +26,34 @@ enum Phase {
     /// connect to this address on the next poll
     Start(Ip),
     Resolve { sock: UdpSocket, id: u16, server: Ip, sent: u64, tries: u8 },
-    Fetch { conn: Conn, connected: bool, head: Vec<u8>, header_done: bool, shown: usize },
+    Fetch { conn: Conn, tls: Option<Tls>, connected: bool, head: Vec<u8>, header_done: bool, shown: usize },
+}
+
+#[cfg(feature = "tls")]
+type Tls = tls::TlsClient;
+/// Without TLS there is never one.
+#[cfg(not(feature = "tls"))]
+struct Tls {
+    established: bool,
+    closed: bool,
+    error: Option<String>,
+}
+#[cfg(not(feature = "tls"))]
+impl Tls {
+    fn take_outgoing(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn take_received(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn feed(&mut self, _: &[u8]) {}
 }
 
 pub struct Curl {
     host: String,
     port: u16,
     path: String,
+    https: bool,
     src: Ip,
     head_only: bool,
     include: bool,
@@ -93,10 +115,8 @@ impl Curl {
             }
         }
         let Some(url) = url else { return Err(String::from(USAGE)) };
-        if url.starts_with("https://") {
-            return Err(String::from("curl: https needs TLS, which RustROS does not have yet; use http://\n"));
-        }
-        let rest = url.strip_prefix("http://").unwrap_or(url);
+        let https = url.starts_with("https://");
+        let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url);
         let (hostport, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
@@ -104,8 +124,23 @@ impl Curl {
         let hostport = hostport.rsplit('@').next().unwrap_or(hostport);
         let (host, port) = match hostport.rsplit_once(':') {
             Some((h, p)) => (h, p.parse().map_err(|_| format!("curl: bad port in '{url}'\n"))?),
-            None => (hostport, 80),
+            None => (hostport, if https { 443 } else { 80 }),
         };
+        if https && cfg!(not(feature = "tls")) {
+            return Err(String::from("curl: this shell was built without TLS (the loadable shell module has it)\n"));
+        }
+        #[cfg(feature = "tls")]
+        if https {
+            if sys.unix_time() == 0 {
+                return Err(String::from("curl: no clock (the real-time clock was not readable): certificates cannot be checked\n"));
+            }
+            // fresh hardware randomness for the keys
+            let mut seed = [0u8; 32];
+            for c in seed.chunks_mut(8) {
+                c.copy_from_slice(&sys.random().to_le_bytes());
+            }
+            tls::seed(seed);
+        }
         if host.is_empty() {
             return Err(String::from(USAGE));
         }
@@ -114,6 +149,7 @@ impl Curl {
             host: String::from(host),
             port,
             path: String::from(path),
+            https,
             src,
             head_only,
             include: include || head_only,
@@ -148,7 +184,8 @@ impl Curl {
         let s = if self.src != 0 { net.tcp_connect_from(self.src, to) } else { net.tcp_connect(to) }.map_err(|e| format!("curl: cannot connect to {to}: {e:?}\n"))?;
         let mut conn = Conn::new(s, to);
         let method = if self.head_only { "HEAD" } else { "GET" };
-        let host = if self.port == 80 { self.host.clone() } else { format!("{}:{}", self.host, self.port) };
+        let default_port = if self.https { 443 } else { 80 };
+        let host = if self.port == default_port { self.host.clone() } else { format!("{}:{}", self.host, self.port) };
         let req = format!("{method} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: curl/8.0 (RustROS)\r\nAccept: */*\r\nConnection: close\r\n\r\n", self.path);
         if self.verbose {
             let from = if self.src != 0 { format!(" from {}", IpFmt(self.src)) } else { String::new() };
@@ -157,8 +194,22 @@ impl Curl {
                 say!(sys, "> {}\n", l);
             }
         }
-        conn.write(req.as_bytes());
-        self.phase = Phase::Fetch { conn, connected: false, head: Vec::new(), header_done: false, shown: 0 };
+        #[cfg(feature = "tls")]
+        let tls = if self.https {
+            tls::set_time(sys.unix_time());
+            let mut t = tls::TlsClient::new(&self.host).map_err(|e| format!("curl: (35) TLS: {e}\n"))?;
+            t.write(req.as_bytes()); // sent once the handshake is done
+            Some(t)
+        } else {
+            conn.write(req.as_bytes());
+            None
+        };
+        #[cfg(not(feature = "tls"))]
+        let tls: Option<Tls> = {
+            conn.write(req.as_bytes());
+            None
+        };
+        self.phase = Phase::Fetch { conn, tls, connected: false, head: Vec::new(), header_done: false, shown: 0 };
         Ok(())
     }
 
@@ -227,10 +278,39 @@ impl Curl {
                 }
                 false
             }
-            Phase::Fetch { conn, connected, head, header_done, shown } => {
+            Phase::Fetch { conn, tls, connected, head, header_done, shown } => {
                 let Some(net) = sys.net() else { return true };
                 let up = net.tcp_is_connected(conn.stream) == Ok(true);
-                let alive = conn.pump(net, 64 * 1024);
+                if let Some(t) = tls.as_mut() {
+                    let out = t.take_outgoing();
+                    conn.write(&out);
+                }
+                let mut alive = conn.pump(net, 64 * 1024);
+                if let Some(t) = tls.as_mut() {
+                    // ciphertext in, plaintext out (and the handshake's answers)
+                    let cipher = core::mem::take(&mut conn.inbuf);
+                    let was = t.established;
+                    t.feed(&cipher);
+                    let out = t.take_outgoing();
+                    conn.write(&out);
+                    alive = conn.pump(net, 64 * 1024) && alive;
+                    let more = core::mem::take(&mut conn.inbuf);
+                    t.feed(&more);
+                    if t.established && !was && self.verbose {
+                        say!(sys, "* TLS 1.3 handshake done, certificate for {} verified\n", self.host);
+                    }
+                    if let Some(e) = t.error.take() {
+                        say!(sys, "curl: (60) TLS: {}\n", e);
+                        if let Some(net) = sys.net() {
+                            conn.abort(net);
+                        }
+                        return true;
+                    }
+                    conn.inbuf = t.take_received();
+                    if t.closed && conn.inbuf.is_empty() {
+                        conn.eof = true;
+                    }
+                }
                 if !*connected && up {
                     *connected = true;
                     if self.verbose {

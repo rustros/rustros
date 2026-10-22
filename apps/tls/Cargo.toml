@@ -1,0 +1,27 @@
+[package]
+name = "tls"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+rustls = { version = "0.23", default-features = false }
+webpki-roots = "1"
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+rand_core = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+aead = { version = "0.5", default-features = false, features = ["alloc"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["precomputed-tables"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+ecdsa = { version = "0.16", default-features = false, features = ["verifying", "der"] }
+ed25519-dalek = { version = "2", default-features = false }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+signature = { version = "2", default-features = false }

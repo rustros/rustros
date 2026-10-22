@@ -195,6 +195,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
 
     arch::init_clock();
+    arch::init_wall_clock();
     arch::init_interrupts();
     let t0 = arch::now_ms();
     while arch::now_ms() - t0 < 20 {
