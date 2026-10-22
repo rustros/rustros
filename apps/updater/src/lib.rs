@@ -12,7 +12,7 @@
 //! image), 'X' remove a module (payload: "name" or "name native|wasm"),
 //! 'S' switch a module's form (payload: "name native|wasm"),
 //! 'K' set a module setting (payload: "name\nkey\nvalue"; no value: remove),
-//! 'Q' list a module's settings (payload: "name"; `user.*` values masked),
+//! 'Q' list a module's settings (payload: "name"; secret values masked),
 //! 'E' encrypted command: payload = inner cmd byte + inner payload, XORed
 //! with HMAC(key, nonce | "E" | counter) blocks; the MAC covers the
 //! ciphertext (encrypt-then-MAC). Inner commands: K, Q, X, S.
@@ -337,7 +337,7 @@ impl Session {
                                     let l: String = admin
                                         .module_config(name)
                                         .into_iter()
-                                        .map(|(k, v)| alloc::format!("{k} = {}\n", if k.starts_with("user.") { "***" } else { v.as_str() }))
+                                        .map(|(k, v)| alloc::format!("{k} = {}\n", if rustros_util::secret::is_secret(&k) { "***" } else { v.as_str() }))
                                         .collect();
                                     if l.is_empty() { String::from("(no settings)\n") } else { l }
                                 }

@@ -509,7 +509,7 @@ fn modules(sys: &mut dyn Sys) -> String {
             .iter()
             .map(|(k, v)| {
                 // the password hash is nobody's business
-                let v = if m.name == "webadmin" && (k == "pwhash" || k == "password") { "(set)" } else { v.as_str() };
+                let v = if rustros_util::secret::is_secret(k) { "(set)" } else { v.as_str() };
                 format!("[{},{}]", js(k), js(v))
             })
             .collect();

@@ -1,11 +1,15 @@
 //! Line input for the consoles: backspace, command history on the up and
 //! down arrow keys (the kernel turns both PS/2 and serial arrows into
-//! `KEY_UP` / `KEY_DOWN`), and Tab completion.
+//! `KEY_UP` / `KEY_DOWN`), and Tab completion. Secrets are echoed as `*`
+//! and kept out of the history: a whole line in `hidden` mode, or the value
+//! of `cfg <module> <password key> <value>`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustros_api::{KEY_DOWN, KEY_UP, Sys};
+
+use crate::secret;
 
 const HISTORY: usize = 32;
 const MAX_LINE: usize = 200;
@@ -18,6 +22,8 @@ pub struct LineEdit {
     pos: Option<usize>,
     /// what was typed before browsing started
     draft: String,
+    /// the next line is a secret: echo `*`, no history, no completion
+    pub hidden: bool,
 }
 
 impl LineEdit {
@@ -26,6 +32,7 @@ impl LineEdit {
     /// shown again after a list of candidates.
     pub fn key(&mut self, sys: &mut dyn Sys, c: u8, prompt: &str, complete: &dyn Fn(&mut dyn Sys, &[&str]) -> Vec<String>) -> Option<String> {
         match c {
+            b'\t' if self.hidden || secret::value_start(&self.line).is_some() => {}
             b'\t' => {
                 let start = self.line.rfind(' ').map_or(0, |i| i + 1);
                 let partial = String::from(&self.line[start..]);
@@ -48,13 +55,14 @@ impl LineEdit {
                     self.line.push_str(&add);
                 } else if cands.len() > 1 {
                     let list = cands.join("  ");
-                    sys.print(&alloc::format!("\n{list}\n{prompt}{}", self.line));
+                    sys.print(&alloc::format!("\n{list}\n{prompt}{}", secret::masked(&self.line)));
                 }
             }
             b'\n' => {
                 sys.print("\n");
                 let line = core::mem::take(&mut self.line);
-                if !line.trim().is_empty() && self.history.last() != Some(&line) {
+                let secret = core::mem::take(&mut self.hidden) || secret::value_start(&line).is_some();
+                if !secret && !line.trim().is_empty() && self.history.last() != Some(&line) {
                     if self.history.len() == HISTORY {
                         self.history.remove(0);
                     }
@@ -68,6 +76,7 @@ impl LineEdit {
                     sys.print("\x08");
                 }
             }
+            KEY_UP | KEY_DOWN if self.hidden => {}
             KEY_UP if !self.history.is_empty() => {
                 let p = match self.pos {
                     None => {
@@ -96,7 +105,8 @@ impl LineEdit {
             32..=126 if self.line.len() < MAX_LINE => {
                 self.line.push(c as char);
                 let mut b = [0u8; 4];
-                sys.print((c as char).encode_utf8(&mut b));
+                let shown = if self.hidden || secret::value_start(&self.line).is_some_and(|v| v < self.line.len()) { '*' } else { c as char };
+                sys.print(shown.encode_utf8(&mut b));
             }
             _ => {}
         }

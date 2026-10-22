@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 
 use rustros_util::conn::Conn;
 use rustros_util::netcmd;
+use rustros_util::secret;
 use rustros_util::wire::PROTO_ICMP;
 use rustros_util::wire::{Ip, IpFmt, MacFmt, be16, checksum, parse_ip};
 use rustros_api::{Admin, Caps, Kv, Module, ModuleInfo, ModuleKind, Net, RawSocket, SocketAddr, Sys, say};
@@ -74,6 +75,8 @@ pub struct Shell {
     ping: Option<Ping>,
     http: Option<HttpGet>,
     greeted: bool,
+    /// asking for a secret setting: (module, key, the first entry)
+    secret: Option<(String, String, Option<String>)>,
 }
 
 impl Shell {
@@ -91,13 +94,19 @@ impl Shell {
         match cmd {
             "help" => say!(
                 sys,
-                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping <ip> [count]   ICMP echo (Ctrl-C stops)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes)\n  uptime\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
+                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping <ip> [count]   ICMP echo (Ctrl-C stops)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
             ),
             "cfg" => match (args.next(), args.next(), args.next()) {
                 (Some(m), None, _) => {
                     for (k, v) in admin(sys).module_config(m) {
-                        say!(sys, "{} = {}\n", k, v);
+                        say!(sys, "{} = {}\n", k, if secret::is_secret(&k) { "(set)" } else { v.as_str() });
                     }
+                }
+                // a password: asked for on its own line, not shown
+                (Some(m), Some(k), None) if secret::is_secret(k) => {
+                    say!(sys, "{} {} (not shown, empty cancels): ", m, k);
+                    self.edit.hidden = true;
+                    self.secret = Some((String::from(m), String::from(k), None));
                 }
                 (Some(m), Some(k), None) => {
                     for (_, v) in admin(sys).module_config(m).into_iter().filter(|(x, _)| x == k) {
@@ -401,6 +410,13 @@ impl Module for Shell {
 
     fn key(&mut self, sys: &mut dyn Sys, c: u8) {
         match c {
+            3 if self.secret.is_some() => {
+                self.secret = None;
+                self.edit.hidden = false;
+                say!(sys, "^C");
+                let _ = self.edit.key(sys, b'\n', "", &|_, _| Vec::new()); // drop what was typed
+                self.prompt(sys);
+            }
             3 => {
                 let http = self.http.take().map(|mut h| h.conn.abort(net(sys))).is_some();
                 if self.ping.take().is_some() | http {
@@ -414,10 +430,28 @@ impl Module for Shell {
                     "mod", "cfg", "uptime", "slot", "log", "reboot", "poweroff",
                 ];
                 if let Some(line) = self.edit.key(sys, c, "rustros> ", &|s, w| netcmd::complete(s, w, COMMANDS)) {
+                    if let Some((m, k, first)) = self.secret.take() {
+                        match first {
+                            _ if line.is_empty() => say!(sys, "cancelled\n"),
+                            None => {
+                                say!(sys, "again: ");
+                                self.edit.hidden = true;
+                                self.secret = Some((m, k, Some(line)));
+                                return;
+                            }
+                            Some(f) if f != line => say!(sys, "the two entries differ, nothing changed\n"),
+                            Some(_) => match admin(sys).module_config_set(&m, &k, Some(line.as_str())) {
+                                Ok(()) => say!(sys, "ok\n"),
+                                Err(e) => say!(sys, "{}\n", e),
+                            },
+                        }
+                        self.prompt(sys);
+                        return;
+                    }
                     if !netcmd::console_line(sys, &mut self.ask, &line) {
                         self.command(sys, &line);
                     }
-                    if self.ping.is_none() && self.http.is_none() && self.ask.is_none() {
+                    if self.ping.is_none() && self.http.is_none() && self.ask.is_none() && self.secret.is_none() {
                         self.prompt(sys);
                     }
                 }

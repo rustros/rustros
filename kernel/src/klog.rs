@@ -69,8 +69,27 @@ impl DiskLog {
         }
         let last = (0..SLOTS).filter_map(|i| header(disk, start + i * SLOT_SECTORS)).map(|(seq, _)| seq).max().unwrap_or(0);
         let mut log = DiskLog { base: start, seq: last + 1, total: 0, tail: Vec::new() };
+        log.scrub(disk);
         log.write_header(disk);
         Some(log)
+    }
+
+    /// Mask passwords that reached the logs on disk (written before they
+    /// were masked at the console).
+    fn scrub(&self, disk: &mut dyn BlockDevice) {
+        let mut buf = vec![0u8; 64 * 512];
+        for i in 0..SLOTS {
+            let lba = self.base + i * SLOT_SECTORS;
+            let Some((_, total)) = header(disk, lba) else { continue };
+            let sectors = total.min(DATA_BYTES).div_ceil(512);
+            for at in (0..sectors).step_by(64) {
+                let n = (sectors - at).min(64) as usize;
+                let chunk = &mut buf[..n * 512];
+                if disk.read(lba + 1 + at, chunk) && rustros_util::secret::redact(chunk) {
+                    disk.write(lba + 1 + at, chunk);
+                }
+            }
+        }
     }
 
     fn slot_lba(&self, seq: u64) -> u64 {
@@ -103,6 +122,7 @@ impl DiskLog {
         // continue the partial sector, then whole sectors up to the ring's end
         let mut buf = core::mem::take(&mut self.tail);
         buf.extend_from_slice(&data);
+        rustros_util::secret::redact(&mut buf);
         let mut sector = pos / 512;
         let mut rest: &[u8] = &buf;
         while !rest.is_empty() {
