@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RustROS</title>
+<meta name="description" content="RustROS: a Rust unikernel for network appliances — routing, NAT, VPN and proxies on a 200 KB kernel.">
+<style>
+:root{--bg:#f7f8fa;--fg:#1b1f27;--mut:#5d6575;--card:#fff;--line:#e2e5eb;--acc:#c2410c;--acc2:#9a3412;--code:#f0f2f5}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#111317;--fg:#e6e8ec;--mut:#9aa1ae;--card:#181b21;--line:#2a2f38;--acc:#fb923c;--acc2:#fdba74;--code:#20242c}}
+:root[data-theme="dark"]{--bg:#111317;--fg:#e6e8ec;--mut:#9aa1ae;--card:#181b21;--line:#2a2f38;--acc:#fb923c;--acc2:#fdba74;--code:#20242c}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+a{color:var(--acc)}a:hover{color:var(--acc2)}
+.wrap{max-width:980px;margin:0 auto;padding:0 20px}
+header{border-bottom:1px solid var(--line);background:var(--card)}
+header .wrap{display:flex;align-items:center;gap:16px;height:60px}
+.logo{font-weight:700;font-size:19px;letter-spacing:.2px;color:var(--fg);text-decoration:none}
+.logo span{color:var(--acc)}
+nav{margin-left:auto;display:flex;gap:18px;font-size:15px}
+nav a{color:var(--mut);text-decoration:none}nav a:hover{color:var(--fg)}
+.lang{border:1px solid var(--line);background:none;color:var(--mut);border-radius:6px;padding:3px 9px;font:inherit;font-size:13px;cursor:pointer}
+.hero{padding:72px 0 40px}
+.hero h1{font-size:clamp(30px,5vw,46px);line-height:1.15;margin:0 0 16px;letter-spacing:-.5px}
+.hero p{font-size:18px;color:var(--mut);max-width:680px;margin:0 0 26px}
+.btns{display:flex;gap:12px;flex-wrap:wrap}
+.btn{display:inline-block;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;font-size:15px;border:1px solid var(--line);color:var(--fg);background:var(--card)}
+.btn.p{background:var(--acc);border-color:var(--acc);color:#fff}.btn.p:hover{background:var(--acc2);color:#fff}
+.facts{display:flex;gap:28px;flex-wrap:wrap;margin:34px 0 0;color:var(--mut);font-size:14px}
+.facts b{display:block;font-size:22px;color:var(--fg)}
+section{padding:44px 0;border-top:1px solid var(--line)}
+section h2{font-size:24px;margin:0 0 20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+.card h3{margin:0 0 6px;font-size:16px}
+.card p{margin:0;color:var(--mut);font-size:15px}
+pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow-x:auto;font:13.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0 0 12px}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}
+.mut{color:var(--mut)}
+#rel{font-size:15px}
+footer{border-top:1px solid var(--line);padding:26px 0 40px;color:var(--mut);font-size:14px}
+[data-l="en"]{display:none}
+html[lang="en"] [data-l="zh"]{display:none}html[lang="en"] [data-l="en"]{display:revert}
+@media (max-width:560px){nav a.opt{display:none}.hero{padding:48px 0 28px}}
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <a class="logo" href="/">Rust<span>ROS</span></a>
+  <nav><a class="opt" href="#features"><span data-l="zh">功能</span><span data-l="en">Features</span></a><a href="#releases"><span data-l="zh">发布</span><span data-l="en">Releases</span></a><a href="https://github.com/rustros/rustros">GitHub</a></nav>
+  <button class="lang" id="lang" type="button">EN</button>
+</div></header>
+
+<main class="wrap">
+<div class="hero">
+  <h1 data-l="zh">用 Rust 写的网络设备操作系统</h1>
+  <h1 data-l="en">A network appliance OS, written in Rust</h1>
+  <p data-l="zh">RustROS 是一个 unikernel：约 200 KB 的内核只做驱动、协议栈和存储，路由、NAT、VPN、代理、网站这些功能都是可以在线安装和更新的应用。开机即用，内核 A/B 双槽更新，失败自动回滚。</p>
+  <p data-l="en">RustROS is a unikernel: a ~200 KB kernel does drivers, the network stack and storage; routing, NAT, VPNs, proxies and websites are apps you install and update online. A/B kernel slots, automatic rollback.</p>
+  <div class="btns">
+    <a class="btn p" href="#releases"><span data-l="zh">获取发布版</span><span data-l="en">Get a release</span></a>
+    <a class="btn" href="https://github.com/rustros/rustros"><span data-l="zh">源代码</span><span data-l="en">Source code</span></a>
+  </div>
+  <div class="facts">
+    <div><b>~200 KB</b><span data-l="zh">内核</span><span data-l="en">kernel</span></div>
+    <div><b>no_std Rust</b><span data-l="zh">从驱动到 TLS</span><span data-l="en">drivers to TLS</span></div>
+    <div><b>KVM · virtio</b><span data-l="zh">云主机与虚拟机</span><span data-l="en">clouds and VMs</span></div>
+  </div>
+</div>
+
+<section id="features">
+  <h2 data-l="zh">它能做什么</h2><h2 data-l="en">What it does</h2>
+  <div class="grid">
+    <div class="card"><h3 data-l="zh">路由与多 WAN</h3><h3 data-l="en">Routing and multi-WAN</h3><p data-l="zh">多网卡、VLAN、源地址路由；NAT、静态映射和端口转发；CAKE 流量整形。</p><p data-l="en">Several NICs, VLANs, source routing; NAT, static mappings and port forwards; CAKE shaping.</p></div>
+    <div class="card"><h3>VPN</h3><p data-l="zh">WireGuard 服务端与客户端（含 WARP 一键注册），L2TP 服务端多实例与拨号客户端。</p><p data-l="en">WireGuard server and client (WARP sign-up built in), L2TP servers per address and dial-out clients.</p></div>
+    <div class="card"><h3 data-l="zh">代理</h3><h3 data-l="en">Proxies</h3><p data-l="zh">SOCKS5 / HTTP 代理与 AnyTLS，多实例，各自的出口地址和账号。</p><p data-l="en">SOCKS5 / HTTP proxies and AnyTLS, any number of instances, each with its own egress and logins.</p></div>
+    <div class="card"><h3 data-l="zh">网站</h3><h3 data-l="en">Websites</h3><p data-l="zh">静态站点与反向代理，按域名选证书，Let's Encrypt 自动签发——本站就跑在 RustROS 上。</p><p data-l="en">Static sites and reverse proxying, certificates by name, Let's Encrypt built in — this site runs on RustROS.</p></div>
+    <div class="card"><h3 data-l="zh">存储</h3><h3 data-l="en">Storage</h3><p data-l="zh">崩溃安全的键值存储放配置，文件分区是标准 ext4，拿到 Linux 上也能直接读。</p><p data-l="en">A crash-safe key-value store for settings; files live on a standard ext4 that Linux reads as it is.</p></div>
+    <div class="card"><h3 data-l="zh">管理</h3><h3 data-l="en">Management</h3><p data-l="zh">网页管理（每个应用的设置页自动生成）、控制台、加密的在线更新，或者接入面板统一管理。</p><p data-l="en">A web admin whose pages are generated from each app's settings, a console, signed online updates, or a central panel.</p></div>
+  </div>
+</section>
+
+<section id="releases">
+  <h2 data-l="zh">发布版</h2><h2 data-l="en">Releases</h2>
+  <p id="rel" class="mut"><span data-l="zh">正在读取最新发布版…</span><span data-l="en">Reading the latest release…</span></p>
+  <p data-l="zh">每个发布版的清单 <a href="/releases/latest.json"><code>latest.json</code></a> 都用 Ed25519 签名（<a href="/releases/latest.json.sig"><code>.sig</code></a>），公钥：</p>
+  <p data-l="en">Each release's manifest <a href="/releases/latest.json"><code>latest.json</code></a> is signed with Ed25519 (<a href="/releases/latest.json.sig"><code>.sig</code></a>); the public key:</p>
+  <pre id="key">5JddaWkdvKjJte+tGwE9kn6f33EOUj2ixVBBOj45s38=</pre>
+  <p class="mut" data-l="zh">内核和每个应用都带 SHA-256；面板和设备在安装前都会校验。</p>
+  <p class="mut" data-l="en">The kernel and every app carry a SHA-256; the panel and the machine check it before installing.</p>
+</section>
+</main>
+
+<footer><div class="wrap">RustROS · <a href="https://github.com/rustros/rustros">github.com/rustros/rustros</a></div></footer>
+
+<script>
+"use strict";
+const html=document.documentElement,btn=document.getElementById("lang");
+function setLang(l){html.lang=l;btn.textContent=l==="zh"?"EN":"中文";try{localStorage.setItem("lang",l)}catch(e){}}
+let saved=null;try{saved=localStorage.getItem("lang")}catch(e){}
+setLang(saved||((navigator.language||"").toLowerCase().startsWith("zh")?"zh":"en"));
+btn.onclick=()=>setLang(html.lang==="zh"?"en":"zh");
+fetch("/releases/latest.json",{cache:"no-cache"}).then(r=>r.ok?r.json():Promise.reject(r.status)).then(m=>{
+  const mods=Object.keys(m.modules||{}).length,k=m.kernel&&m.kernel.x86_64;
+  const zh=`最新：<b>${m.version}</b>（${(m.date||"").slice(0,10)}）· 内核 ${k?Math.round(k.size/1024)+" KiB":"—"} · ${mods} 个应用`;
+  const en=`Latest: <b>${m.version}</b> (${(m.date||"").slice(0,10)}) · kernel ${k?Math.round(k.size/1024)+" KiB":"—"} · ${mods} apps`;
+  document.getElementById("rel").innerHTML=`<span data-l="zh">${zh}</span><span data-l="en">${en}</span>`;
+}).catch(()=>{document.getElementById("rel").innerHTML='<span data-l="zh">还没有发布版。</span><span data-l="en">No release yet.</span>'});
+</script>
+</body>
+</html>
