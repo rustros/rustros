@@ -1,0 +1,11 @@
+[package]
+name = "ext4"
+version.workspace = true
+edition.workspace = true
+description = "ext4 on a partition: format, files and directories (no_std)"
+
+[lib]
+bench = false
+
+[dependencies]
+devices = { path = "../devices" }

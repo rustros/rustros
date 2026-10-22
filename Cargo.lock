@@ -328,6 +328,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext4"
+version = "0.1.0"
+dependencies = [
+ "devices",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
