@@ -268,7 +268,7 @@ function modPage(m){
 function fieldHtml(key,p,cfg){
   const v=cfg[key],id="f"+Math.random().toString(36).slice(2),def=p.def?`默认：${p.def}`:"";
   let inp;
-  if(p.kind==="switch"){const on=(v??p.def)==="on";inp=`<label style="padding:0"><input type=checkbox id=${id} data-k="${esc(key)}" data-sw=1 data-o="${v==null?"":on?"on":"off"}" ${on?"checked":""}> 启用</label>`}
+  if(p.kind==="switch"){const on=(v??p.def)==="on";inp=`<label style="padding:0"><input type=checkbox id=${id} data-k="${esc(key)}" data-sw=1 data-o="${on?"on":"off"}" ${on?"checked":""}> 启用</label>`}
   else if(p.kind==="secret")inp=`<input type=password id=${id} data-k="${esc(key)}" data-sec=1 data-o="" autocomplete="new-password" placeholder="${v!=null?"已设置（留空不修改）":"未设置"}">`;
   else if(p.kind.startsWith("choice:")){const opts=p.kind.slice(7).split("|");inp=`<select id=${id} data-k="${esc(key)}" data-o="${esc(v??"")}"><option value="">${esc(def||"（不设置）")}</option>${opts.map(o=>`<option ${v===o?"selected":""}>${esc(o)}</option>`).join("")}</select>`}
   else inp=`<input ${p.kind==="number"?"type=number":""} id=${id} data-k="${esc(key)}" data-o="${esc(v??"")}" value="${esc(v??"")}" placeholder="${esc(def)}">`;
@@ -279,8 +279,9 @@ function renderNode(node,prefix,caps,cfg,hit,mod){
   if(node.fields.length)o+=`<div class=form>${node.fields.map(f=>fieldHtml(prefix+f.lit,f.p,cfg)).join("")}</div>`;
   for(const mp of node.maps){
     const names=Object.entries(hit).filter(([k,h])=>h.p===mp.p&&same(h.caps,caps)).map(([k,h])=>[k,h.caps[h.caps.length-1]]);
-    const base=prefix+mp.lit,hole=mp.p.segs[mp.p.segs.length-1].hole;
-    o+=`<div class="sub">${esc(base+"<"+hole+">")} <span class="h mut" style="font-weight:400">${esc(mp.p.help||"")}</span></div><table>`+
+    // "user.<name>": rows are user.<name>; base is "user"
+    const base=(prefix+mp.lit).replace(/\.$/,""),hole=mp.p.segs[mp.p.segs.length-1].hole;
+    o+=`<div class="sub">${esc(base+".<"+hole+">")} <span class="h mut" style="font-weight:400">${esc(mp.p.help||"")}</span></div><table>`+
       names.map(([k,n])=>`<tr><td>${esc(n)}</td><td>${mp.p.kind==="secret"?`<input type=password data-k="${esc(k)}" data-sec=1 data-o="" placeholder="已设置（留空不修改）">`:`<input data-k="${esc(k)}" data-o="${esc(cfg[k])}" value="${esc(cfg[k])}">`}</td><td><button class="b d" onclick="delKey('${esc(mod)}','${esc(k)}')">删除</button></td></tr>`).join("")+
       `<tr><td><input placeholder="${esc(hole)}" data-new="${esc(base)}"></td><td><input ${mp.p.kind==="secret"?"type=password":""} placeholder="${esc(mp.p.def||KIND[mp.p.kind]||"")}" data-newv=1></td><td><button class="b" onclick="addRow(this,'${esc(mod)}')">添加</button></td></tr></table>`}
   for(const c of node.colls){
