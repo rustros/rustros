@@ -249,9 +249,22 @@ impl StaticNat {
             }),
         };
         if let Some(host) = to {
+            if host == dst {
+                return false; // a connection to the host's own address: as it is
+            }
             rewrite(p, false, host, partial);
             self.remember_fragment(now, h, host, false);
             return true;
+        }
+        // someone reaching a srcnat host at its own address (routed, not by
+        // a dstnat): the replies must come from that address, so remember
+        // the connection as one not to translate
+        if find(&self.snat, dst).is_some() {
+            let c = Conn { proto: h.proto, host: dst, public: dst, hport: dp, remote: src, rport: sp, ..Conn::default() };
+            if let Some(i) = self.track(now, c) {
+                self.touch(i, now, p, h);
+            }
+            return false;
         }
         // from a host: a reply on a connection, or a srcnat rule
         let from = match self.lookup(false, key(h.proto, src, sp, dst, dp), now) {
@@ -267,6 +280,9 @@ impl StaticNat {
             }),
         };
         if let Some(public) = from {
+            if public == src {
+                return false; // a reply on a connection made to the host's own address
+            }
             rewrite(p, true, public, partial);
             self.remember_fragment(now, h, public, true);
             return true;

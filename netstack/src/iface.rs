@@ -204,8 +204,8 @@ impl Iface {
                 return None;
             }
         }
-        if dst != self.ip && dst != BROADCAST && dst != bcast && !(matches!(pkt.proto, PROTO_ICMP | PROTO_TCP) && local) {
-            return None; // extra addresses serve NAT, ping, and what we started from them
+        if dst != self.ip && dst != BROADCAST && dst != bcast && !(matches!(pkt.proto, PROTO_ICMP | PROTO_TCP | PROTO_UDP) && local) {
+            return None; // extra addresses serve NAT, ping, UDP services and what we started from them
         }
         Some(pkt)
     }

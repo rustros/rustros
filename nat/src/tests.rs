@@ -543,6 +543,28 @@ fn static_srcnat_tracks_replies() {
 }
 
 #[test]
+fn srcnat_leaves_replies_to_the_hosts_own_address() {
+    let mut s = StaticNat::new(7);
+    s.set_rules(vec![(HOST, PUB)], vec![]);
+    // someone pings the host at its own address (routed): the reply keeps it
+    let mut ping = echo(REMOTE, HOST, 8, 21);
+    assert!(!s.process(0, &mut ping, &no_local, false), "the request is left alone");
+    let mut pong = echo(HOST, REMOTE, 0, 21);
+    assert!(!s.process(1, &mut pong, &no_local, false));
+    assert_eq!(get32(&pong, 12), HOST, "answered from the address that was pinged");
+    // a TCP connection to the host the same
+    let mut syn = tcp(REMOTE, 5555, HOST, 22, SYN, &[], b"");
+    s.process(2, &mut syn, &no_local, false);
+    let mut synack = tcp(HOST, 22, REMOTE, 5555, SYN | ACK, &[], b"");
+    s.process(3, &mut synack, &no_local, false);
+    assert_eq!(src_of(&synack), (HOST, 22));
+    // what the host starts itself still leaves as PUB
+    let mut out = tcp(HOST, 6000, REMOTE, 80, SYN, &[], b"");
+    assert!(s.process(4, &mut out, &no_local, false));
+    assert_eq!(src_of(&out), (PUB, 6000));
+}
+
+#[test]
 fn static_dstnat_from_several_wans() {
     let mut s = StaticNat::new(7);
     // the host is published on two WANs, and goes out by WAN 1 itself

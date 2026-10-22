@@ -113,10 +113,12 @@ impl Stack {
             }
             PROTO_UDP => {
                 let Some((sport, dport, data)) = parse_udp(&pkt) else { return };
-                let local = self.ifs.0[nic].ip;
+                // the address it was sent to (an interface's or an extra one)
+                let local = pkt.dst;
+                let ours = self.ifs.0.iter().any(|f| f.is_local(local));
                 match self.udp.iter_mut().find(|u| u.port == dport) {
                     Some(u) if u.rx.len() < QUEUE => {
-                        if pkt.dst == local {
+                        if ours {
                             match u.peers.iter().position(|p| p.0 == pkt.src) {
                                 Some(i) => u.peers[i].1 = local,
                                 None if u.peers.len() < PEERS => u.peers.push((pkt.src, local)),
@@ -289,7 +291,7 @@ impl Stack {
         let port = u.port;
         // still one of ours? (addresses change)
         let from = u.peers.iter().find(|p| p.0 == to.ip).map_or(0, |p| p.1);
-        let from = if self.ifs.0.iter().any(|f| f.ip == from) { from } else { 0 };
+        let from = if self.ifs.0.iter().any(|f| f.is_local(from)) { from } else { 0 };
         if 20 + 8 + data.len() > self.ifs.mtu_for(to.ip) {
             return Err(NetError::TooLarge);
         }
