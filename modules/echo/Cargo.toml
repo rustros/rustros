@@ -1,0 +1,15 @@
+[package]
+name = "echo-mod"
+version.workspace = true
+edition.workspace = true
+
+# The very same echo app as the built-in one, as a loadable native module.
+[[bin]]
+name = "echo"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+echo = { path = "../../apps/echo" }

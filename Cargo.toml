@@ -1,0 +1,56 @@
+[workspace]
+members = ["kernel", "api", "util", "devices", "netstack", "kvstore", "slots", "storage", "wasmhost", "nat", "l2tp", "apps/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+# With LTO the kernel crate's level applies to the whole link (core::fmt,
+# alloc, boot, storage, management...): optimise for size there (-Oz), and give
+# the per-packet crates their speed below. Forwarding itself (NAT, L2TP) runs
+# in modules, which are built at -O3.
+opt-level = "z"
+lto = true
+codegen-units = 1
+# GRUB loads only the program segments; symbols just bloat the slot and uploads
+strip = "symbols"
+
+# The WebAssembly interpreter is most of the kernel: optimise it for size.
+[profile.release.package.wasmi]
+opt-level = "z"
+[profile.release.package.wasmi_core]
+opt-level = "z"
+[profile.release.package.wasmi_ir]
+opt-level = "z"
+[profile.release.package.wasmparser]
+opt-level = "z"
+
+[profile.release.package.netstack]
+opt-level = 3
+[profile.release.package.rustros-api]
+opt-level = 3
+
+# Cold paths (management, storage, boot-time) are optimised for size.
+[profile.release.package.updater]
+opt-level = "z"
+[profile.release.package.shell]
+opt-level = "z"
+[profile.release.package.kvstore]
+opt-level = "z"
+[profile.release.package.storage]
+opt-level = "z"
+[profile.release.package.slots]
+opt-level = "z"
+[profile.release.package.rescue]
+opt-level = "z"
+[profile.release.package.dhcp]
+opt-level = "z"
+[profile.release.package.rustros-util]
+opt-level = "z"

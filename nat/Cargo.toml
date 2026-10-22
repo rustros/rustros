@@ -1,0 +1,11 @@
+[package]
+name = "nat-core"
+version.workspace = true
+edition.workspace = true
+description = "Packet-level NAPT for IPv4: no_std, no OS dependencies"
+
+[lib]
+bench = false
+
+[dependencies]
+hashbrown = { version = "0.15", default-features = false }

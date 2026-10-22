@@ -1,0 +1,11 @@
+[package]
+name = "dhcp"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+bench = false
+
+[dependencies]
+rustros-api = { path = "../../api" }
+rustros-util = { path = "../../util" }

@@ -1,0 +1,16 @@
+[package]
+name = "wasm-mod"
+version.workspace = true
+edition.workspace = true
+
+# The WebAssembly runtime (wasmi) as a loadable native module; install it
+# under the name "wasm".
+[[bin]]
+name = "wasm"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+wasmhost = { path = "../../wasmhost" }

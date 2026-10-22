@@ -1,0 +1,14 @@
+[package]
+name = "cake-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cake"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+cake = { path = "../../apps/cake" }

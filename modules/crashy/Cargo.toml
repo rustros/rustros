@@ -1,0 +1,14 @@
+[package]
+name = "crashy-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "crashy"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+crashy = { path = "../../apps/crashy" }

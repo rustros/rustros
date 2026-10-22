@@ -1,0 +1,14 @@
+[package]
+name = "webadmin-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "webadmin"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+webadmin = { path = "../../apps/webadmin" }

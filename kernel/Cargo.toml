@@ -1,0 +1,30 @@
+[package]
+name = "rustros-kernel"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rustros"
+path = "src/main.rs"
+test = false
+bench = false
+
+# Each built-in module is a feature. The WebAssembly runtime is not built in:
+# it is the loadable native module modules/wasm.
+[features]
+default = ["rescue", "dhcp", "updater"]
+
+[dependencies]
+rustros-api = { path = "../api" }
+rustros-util = { path = "../util" }
+netstack = { path = "../netstack" }
+devices = { path = "../devices" }
+slots = { path = "../slots" }
+storage = { path = "../storage" }
+kvstore = { path = "../kvstore" }
+rescue = { path = "../apps/rescue", optional = true }
+dhcp = { path = "../apps/dhcp", optional = true }
+shell = { path = "../apps/shell", optional = true }
+echo = { path = "../apps/echo", optional = true }
+httpd = { path = "../apps/httpd", optional = true }
+updater = { path = "../apps/updater", optional = true }

@@ -1,0 +1,11 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+bench = false
+
+[dependencies]
+devices = { path = "../devices" }
+kvstore = { path = "../kvstore" }

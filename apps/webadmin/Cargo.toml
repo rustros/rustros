@@ -1,0 +1,12 @@
+[package]
+name = "webadmin"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+rustros-api = { path = "../../api" }
+rustros-util = { path = "../../util" }

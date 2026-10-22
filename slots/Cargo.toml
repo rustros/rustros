@@ -1,0 +1,11 @@
+[package]
+name = "slots"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+bench = false
+
+[dependencies]
+devices = { path = "../devices" }
+rustros-util = { path = "../util" }

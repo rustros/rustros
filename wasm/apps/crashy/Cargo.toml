@@ -1,0 +1,11 @@
+[package]
+name = "crashy-wasm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rustros-guest = { path = "../../guest" }
+crashy = { path = "../../../apps/crashy" }

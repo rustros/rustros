@@ -1,0 +1,6 @@
+/target
+/build
+/modules/target
+/wasm/target
+__pycache__/
+*.pyc

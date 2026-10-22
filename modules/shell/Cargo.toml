@@ -1,0 +1,14 @@
+[package]
+name = "shell-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+shell = { path = "../../apps/shell" }

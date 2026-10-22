@@ -1,0 +1,8 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Static-pie (overriding the kernel's relocation-model=static from ../.cargo,
+# which cargo merges in): only R_X86_64_RELATIVE relocations, which is all
+# the kernel's loader handles.
+rustflags = ["-C", "relocation-model=pie", "-C", "link-arg=--entry=rustros_module_init", "-C", "link-arg=-z", "-C", "link-arg=norelro"]

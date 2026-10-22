@@ -1,0 +1,6 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+# small stack: every instance's linear memory counts against its 16 MiB cap
+rustflags = ["-C", "link-arg=-zstack-size=65536"]

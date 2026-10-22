@@ -1,0 +1,14 @@
+[package]
+name = "nat-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nat"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+nat = { path = "../../apps/nat" }

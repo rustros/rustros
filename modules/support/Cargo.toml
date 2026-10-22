@@ -1,0 +1,11 @@
+[package]
+name = "rustros-module"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+rustros-api = { path = "../../api" }

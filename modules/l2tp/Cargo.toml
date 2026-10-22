@@ -1,0 +1,14 @@
+[package]
+name = "l2tp-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "l2tp"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+l2tp = { path = "../../apps/l2tp" }

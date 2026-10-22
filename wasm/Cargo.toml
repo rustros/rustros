@@ -1,0 +1,15 @@
+# WebAssembly applications for RustROS (separate workspace: wasm32 target).
+[workspace]
+members = ["guest", "apps/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

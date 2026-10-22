@@ -1,0 +1,12 @@
+[package]
+name = "wasmhost"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+rustros-api = { path = "../api" }
+wasmi = { version = "2.0.0", default-features = false, features = ["stable", "validate", "libm", "portable-dispatch", "prefer-btree-collections"] }

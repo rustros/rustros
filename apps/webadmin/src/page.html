@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RustROS 管理</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#1d2330;--mut:#6b7385;--card:#fff;--line:#dfe3ea;--acc:#2f6fdf;--bad:#c93a3a;--ok:#25864a;--warn:#b7791f;--code:#f0f2f6}
+@media (prefers-color-scheme:dark){:root{--bg:#14171d;--fg:#e4e8ef;--mut:#9099aa;--card:#1c2028;--line:#2d333f;--acc:#6c9cff;--bad:#ef6b6b;--ok:#55c27e;--warn:#e0a84a;--code:#232833}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--line);flex-wrap:wrap}
+header b{font-size:16px}
+nav{display:flex;gap:4px;flex-wrap:wrap}
+nav button{background:none;border:0;color:var(--mut);padding:6px 10px;border-radius:6px;cursor:pointer;font:inherit}
+nav button.on{background:var(--code);color:var(--fg)}
+#who{margin-left:auto;color:var(--mut)}
+main{max-width:1100px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.card h3{margin:0 0 10px;font-size:15px}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500}
+td.n{text-align:right;font-variant-numeric:tabular-nums}
+pre{background:var(--code);padding:10px;border-radius:8px;overflow:auto;margin:0;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+input,select{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+button.b{font:inherit;padding:6px 12px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+button.d{color:var(--bad);border-color:var(--bad)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+.grow{flex:1;min-width:200px}
+.mut{color:var(--mut)}.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}
+.banner{padding:10px 14px;border-radius:8px;margin-bottom:14px;border:1px solid var(--warn);color:var(--warn)}
+#login{max-width:360px;margin:12vh auto}
+.tbl{overflow-x:auto}
+</style>
+</head>
+<body>
+<div id="login" class="card" hidden>
+  <h3>RustROS 管理登录</h3>
+  <div class="row"><input id="pw" class="grow" type="password" placeholder="密码" autocomplete="current-password"></div>
+  <div class="row"><button class="b p" id="go">登录</button><span id="lerr" class="bad"></span></div>
+  <p class="mut">密码不会在网络上传输（挑战-应答）。连接是明文 HTTP，只对内网开放。</p>
+</div>
+<div id="app" hidden>
+<header><b>RustROS</b>
+<nav id="tabs"><button data-t="status">状态</button><button data-t="net">网络</button><button data-t="mods">模块</button><button data-t="log">日志</button><button data-t="sys">系统</button></nav>
+<span id="who"></span><button class="b" id="out">退出</button></header>
+<main>
+<div id="applybar" class="banner" hidden></div>
+
+<section id="t-status">
+  <div class="card"><h3>概况</h3><div class="kv" id="sum"></div></div>
+  <div class="card"><h3>接口</h3><div class="tbl"><table id="ifs"></table></div></div>
+  <div class="card"><h3>性能（CPU、速率与峰值）</h3><pre id="perf"></pre></div>
+</section>
+
+<section id="t-net" hidden>
+  <div class="card"><h3>修改网络（候选配置）</h3>
+    <p class="mut">改动先进候选配置，不生效；<b>应用</b>后若不在倒计时内确认会自动回滚；满意后<b>保存</b>才会在重启后保留。</p>
+    <div class="row"><input id="cmd" class="grow" placeholder="cand ip nic0 203.0.113.240/24 203.0.113.1"><button class="b p" id="run">执行</button></div>
+    <div class="row mut">例：<code>cand ip nic1.109 add 198.51.100.2-252</code> · <code>cand ip vlan add nic2 2240</code> · <code>cand ip route add 0.0.0.0/0 203.0.113.1 from 10.20.0.1</code> · <code>cand mtu nic0 1500</code></div>
+    <div class="row"><button class="b" id="cand">查看候选</button><button class="b p" id="apply">应用（30 秒内确认）</button><button class="b" id="confirm">确认</button><button class="b" id="revert">回滚</button><button class="b d" id="discard">丢弃候选</button><button class="b" id="save">保存</button></div>
+    <pre id="netout" hidden></pre>
+  </div>
+  <div class="card"><h3>当前运行</h3><pre id="show"></pre></div>
+  <div class="card"><h3>候选配置</h3><pre id="candtxt"></pre></div>
+</section>
+
+<section id="t-mods" hidden>
+  <div class="card"><h3>模块</h3><div class="tbl"><table id="modt"></table></div></div>
+  <div class="card"><h3>模块设置</h3>
+    <div class="row"><select id="mname"></select><input id="mkey" placeholder="设置项，如 srcnat.10.20.0.1"><input id="mval" class="grow" placeholder="值（留空则删除）"><button class="b p" id="mset">设置</button></div>
+    <div id="mcfg"></div>
+  </div>
+</section>
+
+<section id="t-log" hidden>
+  <div class="card"><h3>控制台日志</h3><div class="row"><select id="boots"></select><button class="b" id="lrefresh">刷新</button><label class="mut"><input type="checkbox" id="lfollow" checked> 自动跟随</label></div><pre id="logtxt" style="max-height:70vh"></pre></div>
+</section>
+
+<section id="t-sys" hidden>
+  <div class="card"><h3>系统</h3>
+    <div class="row"><button class="b" data-a="perf_reset">清零峰值</button><button class="b" data-a="clear_crash">清除崩溃记录</button></div>
+    <div class="row"><button class="b d" data-a="reboot">重启</button><button class="b d" data-a="poweroff">关机</button></div>
+    <p class="mut">内核升级请用命令行工具 rustros-update.py（带试启动和回滚）。</p>
+  </div>
+</section>
+</main>
+</div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// SHA-256 and HMAC (no WebCrypto on plain HTTP)
+const K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+function sha256(m){
+  const l=m.length,n=((l+9+63)>>6)<<6,b=new Uint8Array(n);b.set(m);b[l]=0x80;
+  const dv=new DataView(b.buffer);dv.setUint32(n-4,l*8>>>0);dv.setUint32(n-8,Math.floor(l/0x20000000));
+  const H=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19],w=new Array(64),r=(x,k)=>(x>>>k)|(x<<(32-k));
+  for(let o=0;o<n;o+=64){
+    for(let i=0;i<16;i++)w[i]=dv.getUint32(o+i*4);
+    for(let i=16;i<64;i++){const a=w[i-15],c=w[i-2];w[i]=(w[i-16]+(r(a,7)^r(a,18)^(a>>>3))+w[i-7]+(r(c,17)^r(c,19)^(c>>>10)))|0}
+    let [a,bb,c,d,e,f,g,h]=H;
+    for(let i=0;i<64;i++){
+      const t1=(h+(r(e,6)^r(e,11)^r(e,25))+((e&f)^(~e&g))+K[i]+w[i])|0,t2=((r(a,2)^r(a,13)^r(a,22))+((a&bb)^(a&c)^(bb&c)))|0;
+      h=g;g=f;f=e;e=(d+t1)|0;d=c;c=bb;bb=a;a=(t1+t2)|0}
+    H[0]=(H[0]+a)|0;H[1]=(H[1]+bb)|0;H[2]=(H[2]+c)|0;H[3]=(H[3]+d)|0;H[4]=(H[4]+e)|0;H[5]=(H[5]+f)|0;H[6]=(H[6]+g)|0;H[7]=(H[7]+h)|0}
+  const out=new Uint8Array(32),ov=new DataView(out.buffer);H.forEach((v,i)=>ov.setUint32(i*4,v>>>0));return out}
+const utf8=s=>new TextEncoder().encode(s);
+const hex=b=>Array.from(b,x=>x.toString(16).padStart(2,"0")).join("");
+function hmac(key,msg){const k=new Uint8Array(64);k.set(key.length>64?sha256(key):key);const cat=(a,b)=>{const c=new Uint8Array(a.length+b.length);c.set(a);c.set(b,a.length);return c};
+  return sha256(cat(k.map(x=>x^0x5c),sha256(cat(k.map(x=>x^0x36),msg))))}
+
+async function api(path,form){
+  const o=form?{method:"POST",headers:{"X-RustROS":"1","Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams(form)}:{headers:{"X-RustROS":"1"}};
+  const r=await fetch(path,o);
+  if(r.status==401){showLogin();throw new Error("login")}
+  const ct=r.headers.get("Content-Type")||"";
+  const d=ct.includes("json")?await r.json():await r.text();
+  if(!r.ok)throw new Error(d.error||r.status);
+  return d}
+
+function showLogin(){$("app").hidden=true;$("login").hidden=false;$("pw").focus()}
+async function login(){
+  $("lerr").textContent="";
+  try{
+    const c=await (await fetch("/api/challenge")).json();
+    if(!c.password){$("lerr").textContent="还没有设置密码：module-config webadmin password ...";return}
+    const key=sha256(utf8("rustros-web:"+$("pw").value));
+    const proof=hex(hmac(key,utf8(c.nonce)));
+    const r=await fetch("/api/login",{method:"POST",headers:{"X-RustROS":"1","Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({nonce:c.nonce,proof})});
+    const d=await r.json();
+    if(!r.ok){$("lerr").textContent=d.error==="wrong password"?"密码错误":d.error;return}
+    $("pw").value="";$("login").hidden=true;$("app").hidden=false;tab(cur);
+  }catch(e){$("lerr").textContent="连接失败："+e.message}}
+$("go").onclick=login;$("pw").onkeydown=e=>{if(e.key==="Enter")login()};
+$("out").onclick=async()=>{await api("/api/logout",{});showLogin()};
+
+let cur="status",timer=null;
+function tab(t){cur=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
+  ["status","net","mods","log","sys"].forEach(x=>$("t-"+x).hidden=x!==t);
+  clearInterval(timer);const f={status:loadStatus,net:loadNet,mods:loadMods,log:loadLog,sys:()=>{}}[t];
+  f().catch(()=>{});if(t==="status"||t==="log"||t==="net")timer=setInterval(()=>f().catch(()=>{}),t==="net"?3000:2000)}
+document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>tab(b.dataset.t));
+
+const fmtUp=s=>`${Math.floor(s/86400)}天 ${String(Math.floor(s/3600)%24).padStart(2,"0")}:${String(Math.floor(s/60)%60).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+async function loadStatus(){
+  const d=await api("/api/status");
+  $("who").textContent="运行 "+fmtUp(d.uptime);
+  const kv=[["运行时间",fmtUp(d.uptime)],["内核槽位",d.slot+(d.trial?"（试启动，未确认）":"")],["启动",(d.safe?"安全模式，":"")+(d.unstable>1?`连续 ${d.unstable} 次不稳定启动`:"正常")],["运行的模块",d.running.join(", ")],["存储",d.storage],["上次崩溃",d.crash||"无"]];
+  $("sum").innerHTML=kv.map(([k,v])=>`<span class="mut">${k}</span><span>${esc(v)}</span>`).join("");
+  $("ifs").innerHTML="<tr><th>接口</th><th>地址</th><th>网关</th><th>附加地址</th><th>MTU</th><th class=n>收</th><th class=n>发</th><th class=n>丢弃 收/发</th></tr>"+
+    d.ifaces.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.ip)}</td><td>${i.gw==="0.0.0.0"?"":esc(i.gw)}</td><td>${esc(i.extra)}</td><td>${i.mtu}</td><td class=n>${i.rx}</td><td class=n>${i.tx}</td><td class=n>${i.rxd} / ${i.txd}</td></tr>`).join("");
+  $("perf").textContent=d.perf}
+
+let applyEnd=0;
+async function loadNet(){
+  const d=await api("/api/net");
+  $("show").textContent=d.show;$("candtxt").textContent=d.has_cand?d.cand:"（没有候选配置：用 cand ip ... 开始）";
+  const bar=$("applybar");
+  if(d.pending!=null){applyEnd=Date.now()+d.pending*1000;bar.hidden=false;
+    bar.innerHTML=`候选配置已应用，<b>${d.pending}</b> 秒后自动回滚。 <button class="b p" onclick="netCmd('confirm')">保留（确认）</button> <button class="b" onclick="netCmd('revert')">回滚</button>`}
+  else if(d.applied){bar.hidden=false;bar.innerHTML=`候选配置在运行中（已确认），还没保存。 <button class="b p" onclick="netCmd('save')">保存</button> <button class="b" onclick="netCmd('revert')">回滚</button>`}
+  else bar.hidden=true}
+async function netCmd(c){
+  const out=$("netout");out.hidden=false;out.textContent="…";
+  try{const r=await api("/api/net",{cmd:c});out.textContent=r.out;out.className=r.ok?"":"bad"}
+  catch(e){out.textContent=c.startsWith("apply")?"应用后连接不上了：等它自动回滚，然后检查配置。":"失败："+e.message}
+  if(c.startsWith("apply")){
+    // like iptables-apply: can a new connection still reach us?
+    try{await api("/api/net");out.textContent+="\n新连接正常。满意就点“保留（确认）”，否则会自动回滚。"}catch(e){}
+  }
+  loadNet().catch(()=>{})}
+$("run").onclick=()=>netCmd($("cmd").value.trim());$("cmd").onkeydown=e=>{if(e.key==="Enter")$("run").click()};
+$("cand").onclick=()=>netCmd("cand");
+$("apply").onclick=async()=>{try{const d=await api("/api/net");if(!d.has_cand){netCmd("cand");return}
+  if(confirm("应用以下候选配置？30 秒内不确认会自动回滚。\n\n"+d.cand))netCmd("apply 30")}catch(e){}};
+$("confirm").onclick=()=>netCmd("confirm");$("revert").onclick=()=>netCmd("revert");
+$("discard").onclick=()=>{if(confirm("丢弃候选配置（已应用的会先回滚）？"))netCmd("discard")};
+$("save").onclick=()=>{if(confirm("把当前运行的网络配置保存为开机配置？"))netCmd("save")};
+
+let mods=[];
+async function loadMods(){
+  const d=await api("/api/modules");mods=d.modules;
+  const kb=b=>b==null?"-":Math.ceil(b/1024)+" KiB";
+  $("modt").innerHTML="<tr><th>模块</th><th>运行</th><th>状态</th><th>native</th><th>wasm</th><th>重启</th><th></th></tr>"+mods.map(m=>
+    `<tr><td>${esc(m.name)}</td><td>${m.running?esc(m.running):"<span class=bad>未运行</span>"}</td><td>${esc(m.state)}${m.off?`<div class=bad>native 因崩溃已停用：${esc(m.off)}</div>`:""}</td><td>${kb(m.native)}</td><td>${kb(m.wasm)}</td><td>${m.restarts}</td><td>`+
+    (m.native!=null&&m.running!=="native"?`<button class="b" onclick="modAct('${esc(m.name)}','native')">切到 native</button>`:"")+
+    (m.wasm!=null&&m.running!=="wasm"?`<button class="b" onclick="modAct('${esc(m.name)}','wasm')">切到 wasm</button>`:"")+`</td></tr>`).join("")+
+    `<tr><td colspan=7 class=mut>内置：${esc(d.running.filter(n=>!mods.some(m=>m.name===n)).join(", "))}</td></tr>`;
+  const sel=$("mname"),keep=sel.value;sel.innerHTML=mods.map(m=>`<option>${esc(m.name)}</option>`).join("");if(keep)sel.value=keep;showCfg()}
+function showCfg(){const m=mods.find(x=>x.name===$("mname").value);
+  $("mcfg").innerHTML=m&&m.config.length?"<table>"+m.config.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td><td><button class="b" onclick="editCfg(this)" data-k="${esc(k)}" data-v="${esc(v)}">编辑</button> <button class="b d" onclick="delCfg(this)" data-k="${esc(k)}">删除</button></td></tr>`).join("")+"</table>":"<p class=mut>没有设置</p>"}
+$("mname").onchange=showCfg;
+function editCfg(b){$("mkey").value=b.dataset.k;$("mval").value=b.dataset.v==="(set)"?"":b.dataset.v;$("mval").focus()}
+async function delCfg(b){if(!confirm("删除设置 "+b.dataset.k+"？"))return;await modCall({name:$("mname").value,action:"del",key:b.dataset.k})}
+$("mset").onclick=()=>{const k=$("mkey").value.trim(),v=$("mval").value.trim();if(!k)return;modCall({name:$("mname").value,action:v?"set":"del",key:k,value:v})};
+async function modCall(f){try{const r=await api("/api/module",f);if(!r.ok)alert(r.out)}catch(e){alert(e.message)}setTimeout(()=>loadMods().catch(()=>{}),600)}
+function modAct(n,a){if(confirm(`把 ${n} 切到 ${a}？`))modCall({name:n,action:a})}
+
+async function loadLog(){
+  const sel=$("boots");
+  if(!sel.options.length){const d=await api("/api/logs");sel.innerHTML=d.boots.reverse().map(([b,n])=>`<option value="${b}">第 ${b} 次启动${b===d.this?"（本次）":""} · ${Math.ceil(n/1024)} KiB</option>`).join("")}
+  const t=await api("/api/log?boot="+sel.value),pre=$("logtxt"),atEnd=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-20;
+  pre.textContent=t.replace(/\x1b\[[0-9;?]*[A-Za-z]/g,"");if($("lfollow").checked&&atEnd)pre.scrollTop=pre.scrollHeight}
+$("lrefresh").onclick=()=>loadLog();$("boots").onchange=()=>loadLog();
+
+document.querySelectorAll("[data-a]").forEach(b=>b.onclick=async()=>{
+  const a=b.dataset.a,txt={reboot:"重启",poweroff:"关机"}[a];
+  if(txt&&!confirm(`确定要${txt}吗？`))return;
+  try{const r=await api("/api/system",{action:a});alert(r.out)}catch(e){alert(e.message)}});
+
+api("/api/status").then(()=>{$("app").hidden=false;tab("status")}).catch(e=>{if(e.message!=="login")showLogin()});
+</script>
+</body>
+</html>
