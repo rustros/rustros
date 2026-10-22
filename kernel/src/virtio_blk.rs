@@ -41,7 +41,7 @@ struct ReqHdr {
 
 impl VirtioBlk {
     pub fn new(pci: &PciDev) -> Option<VirtioBlk> {
-        let dev = Virtio::probe(pci)?;
+        let mut dev = Virtio::probe(pci)?;
         let feat = dev.begin(F_RO)?;
         let q = dev.queue(0, 16)?;
         let sectors = dev.config32(0) as u64 | (dev.config32(4) as u64) << 32;

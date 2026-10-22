@@ -35,8 +35,18 @@ fn next_table(entry: &mut u64) -> Option<&'static mut [u64; 512]> {
 /// Make sure `[phys, phys+len)` is identity-mapped (uncached). The first 4 GiB
 /// are mapped by boot.rs with 2 MiB pages; this adds more of them on demand.
 pub fn map_identity(phys: u64, len: u64) -> bool {
+    map(phys, len, false)
+}
+
+/// `map_identity` for a device's registers: uncached below 4 GiB too (boot.rs
+/// maps that cacheable; firmware MTRRs usually cover device memory, not always).
+pub fn map_device(phys: u64, len: u64) -> bool {
+    map(phys, len, true)
+}
+
+fn map(phys: u64, len: u64, uncached_low: bool) -> bool {
     const MB2: u64 = 2 << 20;
-    if phys + len <= 4 << 30 {
+    if phys + len <= 4 << 30 && !uncached_low {
         return true;
     }
     if phys + len > 1 << 47 {
@@ -50,6 +60,8 @@ pub fn map_identity(phys: u64, len: u64) -> bool {
         let e = &mut pd[(a >> 21) as usize & 511];
         if *e & 1 == 0 {
             *e = a | 0x9B; // present | writable | PWT | PCD | 2 MiB page
+        } else if uncached_low {
+            *e |= 0x18; // PWT | PCD
         }
         a += MB2;
     }

@@ -292,7 +292,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let offloads = cmdline_get(&cmdline, "offload").or_else(|| boot.as_ref().and_then(|b| b.upd.get("net_offload"))) != Some("off");
     let nics: Vec<Box<dyn NetDevice>> = nets.iter().filter_map(|d| virtio_net::VirtioNet::new(d, offloads)).map(|n| Box::new(n) as Box<dyn NetDevice>).collect();
     if nics.is_empty() {
-        kprintln!("no usable virtio-net device found, halting");
+        kprintln!("no usable virtio-net device found ({} seen, messages above), halting", nets.len());
         arch::halt_forever();
     }
     for (i, n) in nics.iter().enumerate() {

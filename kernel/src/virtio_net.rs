@@ -169,9 +169,10 @@ fn flow_hash(f: &[u8]) -> u32 {
 
 impl VirtioNet {
     pub fn new(pci: &PciDev, offloads: bool) -> Option<VirtioNet> {
-        let dev = Virtio::probe(pci)?;
-        let modern = dev.is_modern();
+        let mut dev = Virtio::probe(pci)?;
         let offered = dev.offered();
+        // whether the device is driven the modern way, decided by `begin`
+        let mut modern = dev.is_modern();
         let mut want = F_MAC | if modern { F_CTRL_VQ | F_CTRL_RX | F_MQ } else { 0 };
         if modern && offloads {
             // big segments in only with buffers that chain (MRG_RXBUF)
@@ -181,6 +182,12 @@ impl VirtioNet {
             want |= F_CSUM | F_HOST_TSO4 | F_HOST_ECN;
         }
         let mut feat = dev.begin(want)?;
+        if !dev.is_modern() && modern {
+            // fell back to legacy: none of the modern-only features
+            modern = false;
+            want &= F_MAC;
+            feat = dev.begin(want)?;
+        }
         if feat & F_GUEST_TSO4 != 0 && feat & (F_MRG_RXBUF | F_GUEST_CSUM) != F_MRG_RXBUF | F_GUEST_CSUM {
             feat = dev.begin(want & !(F_GUEST_TSO4 | F_GUEST_ECN))?; // not without them
         }

@@ -33,7 +33,7 @@ impl Esb {
         let d: PciDev = found?;
         d.enable();
         let (bar, io) = d.bar(0);
-        if io || bar == 0 || !crate::mem::map_identity(bar, 0x1000) {
+        if io || bar == 0 || !crate::mem::map_device(bar, 0x1000) {
             return None;
         }
         let mut w = Esb { base: bar as usize, last_pet: 0 };

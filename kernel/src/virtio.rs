@@ -9,6 +9,12 @@ use crate::arch::{inb, inl, outb, outl};
 use crate::pci::PciDev;
 
 pub const F_VERSION_1: u64 = 1 << 32;
+/// The device sits behind the platform's DMA translation (none here: we
+/// hand it physical addresses, which is what it then expects). Hardware
+/// virtio devices (cloud hosts' offload cards) insist on it.
+const F_ACCESS_PLATFORM: u64 = 1 << 33;
+/// Memory ordering as for real hardware: our fences already are.
+const F_ORDER_PLATFORM: u64 = 1 << 35;
 
 const S_ACK: u8 = 1;
 const S_DRIVER: u8 = 2;
@@ -17,11 +23,74 @@ const S_FEATURES_OK: u8 = 8;
 
 enum Transport {
     Modern { common: usize, notify: usize, notify_mul: u32, device: usize, isr: usize },
-    Legacy { io: u16 },
+    Legacy { io: Lio },
+}
+
+/// Where a legacy device's registers are: I/O ports, or a memory BAR (as on
+/// some cloud hosts).
+#[derive(Clone, Copy)]
+enum Lio {
+    Port(u16),
+    Mem(usize),
+}
+
+impl Lio {
+    unsafe fn r8(self, off: u16) -> u8 {
+        unsafe {
+            match self {
+                Lio::Port(p) => inb(p + off),
+                Lio::Mem(a) => rd::<u8>(a + off as usize),
+            }
+        }
+    }
+    unsafe fn r16(self, off: u16) -> u16 {
+        unsafe {
+            match self {
+                Lio::Port(p) => inw(p + off),
+                Lio::Mem(a) => rd::<u16>(a + off as usize),
+            }
+        }
+    }
+    unsafe fn r32(self, off: u16) -> u32 {
+        unsafe {
+            match self {
+                Lio::Port(p) => inl(p + off),
+                Lio::Mem(a) => rd::<u32>(a + off as usize),
+            }
+        }
+    }
+    unsafe fn w8(self, off: u16, v: u8) {
+        unsafe {
+            match self {
+                Lio::Port(p) => outb(p + off, v),
+                Lio::Mem(a) => wr::<u8>(a + off as usize, v),
+            }
+        }
+    }
+    unsafe fn w16(self, off: u16, v: u16) {
+        unsafe {
+            match self {
+                Lio::Port(p) => outw(p + off, v),
+                Lio::Mem(a) => wr::<u16>(a + off as usize, v),
+            }
+        }
+    }
+    unsafe fn w32(self, off: u16, v: u32) {
+        unsafe {
+            match self {
+                Lio::Port(p) => outl(p + off, v),
+                Lio::Mem(a) => wr::<u32>(a + off as usize, v),
+            }
+        }
+    }
 }
 
 pub struct Virtio {
     t: Transport,
+    /// the legacy registers of a transitional device, to fall back to
+    legacy_io: Option<Lio>,
+    /// "00:05.0", for messages
+    at: alloc::string::String,
 }
 
 unsafe fn rd<T>(a: usize) -> T {
@@ -67,6 +136,7 @@ const L_CONFIG: u16 = 20;
 impl Virtio {
     pub fn probe(pci: &PciDev) -> Option<Virtio> {
         pci.enable();
+        let at = alloc::format!("{:02x}:{:02x}.{}", pci.bus, pci.dev, pci.func);
         let (mut common, mut notify, mut device, mut mul, mut isr) = (None, None, None, 0, None);
         for cap in pci.caps() {
             if pci.read8(cap) != 0x09 {
@@ -80,7 +150,11 @@ impl Virtio {
                 continue;
             }
             let (base, io) = pci.bar(bar);
-            if io || base == 0 || !crate::mem::map_identity(base + off, len) {
+            if !(1..=4).contains(&ty) {
+                continue;
+            }
+            if io || base == 0 || !crate::mem::map_device(base + off, len) {
+                crate::kprintln!("virtio {}: capability {} in BAR{} at {:#x}+{:#x} not usable", at, ty, bar, base, off);
                 continue;
             }
             let a = (base + off) as usize;
@@ -95,17 +169,36 @@ impl Virtio {
                 _ => {}
             }
         }
+        let (io, is_io) = pci.bar(0);
+        let modern = common.is_some() && notify.is_some() && device.is_some();
+        let legacy_io = if is_io && io != 0 {
+            Some(Lio::Port(io as u16))
+        } else if !modern && io != 0 && crate::mem::map_device(io, 4096) {
+            // a legacy device with its registers in memory
+            Some(Lio::Mem(io as usize))
+        } else {
+            None
+        };
+        if legacy_io.is_some() && !modern {
+            // the legacy layout moves the device's config when MSI-X is on: keep it off
+            if let Some(c) = pci.caps().find(|&c| pci.read8(c) == 0x11) {
+                let ctl = pci.read8(c + 3);
+                if ctl & 0x80 != 0 {
+                    pci.write8(c + 3, ctl & !0x80);
+                }
+            }
+        }
         let t = match (common, notify, device) {
             (Some(common), Some(notify), Some(device)) => Transport::Modern { common, notify, notify_mul: mul, device, isr: isr.unwrap_or(0) },
-            _ => {
-                let (io, is_io) = pci.bar(0);
-                if !is_io || io == 0 {
+            _ => match legacy_io {
+                Some(io) => Transport::Legacy { io },
+                None => {
+                    crate::kprintln!("virtio {}: neither modern registers nor legacy ones (BAR0 {:#x})", at, io);
                     return None;
                 }
-                Transport::Legacy { io: io as u16 }
-            }
+            },
         };
-        Some(Virtio { t })
+        Some(Virtio { t, legacy_io, at })
     }
 
     /// The ISR status register (reading it acknowledges the interrupt).
@@ -113,7 +206,8 @@ impl Virtio {
         match self.t {
             Transport::Modern { isr: 0, .. } => None,
             Transport::Modern { isr, .. } => Some(Isr::Mmio(isr)),
-            Transport::Legacy { io } => Some(Isr::Port(io + 19)),
+            Transport::Legacy { io: Lio::Port(p) } => Some(Isr::Port(p + 19)),
+            Transport::Legacy { io: Lio::Mem(a) } => Some(Isr::Mmio(a + 19)),
         }
     }
 
@@ -125,7 +219,7 @@ impl Virtio {
         unsafe {
             match self.t {
                 Transport::Modern { common, .. } => wr::<u8>(common + C_STATUS, s),
-                Transport::Legacy { io } => outb(io + L_STATUS, s),
+                Transport::Legacy { io } => io.w8(L_STATUS, s),
             }
         }
     }
@@ -133,13 +227,28 @@ impl Virtio {
         unsafe {
             match self.t {
                 Transport::Modern { common, .. } => rd::<u8>(common + C_STATUS),
-                Transport::Legacy { io } => inb(io + L_STATUS),
+                Transport::Legacy { io } => io.r8(L_STATUS),
             }
         }
     }
 
-    /// Reset and negotiate features. Returns the accepted feature set.
-    pub fn begin(&self, wanted: u64) -> Option<u64> {
+    /// Reset and negotiate features. Returns the accepted feature set. A
+    /// transitional device that refuses the modern way is driven the
+    /// legacy way.
+    pub fn begin(&mut self, wanted: u64) -> Option<u64> {
+        match self.negotiate(wanted) {
+            Some(f) => Some(f),
+            None if self.is_modern() && self.legacy_io.is_some() => {
+                crate::kprintln!("virtio {}: trying the legacy interface", self.at);
+                self.set_status(0);
+                self.t = Transport::Legacy { io: self.legacy_io? };
+                self.negotiate(wanted)
+            }
+            None => None,
+        }
+    }
+
+    fn negotiate(&self, wanted: u64) -> Option<u64> {
         self.set_status(0);
         while self.status() != 0 {}
         self.set_status(S_ACK);
@@ -151,8 +260,10 @@ impl Virtio {
                     let lo = rd::<u32>(common + C_DF) as u64;
                     wr::<u32>(common + C_DFSEL, 1);
                     let hi = rd::<u32>(common + C_DF) as u64;
-                    let f = (lo | hi << 32) & (wanted | F_VERSION_1);
+                    let offered = lo | hi << 32;
+                    let f = offered & (wanted | F_VERSION_1 | F_ACCESS_PLATFORM | F_ORDER_PLATFORM);
                     if f & F_VERSION_1 == 0 {
+                        crate::kprintln!("virtio {}: no VERSION_1 (offers {:#x})", self.at, offered);
                         return None;
                     }
                     wr::<u32>(common + C_GFSEL, 0);
@@ -161,13 +272,14 @@ impl Virtio {
                     wr::<u32>(common + C_GF, (f >> 32) as u32);
                     self.set_status(S_ACK | S_DRIVER | S_FEATURES_OK);
                     if self.status() & S_FEATURES_OK == 0 {
+                        crate::kprintln!("virtio {}: features {:#x} refused (offers {:#x})", self.at, f, offered);
                         return None;
                     }
                     Some(f)
                 }
                 Transport::Legacy { io } => {
-                    let f = inl(io + L_HF) as u64 & wanted & 0xFFFF_FFFF;
-                    outl(io + L_GF, f as u32);
+                    let f = io.r32(L_HF) as u64 & wanted & 0xFFFF_FFFF;
+                    io.w32(L_GF, f as u32);
                     Some(f)
                 }
             }
@@ -189,7 +301,7 @@ impl Virtio {
                     wr::<u32>(common + C_DFSEL, 1);
                     lo | (rd::<u32>(common + C_DF) as u64) << 32
                 }
-                Transport::Legacy { io } => inl(io + L_HF) as u64,
+                Transport::Legacy { io } => io.r32(L_HF) as u64,
             }
         }
     }
@@ -202,7 +314,7 @@ impl Virtio {
         unsafe {
             match self.t {
                 Transport::Modern { device, .. } => rd::<u8>(device + off),
-                Transport::Legacy { io } => inb(io + L_CONFIG + off as u16),
+                Transport::Legacy { io } => io.r8(L_CONFIG + off as u16),
             }
         }
     }
@@ -211,7 +323,7 @@ impl Virtio {
         unsafe {
             match self.t {
                 Transport::Modern { device, .. } => rd::<u32>(device + off),
-                Transport::Legacy { io } => inl(io + L_CONFIG + off as u16),
+                Transport::Legacy { io } => io.r32(L_CONFIG + off as u16),
             }
         }
     }
@@ -225,11 +337,12 @@ impl Virtio {
                     rd::<u16>(common + C_QSIZE)
                 }
                 Transport::Legacy { io } => {
-                    outw(io + L_QSEL, idx);
-                    inw(io + L_QSIZE)
+                    io.w16(L_QSEL, idx);
+                    io.r16(L_QSIZE)
                 }
             };
             if size == 0 {
+                crate::kprintln!("virtio {}: no queue {}", self.at, idx);
                 return None;
             }
             // modern devices let us shrink the queue; legacy ones don't
@@ -254,8 +367,11 @@ impl Virtio {
                     Notify::Mmio(notify + off * notify_mul as usize)
                 }
                 Transport::Legacy { io } => {
-                    outl(io + L_QPFN, (mem >> 12) as u32);
-                    Notify::Port(io + L_QNOTIFY)
+                    io.w32(L_QPFN, (mem >> 12) as u32);
+                    match io {
+                        Lio::Port(p) => Notify::Port(p + L_QNOTIFY),
+                        Lio::Mem(a) => Notify::Mmio(a + L_QNOTIFY as usize),
+                    }
                 }
             };
             wr::<u16>(avail, 1); // VIRTQ_AVAIL_F_NO_INTERRUPT
