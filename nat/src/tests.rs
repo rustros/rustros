@@ -105,7 +105,7 @@ fn nat() -> Nat {
 fn tcp_round_trip() {
     let mut n = nat();
     let mut syn = tcp(HOST, 40000, REMOTE, 443, SYN, &[], &[]);
-    assert_eq!(n.outbound(0, &mut syn, 7), Ok(PUB));
+    assert_eq!(n.outbound(0, &mut syn, 7, false), Ok(PUB));
     assert_valid(&syn);
     let (ext_ip, ext_port) = src_of(&syn);
     assert_eq!(ext_ip, PUB);
@@ -114,12 +114,12 @@ fn tcp_round_trip() {
     assert_eq!(dst_of(&syn), (REMOTE, 443));
 
     let mut synack = tcp(REMOTE, 443, PUB, ext_port, SYN | ACK, &[], &[]);
-    assert_eq!(n.inbound(5, &mut synack), Inbound::Forward { to: HOST, tag: 7 });
+    assert_eq!(n.inbound(5, &mut synack, false), Inbound::Forward { to: HOST, tag: 7 });
     assert_valid(&synack);
     assert_eq!(dst_of(&synack), (HOST, 40000));
 
     let mut data = tcp(HOST, 40000, REMOTE, 443, ACK, &[], b"GET / HTTP/1.1\r\n\r\n");
-    assert_eq!(n.outbound(10, &mut data, 7), Ok(PUB));
+    assert_eq!(n.outbound(10, &mut data, 7, false), Ok(PUB));
     assert_valid(&data);
     assert_eq!(src_of(&data), (PUB, ext_port));
     assert_eq!(n.stats().sessions, 1);
@@ -129,11 +129,11 @@ fn tcp_round_trip() {
 fn inside_port_kept_when_free() {
     let mut n = nat();
     let mut a = udp(HOST, 20000, REMOTE, 53, b"q");
-    n.outbound(0, &mut a, 0).unwrap();
+    n.outbound(0, &mut a, 0, false).unwrap();
     assert_eq!(src_of(&a), (PUB, 20000));
     // another host with the same port gets a different one
     let mut b = udp(HOST2, 20000, REMOTE, 53, b"q");
-    n.outbound(0, &mut b, 0).unwrap();
+    n.outbound(0, &mut b, 0, false).unwrap();
     assert_ne!(src_of(&b).1, 20000);
     assert_valid(&b);
 }
@@ -142,19 +142,19 @@ fn inside_port_kept_when_free() {
 fn endpoint_independent_mapping_dependent_filtering() {
     let mut n = nat();
     let mut a = udp(HOST, 5000, REMOTE, 3478, b"stun");
-    n.outbound(0, &mut a, 0).unwrap();
+    n.outbound(0, &mut a, 0, false).unwrap();
     let ext = src_of(&a).1;
     let mut b = udp(HOST, 5000, ROUTER, 9999, b"x");
-    n.outbound(0, &mut b, 0).unwrap();
+    n.outbound(0, &mut b, 0, false).unwrap();
     assert_eq!(src_of(&b).1, ext, "same external port for every destination");
     // a reply from the contacted endpoint comes in ...
     let mut r = udp(ROUTER, 9999, PUB, ext, b"y");
-    assert_eq!(n.inbound(1, &mut r), Inbound::Forward { to: HOST, tag: 0 });
+    assert_eq!(n.inbound(1, &mut r, false), Inbound::Forward { to: HOST, tag: 0 });
     // ... a stranger, or another port of a contacted host, does not
     let mut s = udp(ip(192, 0, 2, 9), 9999, PUB, ext, b"z");
-    assert_eq!(n.inbound(1, &mut s), Inbound::NotOurs);
+    assert_eq!(n.inbound(1, &mut s, false), Inbound::NotOurs);
     let mut s = udp(REMOTE, 1234, PUB, ext, b"z");
-    assert_eq!(n.inbound(1, &mut s), Inbound::NotOurs);
+    assert_eq!(n.inbound(1, &mut s, false), Inbound::NotOurs);
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn not_ours_is_untouched() {
     let mut n = nat();
     let mut p = tcp(REMOTE, 5555, PUB, 9000, SYN, &[], &[]);
     let before = p.clone();
-    assert_eq!(n.inbound(0, &mut p), Inbound::NotOurs);
+    assert_eq!(n.inbound(0, &mut p, false), Inbound::NotOurs);
     assert_eq!(p, before);
 }
 
@@ -171,7 +171,7 @@ fn udp_without_checksum() {
     let mut n = nat();
     let mut p = udp(HOST, 30000, REMOTE, 9, b"x");
     set16(&mut p, 26, 0);
-    n.outbound(0, &mut p, 0).unwrap();
+    n.outbound(0, &mut p, 0, false).unwrap();
     assert_eq!(get16(&p, 26), 0, "stays without checksum");
     assert_eq!(checksum(&p[..20]), 0);
 }
@@ -180,17 +180,17 @@ fn udp_without_checksum() {
 fn icmp_echo() {
     let mut n = nat();
     let mut req = echo(HOST, REMOTE, 8, 0x0042);
-    assert_eq!(n.outbound(0, &mut req, 3), Ok(PUB));
+    assert_eq!(n.outbound(0, &mut req, 3, false), Ok(PUB));
     assert_valid(&req);
     let id = get16(&req, 24);
     let mut rep = echo(REMOTE, PUB, 0, id);
-    assert_eq!(n.inbound(1, &mut rep), Inbound::Forward { to: HOST, tag: 3 });
+    assert_eq!(n.inbound(1, &mut rep, false), Inbound::Forward { to: HOST, tag: 3 });
     assert_valid(&rep);
     assert_eq!(get16(&rep, 24), 0x0042);
     assert_eq!(get32(&rep, 16), HOST);
     // a ping to the NAT itself is not a session
     let mut own = echo(REMOTE, PUB, 8, 7);
-    assert_eq!(n.inbound(1, &mut own), Inbound::NotOurs);
+    assert_eq!(n.inbound(1, &mut own, false), Inbound::NotOurs);
 }
 
 #[test]
@@ -200,12 +200,12 @@ fn icmp_error_from_outside_reaches_the_host() {
     let mut n = Nat::new(cfg, 1);
     n.set_default_egress(PUB);
     let mut out = udp(HOST, 1111, REMOTE, 53, &[0u8; 1400]);
-    n.outbound(0, &mut out, 9).unwrap();
+    n.outbound(0, &mut out, 9, false).unwrap();
     assert_eq!(src_of(&out), (PUB, 40000));
     // the router says: fragmentation needed, MTU 1280
     let mut err = icmp_error(ROUTER, &out, 3, 4, 1280).unwrap();
     assert_eq!(err.len(), 20 + 8 + 28);
-    assert_eq!(n.inbound(1, &mut err), Inbound::Forward { to: HOST, tag: 9 });
+    assert_eq!(n.inbound(1, &mut err, false), Inbound::Forward { to: HOST, tag: 9 });
     assert_valid(&err);
     assert_eq!(get32(&err, 16), HOST);
     let inner = &err[28..];
@@ -215,9 +215,9 @@ fn icmp_error_from_outside_reaches_the_host() {
 
     // and about a ping
     let mut ping = echo(HOST, REMOTE, 8, 5);
-    n.outbound(0, &mut ping, 9).unwrap();
+    n.outbound(0, &mut ping, 9, false).unwrap();
     let mut err = icmp_error(ROUTER, &ping, 11, 0, 0).unwrap();
-    assert_eq!(n.inbound(1, &mut err), Inbound::Forward { to: HOST, tag: 9 });
+    assert_eq!(n.inbound(1, &mut err, false), Inbound::Forward { to: HOST, tag: 9 });
     assert_valid(&err);
     assert_eq!(get16(&err[28..], 24), 5, "inner echo identifier restored");
 }
@@ -226,13 +226,13 @@ fn icmp_error_from_outside_reaches_the_host() {
 fn icmp_error_from_inside_goes_out() {
     let mut n = nat();
     let mut out = udp(HOST, 2222, REMOTE, 7000, b"hi");
-    n.outbound(0, &mut out, 0).unwrap();
+    n.outbound(0, &mut out, 0, false).unwrap();
     let ext = src_of(&out).1;
     let mut back = udp(REMOTE, 7000, PUB, ext, b"reply");
-    n.inbound(1, &mut back).unwrap_forward();
+    n.inbound(1, &mut back, false).unwrap_forward();
     // the host says: port unreachable
     let mut err = icmp_error(HOST, &back, 3, 3, 0).unwrap();
-    assert_eq!(n.outbound(2, &mut err, 0), Ok(PUB));
+    assert_eq!(n.outbound(2, &mut err, 0, false), Ok(PUB));
     assert_valid(&err);
     assert_eq!(get32(&err, 12), PUB);
     let inner = &err[28..];
@@ -253,9 +253,9 @@ impl Fwd for Inbound {
 fn tcp_needs_syn_to_start() {
     let mut n = nat();
     let mut p = tcp(HOST, 1, REMOTE, 80, ACK, &[], b"x");
-    assert_eq!(n.outbound(0, &mut p, 0), Err(Drop::NoSession));
+    assert_eq!(n.outbound(0, &mut p, 0, false), Err(Drop::NoSession));
     let mut p = tcp(HOST, 1, REMOTE, 80, SYN | ACK, &[], &[]);
-    assert_eq!(n.outbound(0, &mut p, 0), Err(Drop::NoSession));
+    assert_eq!(n.outbound(0, &mut p, 0, false), Err(Drop::NoSession));
     assert_eq!(n.stats().sessions, 0);
 }
 
@@ -264,9 +264,9 @@ fn ttl() {
     let mut n = nat();
     let mut p = udp(HOST, 1, REMOTE, 2, b"x");
     p[8] = 1;
-    assert_eq!(n.outbound(0, &mut p, 0), Err(Drop::TtlExceeded));
+    assert_eq!(n.outbound(0, &mut p, 0, false), Err(Drop::TtlExceeded));
     let mut p = udp(HOST, 1, REMOTE, 2, b"x");
-    n.outbound(0, &mut p, 0).unwrap();
+    n.outbound(0, &mut p, 0, false).unwrap();
     let mut r = udp(REMOTE, 2, PUB, src_of(&p).1, b"y");
     r[8] = 1;
     let c = checksum(&{
@@ -275,7 +275,7 @@ fn ttl() {
         h
     });
     set16(&mut r, 10, c);
-    assert_eq!(n.inbound(0, &mut r), Inbound::Drop(Drop::TtlExceeded));
+    assert_eq!(n.inbound(0, &mut r, false), Inbound::Drop(Drop::TtlExceeded));
     let e = icmp_error(PUB, &r, 11, 0, 0).unwrap();
     assert_valid(&e);
     assert_eq!(get32(&e, 16), REMOTE);
@@ -289,17 +289,17 @@ fn mss_clamp_both_ways() {
     n.set_default_egress(PUB);
     let opts = [2, 4, 0x05, 0xB4, 1, 1, 4, 2]; // MSS 1460, NOP, NOP, SACK permitted
     let mut syn = tcp(HOST, 1000, REMOTE, 80, SYN, &opts, &[]);
-    n.outbound(0, &mut syn, 0).unwrap();
+    n.outbound(0, &mut syn, 0, false).unwrap();
     assert_valid(&syn);
     assert_eq!(get16(&syn, 42), 1360);
     let mut sa = tcp(REMOTE, 80, PUB, src_of(&syn).1, SYN | ACK, &opts, &[]);
-    n.inbound(1, &mut sa).unwrap_forward();
+    n.inbound(1, &mut sa, false).unwrap_forward();
     assert_valid(&sa);
     assert_eq!(get16(&sa, 42), 1360);
     // smaller ones are left alone
     let small = [2, 4, 0x02, 0x18];
     let mut syn = tcp(HOST, 1001, REMOTE, 80, SYN, &small, &[]);
-    n.outbound(0, &mut syn, 0).unwrap();
+    n.outbound(0, &mut syn, 0, false).unwrap();
     assert_eq!(get16(&syn, 42), 536);
 }
 
@@ -309,18 +309,18 @@ fn per_host_egress() {
     n.set_egress(HOST2, Some(PUB2));
     let mut a = udp(HOST, 20000, REMOTE, 2, b"a");
     let mut b = udp(HOST2, 20000, REMOTE, 2, b"b");
-    assert_eq!(n.outbound(0, &mut a, 0), Ok(PUB));
-    assert_eq!(n.outbound(0, &mut b, 0), Ok(PUB2));
+    assert_eq!(n.outbound(0, &mut a, 0, false), Ok(PUB));
+    assert_eq!(n.outbound(0, &mut b, 0, false), Ok(PUB2));
     // same port on different egress addresses does not collide
     assert_eq!(src_of(&a).1, src_of(&b).1);
     let mut r = udp(REMOTE, 2, PUB2, src_of(&b).1, b"r");
-    assert_eq!(n.inbound(1, &mut r), Inbound::Forward { to: HOST2, tag: 0 });
+    assert_eq!(n.inbound(1, &mut r, false), Inbound::Forward { to: HOST2, tag: 0 });
     let mut r = udp(REMOTE, 2, PUB, src_of(&a).1, b"r");
-    assert_eq!(n.inbound(1, &mut r), Inbound::Forward { to: HOST, tag: 0 });
+    assert_eq!(n.inbound(1, &mut r, false), Inbound::Forward { to: HOST, tag: 0 });
 
     let mut nobody = Nat::new(Config::default(), 1);
     let mut p = udp(HOST, 1, REMOTE, 2, b"a");
-    assert_eq!(nobody.outbound(0, &mut p, 0), Err(Drop::NoEgress));
+    assert_eq!(nobody.outbound(0, &mut p, 0, false), Err(Drop::NoEgress));
 }
 
 #[test]
@@ -329,31 +329,31 @@ fn expiry_and_timeouts() {
     let c = n.config().clone();
     // unanswered UDP: short timeout
     let mut p = udp(HOST, 1, REMOTE, 2, b"a");
-    n.outbound(0, &mut p, 0).unwrap();
+    n.outbound(0, &mut p, 0, false).unwrap();
     let ext = src_of(&p).1;
     let mut r = udp(REMOTE, 2, PUB, ext, b"r");
-    assert_eq!(n.inbound(c.udp_ms, &mut r), Inbound::NotOurs, "expired");
+    assert_eq!(n.inbound(c.udp_ms, &mut r, false), Inbound::NotOurs, "expired");
     assert_eq!(n.stats().sessions, 0, "removed on lookup");
     // answered UDP: stream timeout
     let mut p = udp(HOST, 1, REMOTE, 2, b"a");
-    n.outbound(0, &mut p, 0).unwrap();
+    n.outbound(0, &mut p, 0, false).unwrap();
     let mut r = udp(REMOTE, 2, PUB, src_of(&p).1, b"r");
-    n.inbound(1, &mut r).unwrap_forward();
+    n.inbound(1, &mut r, false).unwrap_forward();
     let mut r = udp(REMOTE, 2, PUB, src_of(&p).1, b"r");
-    n.inbound(c.udp_ms + 10, &mut r).unwrap_forward();
+    n.inbound(c.udp_ms + 10, &mut r, false).unwrap_forward();
     // established TCP lives long, RST shortens it
     let mut s = tcp(HOST, 7, REMOTE, 80, SYN, &[], &[]);
-    n.outbound(0, &mut s, 0).unwrap();
+    n.outbound(0, &mut s, 0, false).unwrap();
     let ext = src_of(&s).1;
     let mut sa = tcp(REMOTE, 80, PUB, ext, SYN | ACK, &[], &[]);
-    n.inbound(1, &mut sa).unwrap_forward();
+    n.inbound(1, &mut sa, false).unwrap_forward();
     let t = 1 + c.tcp_transitory_ms + 1000;
     let mut a = tcp(REMOTE, 80, PUB, ext, ACK, &[], b"d");
-    n.inbound(t, &mut a).unwrap_forward();
+    n.inbound(t, &mut a, false).unwrap_forward();
     let mut rst = tcp(HOST, 7, REMOTE, 80, RST, &[], &[]);
-    n.outbound(t, &mut rst, 0).unwrap();
+    n.outbound(t, &mut rst, 0, false).unwrap();
     let mut late = tcp(REMOTE, 80, PUB, ext, ACK, &[], b"d");
-    assert_eq!(n.inbound(t + RST_MS, &mut late), Inbound::NotOurs);
+    assert_eq!(n.inbound(t + RST_MS, &mut late, false), Inbound::NotOurs);
     // the sweeper frees what nobody looks up
     n.expire(u64::MAX / 2, 1000);
     assert_eq!(n.stats().sessions, 0);
@@ -368,15 +368,15 @@ fn ports_are_released_and_reused() {
     let mut a = udp(HOST, 1, REMOTE, 2, b"a");
     let mut b = udp(HOST, 2, REMOTE, 2, b"b");
     let mut c = udp(HOST, 3, REMOTE, 2, b"c");
-    n.outbound(0, &mut a, 0).unwrap();
-    n.outbound(0, &mut b, 0).unwrap();
-    assert_eq!(n.outbound(0, &mut c, 0), Err(Drop::PortsExhausted));
+    n.outbound(0, &mut a, 0, false).unwrap();
+    n.outbound(0, &mut b, 0, false).unwrap();
+    assert_eq!(n.outbound(0, &mut c, 0, false), Err(Drop::PortsExhausted));
     // the mapping is shared: another destination from port 1 is fine
     let mut a2 = udp(HOST, 1, ROUTER, 2, b"a");
-    n.outbound(0, &mut a2, 0).unwrap();
+    n.outbound(0, &mut a2, 0, false).unwrap();
     n.expire(1_000_000, 100);
     let mut c = udp(HOST, 3, REMOTE, 2, b"c");
-    n.outbound(1_000_000, &mut c, 0).unwrap();
+    n.outbound(1_000_000, &mut c, 0, false).unwrap();
 }
 
 #[test]
@@ -387,14 +387,14 @@ fn limits() {
     let mut n = Nat::new(cfg, 1);
     n.set_default_egress(PUB);
     for port in 1..=2 {
-        n.outbound(0, &mut udp(HOST, port, REMOTE, 2, b"x"), 0).unwrap();
+        n.outbound(0, &mut udp(HOST, port, REMOTE, 2, b"x"), 0, false).unwrap();
     }
-    assert_eq!(n.outbound(0, &mut udp(HOST, 3, REMOTE, 2, b"x"), 0), Err(Drop::HostLimit));
-    n.outbound(0, &mut udp(HOST2, 1, REMOTE, 2, b"x"), 0).unwrap();
-    assert_eq!(n.outbound(0, &mut udp(HOST2, 2, REMOTE, 2, b"x"), 0), Err(Drop::TableFull));
+    assert_eq!(n.outbound(0, &mut udp(HOST, 3, REMOTE, 2, b"x"), 0, false), Err(Drop::HostLimit));
+    n.outbound(0, &mut udp(HOST2, 1, REMOTE, 2, b"x"), 0, false).unwrap();
+    assert_eq!(n.outbound(0, &mut udp(HOST2, 2, REMOTE, 2, b"x"), 0, false), Err(Drop::TableFull));
     n.remove_host(HOST);
     assert_eq!(n.stats().sessions, 1);
-    n.outbound(0, &mut udp(HOST2, 2, REMOTE, 2, b"x"), 0).unwrap();
+    n.outbound(0, &mut udp(HOST2, 2, REMOTE, 2, b"x"), 0, false).unwrap();
 }
 
 /// Split an IPv4 packet into fragments with `chunk` bytes of payload each.
@@ -437,9 +437,9 @@ fn fragments_follow_the_first() {
     assert_eq!(frags.len(), 3);
     // a later fragment before the first: no session yet
     let mut early = frags[1].clone();
-    assert_eq!(n.outbound(0, &mut early, 0), Err(Drop::NoSession));
+    assert_eq!(n.outbound(0, &mut early, 0, false), Err(Drop::NoSession));
     for f in frags.iter_mut() {
-        assert_eq!(n.outbound(0, f, 0), Ok(PUB));
+        assert_eq!(n.outbound(0, f, 0, false), Ok(PUB));
         assert_eq!(checksum(&f[..20]), 0);
         assert_eq!(get32(f, 12), PUB);
     }
@@ -450,7 +450,7 @@ fn fragments_follow_the_first() {
     let reply = udp(REMOTE, 5000, PUB, ext, &[9u8; 2000]);
     let mut frags = fragment(&reply, 1480);
     for f in frags.iter_mut() {
-        assert_eq!(n.inbound(1, f), Inbound::Forward { to: HOST, tag: 0 });
+        assert_eq!(n.inbound(1, f, false), Inbound::Forward { to: HOST, tag: 0 });
     }
     let whole = reassemble(&frags);
     assert_valid(&whole);
@@ -462,19 +462,19 @@ fn static_nat_both_ways() {
     // srcnat HOST -> PUB, dstnat PUB -> HOST
     for mut p in [tcp(HOST, 1111, REMOTE, 80, SYN, &[], b"hi"), udp(HOST, 2222, REMOTE, 53, b"q"), echo(HOST, REMOTE, 8, 7)] {
         let before = p[20..24].to_vec();
-        assert_eq!(rewrite(&mut p, true, PUB), Some(HOST));
+        assert_eq!(rewrite(&mut p, true, PUB, false), Some(HOST));
         assert_valid(&p);
         assert_eq!(get32(&p, 12), PUB);
         assert_eq!(p[20..24], before[..], "ports untouched");
     }
     let mut back = tcp(REMOTE, 80, PUB, 1111, SYN | ACK, &[], b"");
-    assert_eq!(rewrite(&mut back, false, HOST), Some(PUB));
+    assert_eq!(rewrite(&mut back, false, HOST, false), Some(PUB));
     assert_valid(&back);
     assert_eq!(dst_of(&back), (HOST, 1111));
     // UDP without a checksum stays without
     let mut u = udp(HOST, 1, REMOTE, 2, b"x");
     set16(&mut u, 26, 0);
-    rewrite(&mut u, true, PUB);
+    rewrite(&mut u, true, PUB, false);
     assert_eq!(get16(&u, 26), 0);
 }
 
@@ -483,18 +483,18 @@ fn static_nat_icmp_errors_and_fragments() {
     // a router answers a packet we srcnat'ed: dstnat takes it back, the quoted
     // packet's source too
     let mut out = udp(HOST, 1111, REMOTE, 53, &[0u8; 100]);
-    rewrite(&mut out, true, PUB);
+    rewrite(&mut out, true, PUB, false);
     let mut err = icmp_error(ROUTER, &out, 3, 4, 1280).unwrap();
-    rewrite(&mut err, false, HOST);
+    rewrite(&mut err, false, HOST, false);
     assert_valid(&err);
     let inner = &err[28..];
     assert_eq!(checksum(&inner[..20]), 0, "inner header checksum");
     assert_eq!(get32(inner, 12), HOST, "quoted source back to the host");
     // the host answers a dstnat'ed packet with an error: srcnat fixes the quote
     let mut inb = udp(REMOTE, 53, PUB, 1111, &[0u8; 100]);
-    rewrite(&mut inb, false, HOST);
+    rewrite(&mut inb, false, HOST, false);
     let mut err = icmp_error(HOST, &inb, 3, 3, 0).unwrap();
-    rewrite(&mut err, true, PUB);
+    rewrite(&mut err, true, PUB, false);
     assert_valid(&err);
     assert_eq!((get32(&err, 12), get32(&err[28..], 16)), (PUB, PUB));
     let q = &err[28..];
@@ -503,11 +503,11 @@ fn static_nat_icmp_errors_and_fragments() {
     let whole = udp(HOST, 9, REMOTE, 9, &[7u8; 3000]);
     let mut frags = fragment(&whole, 1400);
     for f in &mut frags {
-        rewrite(f, true, PUB);
+        rewrite(f, true, PUB, false);
         assert_eq!(checksum(&f[..20]), 0);
     }
     assert_valid(&reassemble(&frags));
-    assert_eq!(rewrite(&mut [0u8; 10], true, PUB), None);
+    assert_eq!(rewrite(&mut [0u8; 10], true, PUB, false), None);
 }
 
 const WAN2: Ip = ip(203, 0, 113, 240);
@@ -523,20 +523,20 @@ fn static_srcnat_tracks_replies() {
     let mut s = StaticNat::new(7);
     s.set_rules(vec![(HOST, PUB)], vec![]);
     let mut out = tcp(HOST, 1111, REMOTE, 80, SYN, &[], b"");
-    assert!(s.process(0, &mut out, &no_local));
+    assert!(s.process(0, &mut out, &no_local, false));
     assert_valid(&out);
     assert_eq!(src_of(&out), (PUB, 1111), "port kept");
     // the reply finds its way back without a dstnat rule
     let mut back = tcp(REMOTE, 80, PUB, 1111, SYN | ACK, &[], b"");
-    assert!(s.process(1, &mut back, &no_local));
+    assert!(s.process(1, &mut back, &no_local, false));
     assert_valid(&back);
     assert_eq!(dst_of(&back), (HOST, 1111));
     // others to the public address are not let in
     let mut stranger = tcp(REMOTE2, 80, PUB, 1111, SYN, &[], b"");
-    assert!(!s.process(1, &mut stranger, &no_local));
+    assert!(!s.process(1, &mut stranger, &no_local, false));
     // the host talking to us keeps its address
     let mut mine = udp(HOST, 5, PUB2, 53, b"q");
-    assert!(!s.process(1, &mut mine, &|a| a == PUB2));
+    assert!(!s.process(1, &mut mine, &|a| a == PUB2, false));
     // idle connections go
     s.expire(TCP_IDLE + 10, 1000);
     assert_eq!(s.stats.conns, 0);
@@ -549,41 +549,41 @@ fn static_dstnat_from_several_wans() {
     s.set_rules(vec![(HOST, PUB)], vec![(PUB, HOST), (WAN2, HOST)]);
     for (public, sport) in [(PUB, 4000), (WAN2, 5000)] {
         let mut syn = tcp(REMOTE, sport, public, 443, SYN, &[], b"");
-        assert!(s.process(0, &mut syn, &no_local));
+        assert!(s.process(0, &mut syn, &no_local, false));
         assert_valid(&syn);
         assert_eq!(dst_of(&syn), (HOST, 443));
         // the answer leaves from the address the connection came in on
         let mut ack = tcp(HOST, 443, REMOTE, sport, SYN | ACK, &[], b"");
-        assert!(s.process(1, &mut ack, &no_local));
+        assert!(s.process(1, &mut ack, &no_local, false));
         assert_valid(&ack);
         assert_eq!(src_of(&ack), (public, 443), "answered from {public:x}");
         // an ICMP error the host sends about it too
         let mut err = icmp_error(HOST, &syn, 3, 3, 0).unwrap();
-        assert!(s.process(1, &mut err, &no_local));
+        assert!(s.process(1, &mut err, &no_local, false));
         assert_valid(&err);
         assert_eq!((get32(&err, 12), get32(&err[28..], 16)), (public, public));
     }
     // a ping to the second WAN address is answered from it
     let mut ping = echo(REMOTE, WAN2, 8, 9);
-    assert!(s.process(2, &mut ping, &no_local));
+    assert!(s.process(2, &mut ping, &no_local, false));
     let mut pong = echo(HOST, REMOTE, 0, 9);
-    assert!(s.process(2, &mut pong, &no_local));
+    assert!(s.process(2, &mut pong, &no_local, false));
     assert_valid(&pong);
     assert_eq!(get32(&pong, 12), WAN2);
     // the host's own new connections use its srcnat address
     let mut new = udp(HOST, 7777, REMOTE, 53, b"q");
-    assert!(s.process(3, &mut new, &no_local));
+    assert!(s.process(3, &mut new, &no_local, false));
     assert_eq!(src_of(&new), (PUB, 7777));
     // an ICMP error from a router about it reaches the host
     let mut err = icmp_error(ROUTER, &new, 3, 4, 1280).unwrap();
-    assert!(s.process(4, &mut err, &no_local));
+    assert!(s.process(4, &mut err, &no_local, false));
     assert_valid(&err);
     assert_eq!((get32(&err, 16), get32(&err[28..], 12)), (HOST, HOST));
     // fragments follow their first
     let whole = udp(REMOTE, 9, WAN2, 9, &[1u8; 3000]);
     let mut frags = fragment(&whole, 1400);
     for f in &mut frags {
-        assert!(s.process(5, f, &no_local));
+        assert!(s.process(5, f, &no_local, false));
         assert_eq!(get32(f, 16), HOST);
     }
     assert_valid(&reassemble(&frags));
@@ -591,7 +591,65 @@ fn static_dstnat_from_several_wans() {
     s.set_rules(vec![], vec![(PUB, HOST)]);
     assert_eq!(s.stats.conns, 0);
     let mut late = tcp(HOST, 443, REMOTE, 5000, ACK, &[], b"");
-    assert!(!s.process(6, &mut late, &no_local));
+    assert!(!s.process(6, &mut late, &no_local, false));
+}
+
+/// The packet with its TCP/UDP checksum made partial, as with offloads: the
+/// pseudo-header sum only, not complemented.
+fn make_partial(p: &mut [u8]) {
+    let h = parse(p).unwrap();
+    let at = h.ihl + csum_at(h.proto).0;
+    let mut b = Vec::new();
+    b.extend_from_slice(&h.src.to_be_bytes());
+    b.extend_from_slice(&h.dst.to_be_bytes());
+    b.extend_from_slice(&[0, h.proto]);
+    b.extend_from_slice(&((h.total - h.ihl) as u16).to_be_bytes());
+    set16(p, at, !checksum(&b));
+}
+
+/// What the host does with a partial checksum: sum the L4 bytes onto it.
+fn complete(p: &mut [u8]) {
+    let h = parse(p).unwrap();
+    let at = h.ihl + csum_at(h.proto).0;
+    let c = checksum(&p[h.ihl..h.total]);
+    set16(p, at, c);
+}
+
+#[test]
+fn partial_checksums_through_nat() {
+    let mut n = nat();
+    // out: address and port change, MSS clamped on the SYN
+    let mut cfg = Config::default();
+    cfg.mss = Some(1300);
+    let mut m = Nat::new(cfg, 3);
+    m.set_default_egress(PUB);
+    let mut syn = tcp(HOST, 1111, REMOTE, 443, SYN, &[2, 4, 0x05, 0xb4], b"");
+    make_partial(&mut syn);
+    m.outbound(0, &mut syn, 1, true).unwrap();
+    complete(&mut syn);
+    assert_valid(&syn);
+    let mut out = tcp(HOST, 2222, REMOTE, 80, SYN, &[], &[5u8; 3000]);
+    make_partial(&mut out);
+    n.outbound(0, &mut out, 1, true).unwrap();
+    let ext = src_of(&out);
+    complete(&mut out);
+    assert_valid(&out);
+    // and back
+    let mut back = tcp(REMOTE, 80, ext.0, ext.1, SYN | ACK, &[], &[6u8; 3000]);
+    make_partial(&mut back);
+    assert!(matches!(n.inbound(1, &mut back, true), Inbound::Forward { .. }));
+    complete(&mut back);
+    assert_valid(&back);
+    assert_eq!(dst_of(&back), (HOST, 2222));
+    // static NAT too
+    let mut s = StaticNat::new(9);
+    s.set_rules(vec![(HOST, PUB)], vec![]);
+    let mut u = udp(HOST, 53, REMOTE, 53, &[1u8; 2000]);
+    make_partial(&mut u);
+    assert!(s.process(0, &mut u, &no_local, true));
+    complete(&mut u);
+    assert_valid(&u);
+    assert_eq!(get32(&u, 12), PUB);
 }
 
 #[test]
@@ -617,8 +675,8 @@ fn garbage_does_not_panic() {
             p[i] = rnd() as u8;
         }
         p.truncate((rnd() % (p.len() as u64 + 1)) as usize);
-        let _ = n.outbound(k as u64, &mut p.clone(), 0);
-        let _ = n.inbound(k as u64, &mut p);
+        let _ = n.outbound(k as u64, &mut p.clone(), 0, false);
+        let _ = n.inbound(k as u64, &mut p, false);
     }
 }
 
@@ -636,13 +694,13 @@ fn throughput() {
         }
     }
     for p in pkts.iter_mut() {
-        n.outbound(0, &mut p.clone(), 0).unwrap();
+        n.outbound(0, &mut p.clone(), 0, false).unwrap();
     }
     let replies: Vec<Vec<u8>> = pkts
         .iter()
         .map(|p| {
             let mut o = p.clone();
-            n.outbound(0, &mut o, 0).unwrap();
+            n.outbound(0, &mut o, 0, false).unwrap();
             let (e, ep) = src_of(&o);
             udp(get32(p, 16), 443, e, ep, &[0u8; 32])
         })
@@ -654,10 +712,10 @@ fn throughput() {
         for (p, q) in pkts.iter().zip(&replies) {
             let b = &mut buf[..p.len()];
             b.copy_from_slice(p);
-            n.outbound(r, b, 0).unwrap();
+            n.outbound(r, b, 0, false).unwrap();
             let b = &mut buf[..q.len()];
             b.copy_from_slice(q);
-            assert!(matches!(n.inbound(r, b), Inbound::Forward { .. }));
+            assert!(matches!(n.inbound(r, b, false), Inbound::Forward { .. }));
         }
     }
     let total = rounds as f64 * pkts.len() as f64 * 2.0;

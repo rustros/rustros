@@ -62,7 +62,7 @@ fn rates() {
 fn shapes_to_the_rate() {
     let mut s = Shaper::new(100_000_000, 0, 64 << 20);
     for i in 0..20_000 {
-        s.enqueue(0, pkt(1000 + (i % 7) as u16, 1500, 0, 17), 1);
+        s.enqueue(0, pkt(1000 + (i % 7) as u16, 1500, 0, 17), rustros_api::Offload::default(), 1);
     }
     let mut out = Vec::new();
     let mut bytes = 0u64;
@@ -81,10 +81,10 @@ fn shapes_to_the_rate() {
 fn flows_share_fairly() {
     let mut s = Shaper::new(10_000_000, 0, 64 << 20);
     for _ in 0..200 {
-        s.enqueue(0, pkt(1, 1500, 0, 6), 1); // a bulk flow
+        s.enqueue(0, pkt(1, 1500, 0, 6), rustros_api::Offload::default(), 1); // a bulk flow
     }
     for _ in 0..20 {
-        s.enqueue(0, pkt(2, 1500, 0, 6), 1); // a second one
+        s.enqueue(0, pkt(2, 1500, 0, 6), rustros_api::Offload::default(), 1); // a second one
     }
     let out = run(&mut s, 0, 40 * MS); // ~33 packets at 10 Mbit
     let second = out.iter().filter(|p| p.data[ETH + 21] == 2).count();
@@ -95,11 +95,11 @@ fn flows_share_fairly() {
 fn new_flow_goes_first() {
     let mut s = Shaper::new(10_000_000, 0, 64 << 20);
     for _ in 0..100 {
-        s.enqueue(0, pkt(1, 1500, 0, 6), 1);
+        s.enqueue(0, pkt(1, 1500, 0, 6), rustros_api::Offload::default(), 1);
     }
     run(&mut s, 0, 10 * MS);
     // a small packet of a new flow (DNS, a keystroke) jumps the bulk queue
-    s.enqueue(10 * MS, pkt(53, 80, 0, 17), 1);
+    s.enqueue(10 * MS, pkt(53, 80, 0, 17), rustros_api::Offload::default(), 1);
     let out = run(&mut s, 10 * MS, 14 * MS);
     assert!(out.iter().take(2).any(|p| p.data[ETH + 21] == 53), "sparse flow waited");
 }
@@ -114,10 +114,10 @@ fn a_flood_does_not_delay_others() {
     let mut t = 0;
     while t < 2000 * MS {
         if t % (6 * MS / 10) == 0 {
-            s.enqueue(t, pkt(1, 1500, 0, 6), 1); // 20 Mbit offered
+            s.enqueue(t, pkt(1, 1500, 0, 6), rustros_api::Offload::default(), 1); // 20 Mbit offered
         }
         if t % (10 * MS) == 0 {
-            s.enqueue(t, pkt(7, 120, 0, 17), 1);
+            s.enqueue(t, pkt(7, 120, 0, 17), rustros_api::Offload::default(), 1);
         }
         s.release(t, &mut out);
         for p in out.drain(..) {
@@ -140,7 +140,7 @@ fn ecn_marks_instead_of_dropping() {
     let mut t = 0;
     while t < 2000 * MS {
         if t % (6 * MS / 10) == 0 {
-            s.enqueue(t, pkt(1, 1500, 2, 6), 1); // ECT(0)
+            s.enqueue(t, pkt(1, 1500, 2, 6), rustros_api::Offload::default(), 1); // ECT(0)
         }
         s.release(t, &mut out);
         for p in out.drain(..) {
@@ -159,9 +159,9 @@ fn ecn_marks_instead_of_dropping() {
 fn limit_drops_from_the_fattest() {
     let mut s = Shaper::new(10_000_000, 0, 100_000);
     for _ in 0..200 {
-        s.enqueue(0, pkt(1, 1500, 0, 6), 1);
+        s.enqueue(0, pkt(1, 1500, 0, 6), rustros_api::Offload::default(), 1);
     }
-    s.enqueue(0, pkt(2, 1500, 0, 6), 1);
+    s.enqueue(0, pkt(2, 1500, 0, 6), rustros_api::Offload::default(), 1);
     assert!(s.backlog() <= 100_000);
     assert!(s.stats.overflow_drops > 100);
     let out = run(&mut s, 0, 10 * MS);

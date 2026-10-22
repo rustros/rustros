@@ -10,6 +10,7 @@ pub mod dns;
 pub mod lineedit;
 pub mod logcmd;
 pub mod netcmd;
+pub mod offload;
 pub mod secret;
 pub mod sha256;
 pub mod wire;

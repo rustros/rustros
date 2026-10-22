@@ -26,7 +26,10 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Frame, Module, Packet, SocketAddr, Sys, UdpSocket, Verdict, say};
+use rustros_api::{Caps, Frame, Module, Offload, Packet, SocketAddr, Sys, UdpSocket, Verdict, say};
+
+/// Place on the packet path (with the other translators).
+const ORDER: i32 = 0;
 use rustros_util::wire::{Ip, IpFmt, checksum, parse_ip};
 use l2tp_core::{Account, Config, DATA_HEADER, Data, Event, Server, data_header};
 use nat_core::{Inbound, Nat, icmp_error};
@@ -275,7 +278,7 @@ impl L2tpModule {
             f.verdict = Verdict::Drop;
             return;
         };
-        match nat.outbound(now, f.data_mut(), 0) {
+        match nat.outbound(now, f.data_mut(), 0, false) {
             // out of the egress address's own WAN
             Ok(egress) => {
                 if let Some(r) = pk.route_from(egress, dst) {
@@ -345,6 +348,7 @@ impl L2tpModule {
                     }
                     f.pull_front(inner);
                     f.set_len(len);
+                    f.offload = Offload::default(); // that was the tunnel's (outer) packet
                     self.from_client(pk, now, f, client);
                 }
             }
@@ -352,7 +356,12 @@ impl L2tpModule {
         }
         // a reply for a client?
         let Some(nat) = self.nat.as_mut() else { return };
-        match nat.inbound(now, &mut f.data_mut()[ETH..]) {
+        // a big segment or a partial checksum cannot go into the tunnel:
+        // plain packets first (they come back here)
+        if !f.offload.is_none() && nat.owns_inbound(now, &f.data()[ETH..]) && !pk.resolve(f, ORDER - 1) {
+            return;
+        }
+        match nat.inbound(now, &mut f.data_mut()[ETH..], false) {
             Inbound::NotOurs => {}
             Inbound::Forward { to, .. } => {
                 f.pull_front(ETH);
@@ -369,6 +378,15 @@ impl L2tpModule {
 impl Module for L2tpModule {
     fn name(&self) -> &'static str {
         "l2tp"
+    }
+
+    fn order(&self) -> i32 {
+        ORDER
+    }
+
+    /// Big segments pass by; those for the tunnel are made plain first.
+    fn offloads(&self) -> bool {
+        true
     }
 
     fn caps(&self) -> Caps {

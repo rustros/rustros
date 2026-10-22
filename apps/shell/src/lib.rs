@@ -516,6 +516,11 @@ impl Module for Shell {
         Caps::NET | Caps::KV | Caps::ADMIN | Caps::CONSOLE | Caps::PACKET
     }
 
+    /// It only sends packets (ping -I) and never looks at the ones passing.
+    fn offloads(&self) -> bool {
+        true
+    }
+
     fn start(&mut self, sys: &mut dyn Sys) {
         self.icmp = net(sys).raw_open(PROTO_ICMP).ok();
     }

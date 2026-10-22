@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 
-use crate::frame::Frame;
+use crate::frame::{Frame, Offload};
 
 /// IPv4 address in host byte order.
 pub type Ip = u32;
@@ -319,7 +319,9 @@ pub trait Net: Base {
     /// connection shows up as `Err(Closed)` on later calls.
     fn tcp_connect(&mut self, to: SocketAddr) -> Result<TcpStream, NetError>;
     /// Connect from our address `src` (an interface's or an extra one), routed by it.
-    fn tcp_connect_from(&mut self, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError>;
+    fn tcp_connect_from(&mut self, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError> {
+        if src == 0 { self.tcp_connect(to) } else { Err(NetError::NoRoute) }
+    }
     /// `Ok(false)` while the handshake is still in progress.
     fn tcp_is_connected(&self, s: TcpStream) -> Result<bool, NetError>;
     /// `Ok(0)` means the peer has closed its side and all data was read.
@@ -383,6 +385,10 @@ pub trait Packet: Base {
     fn send_frame_on(&mut self, nic: usize, frame: &[u8]) -> bool {
         nic == 0 && self.send_frame(frame)
     }
+    /// `send_frame_on` for a frame with offloads pending (`Frame::offload`).
+    fn send_frame_offload(&mut self, nic: usize, frame: &[u8], offload: Offload) -> bool {
+        offload.is_none() && self.send_frame_on(nic, frame)
+    }
     /// (NIC, next hop) towards `dst` by the system's routes.
     fn route(&self, _dst: Ip) -> Option<(usize, Ip)> {
         None
@@ -405,7 +411,14 @@ pub trait Packet: Base {
     /// Put a frame back on the packet path as if it had just arrived on
     /// `nic`; only the modules after `after_order` see it (a shaper
     /// releasing what it held). False if the queue for that is full.
-    fn inject(&mut self, _nic: usize, _frame: &[u8], _after_order: i32) -> bool {
+    fn inject(&mut self, _nic: usize, _frame: &[u8], _offload: Offload, _after_order: i32) -> bool {
+        false
+    }
+    /// Settle a frame's offloads for an app that must see plain packets
+    /// (a tunnel): a partial checksum is completed in place (true: carry on
+    /// with it); a big segment is cut into packets that come back on the
+    /// packet path after `after_order`, and the frame is consumed (false).
+    fn resolve(&mut self, _frame: &mut Frame, _after_order: i32) -> bool {
         false
     }
 }
@@ -518,6 +531,12 @@ pub trait Module {
     /// (NAT, tunnels) stay at 0; a plain router goes last.
     fn order(&self) -> i32 {
         0
+    }
+    /// Whether `on_frames` / `on_egress` take frames with offloads pending
+    /// (`Frame::offload`): big TCP segments and partial checksums. Apps that
+    /// do not get plain packets.
+    fn offloads(&self) -> bool {
+        false
     }
     fn start(&mut self, _sys: &mut dyn Sys) {}
     /// Called on every main-loop iteration (at least every millisecond).

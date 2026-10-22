@@ -209,14 +209,15 @@ impl StaticNat {
     /// Translate an IPv4 packet if a connection or rule names it. `local`
     /// tells our own addresses: a host's traffic with us keeps its address.
     /// True if the packet was rewritten.
-    pub fn process(&mut self, now: u64, p: &mut [u8], local: &dyn Fn(Ip) -> bool) -> bool {
+    /// `partial`: the TCP/UDP checksum is partial (offloads).
+    pub fn process(&mut self, now: u64, p: &mut [u8], local: &dyn Fn(Ip) -> bool, partial: bool) -> bool {
         let Some(h) = parse(p) else { return false };
         let done = if h.offset != 0 {
             self.later_fragment(now, p, &h)
         } else if h.proto == ICMP && h.total >= h.ihl + 8 && matches!(p[h.ihl], 3 | 11 | 12) {
             self.icmp_error(now, p, &h)
         } else {
-            self.packet(now, p, &h, local)
+            self.packet(now, p, &h, local, partial)
         };
         if done {
             self.stats.packets += 1;
@@ -224,7 +225,7 @@ impl StaticNat {
         done
     }
 
-    fn packet(&mut self, now: u64, p: &mut [u8], h: &V4, local: &dyn Fn(Ip) -> bool) -> bool {
+    fn packet(&mut self, now: u64, p: &mut [u8], h: &V4, local: &dyn Fn(Ip) -> bool, partial: bool) -> bool {
         let Some((sp, dp)) = ports(p, h) else { return false };
         let (src, dst) = (h.src, h.dst);
         // towards a public address: a dstnat rule, or a reply to a srcnat connection
@@ -248,7 +249,7 @@ impl StaticNat {
             }),
         };
         if let Some(host) = to {
-            rewrite(p, false, host);
+            rewrite(p, false, host, partial);
             self.remember_fragment(now, h, host, false);
             return true;
         }
@@ -266,7 +267,7 @@ impl StaticNat {
             }),
         };
         if let Some(public) = from {
-            rewrite(p, true, public);
+            rewrite(p, true, public, partial);
             self.remember_fragment(now, h, public, true);
             return true;
         }
@@ -280,21 +281,21 @@ impl StaticNat {
         if let Some((qh, (qsp, qdp))) = quoted {
             // about a packet that left from a public address: back to its host
             if let Some(i) = self.lookup(true, key(qh.proto, qh.src, qsp, qh.dst, qdp), now).filter(|_| h.dst == qh.src) {
-                rewrite(p, false, self.conns[i as usize].host);
+                rewrite(p, false, self.conns[i as usize].host, false);
                 return true;
             }
             // a host's error about a packet it got: from the public address
             if let Some(i) = self.lookup(false, key(qh.proto, qh.dst, qdp, qh.src, qsp), now).filter(|_| h.src == qh.dst) {
-                rewrite(p, true, self.conns[i as usize].public);
+                rewrite(p, true, self.conns[i as usize].public, false);
                 return true;
             }
         }
         if let Some(host) = find(&self.dnat, h.dst) {
-            rewrite(p, false, host);
+            rewrite(p, false, host, false);
             return true;
         }
         if let Some(public) = find(&self.snat, h.src) {
-            rewrite(p, true, public);
+            rewrite(p, true, public, false);
             return true;
         }
         false
@@ -315,7 +316,7 @@ impl StaticNat {
         if until <= now {
             return false;
         }
-        rewrite(p, src_side, new);
+        rewrite(p, src_side, new, false);
         true
     }
 }

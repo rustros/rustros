@@ -280,8 +280,10 @@ fn csum_at(proto: u8) -> (usize, bool) {
 /// Port (or ICMP identifier) change in the L4 header at `l4`, plus an
 /// address change the pseudo header sees (not for ICMP). `port_at` is the
 /// offset of the port in the L4 header. The checksum is only touched if it
-/// is inside `p` (ICMP errors quote just 8 bytes).
-fn set_port(p: &mut [u8], l4: usize, proto: u8, port_at: usize, new_port: u16, addr: Option<(Ip, Ip)>) {
+/// is inside `p` (ICMP errors quote just 8 bytes). `partial`: the checksum
+/// holds only the pseudo-header sum (offloads): ports are not in it, an
+/// address change adjusts it as a sum.
+fn set_port(p: &mut [u8], l4: usize, proto: u8, port_at: usize, new_port: u16, addr: Option<(Ip, Ip)>, partial: bool) {
     let old_port = get16(p, l4 + port_at);
     set16(p, l4 + port_at, new_port);
     let (c_at, optional) = csum_at(proto);
@@ -289,6 +291,12 @@ fn set_port(p: &mut [u8], l4: usize, proto: u8, port_at: usize, new_port: u16, a
         return;
     }
     let mut c = get16(p, l4 + c_at);
+    if partial && proto != ICMP {
+        if let Some((old, new)) = addr {
+            set16(p, l4 + c_at, !adj32(!c, old, new));
+        }
+        return;
+    }
     if optional && c == 0 {
         return;
     }
@@ -307,7 +315,7 @@ fn set_port(p: &mut [u8], l4: usize, proto: u8, port_at: usize, new_port: u16, a
 /// and UDP checksums follow the pseudo header; an ICMP error has the address
 /// in its quoted packet (which went the other way) rewritten back to match.
 /// Returns the old address, or None if `p` is not an IPv4 packet.
-pub fn rewrite(p: &mut [u8], src: bool, new: Ip) -> Option<Ip> {
+pub fn rewrite(p: &mut [u8], src: bool, new: Ip, partial: bool) -> Option<Ip> {
     let h = parse(p)?;
     let o = if src { 12 } else { 16 };
     let old = get32(p, o);
@@ -317,7 +325,7 @@ pub fn rewrite(p: &mut [u8], src: bool, new: Ip) -> Option<Ip> {
     }
     let (l4, end) = (h.ihl, h.total);
     match h.proto {
-        TCP | UDP => fix_l4(p, l4, end, h.proto, old, new),
+        TCP | UDP => fix_l4(p, l4, end, h.proto, old, new, partial),
         ICMP if end >= l4 + 8 && matches!(p[l4], 3 | 11 | 12) => {
             let q = l4 + 8;
             if let Some(qh) = parse_quoted(&p[q..end]) {
@@ -325,7 +333,7 @@ pub fn rewrite(p: &mut [u8], src: bool, new: Ip) -> Option<Ip> {
                 if get32(p, q + qo) == old {
                     set_addr(&mut p[q..end], qo, new);
                     if matches!(qh.proto, TCP | UDP) {
-                        fix_l4(p, q + qh.ihl, end, qh.proto, old, new);
+                        fix_l4(p, q + qh.ihl, end, qh.proto, old, new, false);
                     }
                     fix_icmp(p, l4, end);
                 }
@@ -338,12 +346,16 @@ pub fn rewrite(p: &mut [u8], src: bool, new: Ip) -> Option<Ip> {
 
 /// The TCP/UDP checksum at `l4` after a pseudo-header address change, if it
 /// is within `end` (a quoted packet may be cut short).
-fn fix_l4(p: &mut [u8], l4: usize, end: usize, proto: u8, old: Ip, new: Ip) {
+fn fix_l4(p: &mut [u8], l4: usize, end: usize, proto: u8, old: Ip, new: Ip, partial: bool) {
     let (c_at, optional) = csum_at(proto);
     if l4 + c_at + 2 > end {
         return;
     }
     let c = get16(p, l4 + c_at);
+    if partial {
+        set16(p, l4 + c_at, !adj32(!c, old, new));
+        return;
+    }
     if optional && c == 0 {
         return;
     }
@@ -355,7 +367,7 @@ fn fix_l4(p: &mut [u8], l4: usize, end: usize, proto: u8, old: Ip, new: Ip) {
 }
 
 /// Lower the MSS option of a SYN to `mss`.
-fn clamp_mss(p: &mut [u8], l4: usize, mss: u16) {
+fn clamp_mss(p: &mut [u8], l4: usize, mss: u16, partial: bool) {
     let doff = (p[l4 + 12] >> 4) as usize * 4;
     if doff < 20 || l4 + doff > p.len() {
         return;
@@ -374,8 +386,10 @@ fn clamp_mss(p: &mut [u8], l4: usize, mss: u16) {
                     let old = get16(p, o + 2);
                     if old > mss {
                         set16(p, o + 2, mss);
-                        let c = adj16(get16(p, l4 + 16), old, mss);
-                        set16(p, l4 + 16, c);
+                        if !partial {
+                            let c = adj16(get16(p, l4 + 16), old, mss);
+                            set16(p, l4 + 16, c);
+                        }
                     }
                     return;
                 }
@@ -711,8 +725,9 @@ impl Nat {
 
     /// Translate a packet from inside host (its source address) for `tag`.
     /// Returns the egress address it now carries.
-    pub fn outbound(&mut self, now: u64, p: &mut [u8], tag: u32) -> Result<Ip, Drop> {
-        let r = self.outbound_inner(now, p, tag);
+    /// `partial`: the packet's TCP/UDP checksum is partial (offloads).
+    pub fn outbound(&mut self, now: u64, p: &mut [u8], tag: u32, partial: bool) -> Result<Ip, Drop> {
+        let r = self.outbound_inner(now, p, tag, partial);
         match r {
             Ok(_) => self.stats.out_packets += 1,
             Err(_) => self.stats.dropped += 1,
@@ -720,7 +735,7 @@ impl Nat {
         r
     }
 
-    fn outbound_inner(&mut self, now: u64, p: &mut [u8], tag: u32) -> Result<Ip, Drop> {
+    fn outbound_inner(&mut self, now: u64, p: &mut [u8], tag: u32, partial: bool) -> Result<Ip, Drop> {
         let h = parse(p).ok_or(Drop::Malformed)?;
         if p[8] <= 1 {
             return Err(Drop::TtlExceeded);
@@ -771,10 +786,10 @@ impl Nat {
         let end = h.total;
         dec_ttl(p);
         set_addr(p, 12, ext_ip);
-        set_port(&mut p[..end], l4, h.proto, port_at, ext_port, Some((h.src, ext_ip)));
+        set_port(&mut p[..end], l4, h.proto, port_at, ext_port, Some((h.src, ext_ip)), partial);
         if let (TCP, Some(mss)) = (h.proto, self.cfg.mss) {
             if flags & SYN != 0 {
-                clamp_mss(&mut p[..end], l4, mss);
+                clamp_mss(&mut p[..end], l4, mss, partial);
             }
         }
         self.remember_frag(false, &h, i, now);
@@ -799,7 +814,7 @@ impl Nat {
         let end = h.total;
         // inner packet: destination becomes the external endpoint
         set_addr(&mut p[o..end], 16, s.ext_ip);
-        set_port(&mut p[o..end], inner.ihl, inner.proto, 2, s.ext_port, Some((inner.dst, s.ext_ip)));
+        set_port(&mut p[o..end], inner.ihl, inner.proto, 2, s.ext_port, Some((inner.dst, s.ext_ip)), false);
         dec_ttl(p);
         set_addr(p, 12, s.ext_ip);
         fix_icmp(p, h.ihl, end);
@@ -807,8 +822,8 @@ impl Nat {
     }
 
     /// Translate a packet from outside. `NotOurs` leaves it untouched.
-    pub fn inbound(&mut self, now: u64, p: &mut [u8]) -> Inbound {
-        let r = self.inbound_inner(now, p);
+    pub fn inbound(&mut self, now: u64, p: &mut [u8], partial: bool) -> Inbound {
+        let r = self.inbound_inner(now, p, partial);
         match r {
             Inbound::Forward { .. } => self.stats.in_packets += 1,
             Inbound::Drop(_) => self.stats.dropped += 1,
@@ -817,7 +832,18 @@ impl Nat {
         r
     }
 
-    fn inbound_inner(&mut self, now: u64, p: &mut [u8]) -> Inbound {
+/// Would `inbound` take this TCP/UDP packet (a session's reply)? Looks
+    /// without changing anything (to settle offloads first).
+    pub fn owns_inbound(&self, now: u64, p: &[u8]) -> bool {
+        let Some(h) = parse(p) else { return false };
+        if h.offset != 0 || !matches!(h.proto, TCP | UDP) {
+            return false;
+        }
+        let Some((ext_port, rem_port)) = l4_ports(p, &h, false) else { return false };
+        self.by_out.get(&key(h.proto, h.dst, ext_port, h.src, rem_port)).is_some_and(|&i| self.sessions[i as usize].expires > now)
+    }
+
+    fn inbound_inner(&mut self, now: u64, p: &mut [u8], partial: bool) -> Inbound {
         let Some(h) = parse(p) else { return Inbound::NotOurs };
         if h.offset != 0 {
             let Some(i) = self.frag_session(true, &h, now) else { return Inbound::NotOurs };
@@ -862,10 +888,10 @@ impl Nat {
         let end = h.total;
         dec_ttl(p);
         set_addr(p, 16, in_ip);
-        set_port(&mut p[..end], l4, h.proto, port_at, in_port, Some((h.dst, in_ip)));
+        set_port(&mut p[..end], l4, h.proto, port_at, in_port, Some((h.dst, in_ip)), partial);
         if let (TCP, Some(mss)) = (h.proto, self.cfg.mss) {
             if flags & SYN != 0 {
-                clamp_mss(&mut p[..end], l4, mss);
+                clamp_mss(&mut p[..end], l4, mss, partial);
             }
         }
         self.remember_frag(true, &h, i, now);
@@ -898,7 +924,7 @@ impl Nat {
         let s = self.sessions[i as usize];
         let end = h.total;
         set_addr(&mut p[o..end], 12, s.in_ip);
-        set_port(&mut p[o..end], inner.ihl, inner.proto, port_at, s.in_port, Some((inner.src, s.in_ip)));
+        set_port(&mut p[o..end], inner.ihl, inner.proto, port_at, s.in_port, Some((inner.src, s.in_ip)), false);
         dec_ttl(p);
         set_addr(p, 16, s.in_ip);
         fix_icmp(p, h.ihl, end);

@@ -6,6 +6,12 @@
 //! host spreads what comes in over the RX queues. With CTRL_RX the host
 //! drops unicast for other MACs itself (promiscuous mode off).
 //!
+//! Offloads (modern devices, if the host offers them and they are not turned
+//! off): with GUEST_TSO4 the host hands over big TCP segments (GRO; spread
+//! over several ring buffers with MRG_RXBUF and put back together here) and
+//! partial checksums; with HOST_TSO4 / CSUM big segments and partial
+//! checksums go out as they are and the host finishes them.
+//!
 //! Zero copy: every ring slot holds a packet buffer (`devices::Buf`). A
 //! received frame's buffer is swapped for a spare one from the kernel, and a
 //! forwarded frame's buffer goes onto the TX ring as it is, a spare one
@@ -14,12 +20,23 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use devices::{BUF_SIZE, Buf, HEADROOM, new_buf};
+use devices::{BUF_SIZE, Buf, HEADROOM, Offload, new_buf};
 
 use crate::pci::PciDev;
 use crate::virtio::{D_NEXT, D_WRITE, Queue, Virtio};
 
+const F_CSUM: u64 = 1 << 0;
+const F_GUEST_CSUM: u64 = 1 << 1;
+const F_GUEST_TSO4: u64 = 1 << 7;
+const F_GUEST_ECN: u64 = 1 << 9;
+const F_HOST_TSO4: u64 = 1 << 11;
+const F_HOST_ECN: u64 = 1 << 13;
+const F_MRG_RXBUF: u64 = 1 << 15;
 const F_MAC: u64 = 1 << 5;
+/// virtio_net_hdr
+const NEEDS_CSUM: u8 = 1;
+const GSO_TCPV4: u8 = 1;
+const GSO_ECN: u8 = 0x80;
 const F_CTRL_VQ: u64 = 1 << 17;
 const F_CTRL_RX: u64 = 1 << 18;
 const F_MQ: u64 = 1 << 22;
@@ -53,7 +70,8 @@ impl TxQ {
     fn reclaim(&mut self) {
         while let Some((id, _)) = self.q.pop() {
             if let Some(b) = self.inflight[id as usize].take() {
-                self.spare.push(b);
+                // a big segment's buffer is not kept around
+                self.spare.push(if b.len() > BUF_SIZE { new_buf() } else { b });
             }
             self.free.push(id);
         }
@@ -106,6 +124,11 @@ pub struct VirtioNet {
     /// RX queue to look at first (round robin)
     next_rx: usize,
     hdr: usize,
+    /// receive buffers come in several pieces (MRG_RXBUF)
+    mrg: bool,
+    /// the host completes checksums and cuts segments we send (CSUM, HOST_TSO4), with ECN
+    tx_offload: bool,
+    tx_ecn: bool,
     pub mac: [u8; 6],
     /// legacy interrupt routed (else the timer wakes us)
     pub irq: bool,
@@ -145,10 +168,22 @@ fn flow_hash(f: &[u8]) -> u32 {
 }
 
 impl VirtioNet {
-    pub fn new(pci: &PciDev) -> Option<VirtioNet> {
+    pub fn new(pci: &PciDev, offloads: bool) -> Option<VirtioNet> {
         let dev = Virtio::probe(pci)?;
         let modern = dev.is_modern();
-        let feat = dev.begin(F_MAC | if modern { F_CTRL_VQ | F_CTRL_RX | F_MQ } else { 0 })?;
+        let offered = dev.offered();
+        let mut want = F_MAC | if modern { F_CTRL_VQ | F_CTRL_RX | F_MQ } else { 0 };
+        if modern && offloads {
+            // big segments in only with buffers that chain (MRG_RXBUF)
+            if offered & F_MRG_RXBUF != 0 {
+                want |= F_MRG_RXBUF | F_GUEST_CSUM | F_GUEST_TSO4 | F_GUEST_ECN;
+            }
+            want |= F_CSUM | F_HOST_TSO4 | F_HOST_ECN;
+        }
+        let mut feat = dev.begin(want)?;
+        if feat & F_GUEST_TSO4 != 0 && feat & (F_MRG_RXBUF | F_GUEST_CSUM) != F_MRG_RXBUF | F_GUEST_CSUM {
+            feat = dev.begin(want & !(F_GUEST_TSO4 | F_GUEST_ECN))?; // not without them
+        }
         // virtio_net_hdr: 12 bytes with VERSION_1, 10 bytes for legacy
         let hdr = if modern { 12 } else { 10 };
         let max_pairs = if feat & F_MQ != 0 { dev.config16(8).max(1) } else { 1 };
@@ -187,7 +222,21 @@ impl VirtioNet {
         for r in &rx {
             r.q.notify();
         }
-        let mut n = VirtioNet { dev, rx, tx, ctrl, next_rx: 0, hdr, mac, irq: false, stats: devices::DevStats::default() };
+        let tx_offload = feat & (F_CSUM | F_HOST_TSO4) == F_CSUM | F_HOST_TSO4;
+        let mut n = VirtioNet {
+            dev,
+            rx,
+            tx,
+            ctrl,
+            next_rx: 0,
+            hdr,
+            mrg: feat & F_MRG_RXBUF != 0,
+            tx_offload,
+            tx_ecn: feat & F_HOST_ECN != 0,
+            mac,
+            irq: false,
+            stats: devices::DevStats::default(),
+        };
 
         // more queue pairs: the device uses only the first until told
         if pairs > 1 && !n.ctrl(4, 0, &pairs.to_le_bytes()) {
@@ -206,6 +255,14 @@ impl VirtioNet {
             if filtered { "on" } else { "off" }
         );
         n.describe_host();
+        if offloads && modern {
+            let on = |f: u64| feat & f == f;
+            crate::kprintln!(
+                "net: offloads: receive {}, send {}",
+                if on(F_GUEST_TSO4 | F_MRG_RXBUF) { "big segments + partial checksums" } else if on(F_GUEST_CSUM) { "partial checksums" } else { "none" },
+                if tx_offload { "big segments + partial checksums" } else { "none" }
+            );
+        }
         let line = pci.read8(0x3C);
         n.irq = n.dev.isr().is_some_and(|isr| crate::virtio::register_irq(line, isr));
         if n.irq {
@@ -298,14 +355,38 @@ impl devices::NetDevice for VirtioNet {
         true
     }
 
-    fn send_swap(&mut self, buf: &mut Buf, start: usize, len: usize) -> bool {
-        if start < self.hdr || start + len > BUF_SIZE {
-            return self.send(&buf[start..(start + len).min(BUF_SIZE)]); // no room for the header
+    fn send_swap(&mut self, buf: &mut Buf, start: usize, len: usize, off: Offload) -> bool {
+        let tcp_cwr = |f: &[u8]| {
+            let eth = if f.len() >= 18 && f[12..14] == [0x81, 0x00] { 18 } else { 14 };
+            rustros_util::offload::csum_layout(f, eth).is_some_and(|(l4, _, _)| f.get(l4 as usize + 13).is_some_and(|fl| fl & 0x80 != 0))
+        };
+        // what the host cannot finish: done here
+        if !off.is_none() && (!self.tx_offload || off.gso_size > 0 && !self.tx_ecn && tcp_cwr(&buf[start..start + len])) {
+            return crate::offload::send_plain(self, &mut buf[start..start + len], off);
+        }
+        if start < self.hdr || start + len > buf.len() {
+            return self.send(&buf[start..(start + len).min(buf.len())]); // no room for the header
         }
         let n = self.tx.len();
         let t = &mut self.tx[if n > 1 { flow_hash(&buf[start..start + len]) as usize % n } else { 0 }];
         let Some(id) = t.slot(&mut self.stats) else { return false };
         buf[start - self.hdr..start].fill(0);
+        if !off.is_none() {
+            let f = &buf[start..start + len];
+            let eth = if f.len() >= 18 && f[12..14] == [0x81, 0x00] { 18 } else { 14 };
+            if let Some((cstart, coff, hlen)) = rustros_util::offload::csum_layout(f, eth) {
+                let cwr = off.gso_size > 0 && f[cstart as usize + 13] & 0x80 != 0;
+                let h = &mut buf[start - self.hdr..start];
+                h[0] = NEEDS_CSUM;
+                if off.gso_size > 0 {
+                    h[1] = GSO_TCPV4 | if cwr { GSO_ECN } else { 0 };
+                    h[2..4].copy_from_slice(&hlen.to_le_bytes());
+                    h[4..6].copy_from_slice(&off.gso_size.to_le_bytes());
+                }
+                h[6..8].copy_from_slice(&cstart.to_le_bytes());
+                h[8..10].copy_from_slice(&coff.to_le_bytes());
+            }
+        }
         let frame = core::mem::replace(buf, t.spare.pop().expect("one spare per free slot"));
         t.post(id, frame, start - self.hdr, self.hdr + len);
         self.stats.tx_pkts += 1;
@@ -315,17 +396,26 @@ impl devices::NetDevice for VirtioNet {
 
     fn recv(&mut self, out: &mut [u8]) -> Option<usize> {
         let mut b = new_buf();
-        let n = self.recv_swap(&mut b)?.min(out.len());
+        let (n, off) = self.recv_swap(&mut b)?;
+        let n = n.min(out.len());
+        if off.csum_partial {
+            rustros_util::offload::complete_csum(&mut b[HEADROOM..HEADROOM + n]);
+        }
         out[..n].copy_from_slice(&b[HEADROOM..HEADROOM + n]);
         Some(n)
+    }
+
+    fn tx_offloads(&self) -> bool {
+        self.tx_offload
     }
 
     fn stats(&self) -> devices::DevStats {
         self.stats
     }
 
-    fn recv_swap(&mut self, buf: &mut Buf) -> Option<usize> {
+    fn recv_swap(&mut self, buf: &mut Buf) -> Option<(usize, Offload)> {
         let n = self.rx.len();
+        let hdr = self.hdr;
         for k in 0..n {
             let qi = (self.next_rx + k) % n;
             let r = &mut self.rx[qi];
@@ -333,26 +423,69 @@ impl devices::NetDevice for VirtioNet {
                 self.stats.rx_full += 1;
             }
             while let Some((id, len)) = r.q.pop() {
-                let len = (len as usize).saturating_sub(self.hdr).min(BUF_SIZE - HEADROOM);
-                let slot = &mut r.bufs[id as usize];
-                // unicast for another MAC (flooded to us): straight back to
-                // the ring
-                let d = &slot[HEADROOM..];
-                if len >= 6 && d[0] & 1 == 0 && d[..6] != self.mac {
-                    self.stats.rx_foreign += 1;
-                    post_rx(&mut r.q, id, slot, self.hdr);
+                let len = (len as usize).saturating_sub(hdr).min(BUF_SIZE - HEADROOM);
+                let h = &r.bufs[id as usize][HEADROOM - hdr..HEADROOM];
+                let pieces = if self.mrg { u16::from_le_bytes([h[10], h[11]]).max(1) } else { 1 };
+                let gso = match h[1] & !GSO_ECN {
+                    0 => Some(0),
+                    GSO_TCPV4 => Some(u16::from_le_bytes([h[4], h[5]])),
+                    _ => None, // not asked for
+                };
+                let off = Offload { csum_partial: h[0] & NEEDS_CSUM != 0, gso_size: gso.unwrap_or(0) };
+                // a big segment over several buffers: put it together in one
+                let big = if pieces > 1 {
+                    let mut v = alloc::vec::Vec::with_capacity(HEADROOM + pieces as usize * (BUF_SIZE - HEADROOM));
+                    v.resize(HEADROOM, 0);
+                    v.extend_from_slice(&r.bufs[id as usize][HEADROOM..HEADROOM + len]);
+                    post_rx(&mut r.q, id, &r.bufs[id as usize], hdr);
+                    for _ in 1..pieces {
+                        let Some((id2, len2)) = r.q.pop() else { break };
+                        let len2 = (len2 as usize).min(BUF_SIZE - HEADROOM + hdr);
+                        v.extend_from_slice(&r.bufs[id2 as usize][HEADROOM - hdr..HEADROOM - hdr + len2]);
+                        post_rx(&mut r.q, id2, &r.bufs[id2 as usize], hdr);
+                    }
                     r.kick = true;
+                    Some(v)
+                } else {
+                    None
+                };
+                let d: &[u8] = match &big {
+                    Some(v) => &v[HEADROOM..],
+                    None => &r.bufs[id as usize][HEADROOM..HEADROOM + len],
+                };
+                let flen = d.len();
+                // unicast for another MAC (flooded to us), or an offload we
+                // did not ask for: straight back to the ring
+                let foreign = flen >= 6 && d[0] & 1 == 0 && d[..6] != self.mac;
+                if foreign || gso.is_none() {
+                    if foreign {
+                        self.stats.rx_foreign += 1;
+                    }
+                    if big.is_none() {
+                        post_rx(&mut r.q, id, &r.bufs[id as usize], hdr);
+                        r.kick = true;
+                    }
                     continue;
                 }
-                // the frame's buffer for the kernel's spare one
-                core::mem::swap(slot, buf);
-                post_rx(&mut r.q, id, slot, self.hdr);
-                r.kick = true;
+                match big {
+                    Some(v) => *buf = v.into_boxed_slice(),
+                    None => {
+                        // the frame's buffer for the kernel's spare one (a
+                        // small one: big ones are not kept in rings)
+                        if buf.len() > BUF_SIZE {
+                            *buf = new_buf();
+                        }
+                        let slot = &mut r.bufs[id as usize];
+                        core::mem::swap(slot, buf);
+                        post_rx(&mut r.q, id, slot, hdr);
+                        r.kick = true;
+                    }
+                }
                 self.stats.rx_pkts += 1;
-                self.stats.rx_bytes += len as u64;
+                self.stats.rx_bytes += flen as u64;
                 // next time start at the next queue: fair to all of them
                 self.next_rx = (qi + 1) % n;
-                return Some(len);
+                return Some((flen, off));
             }
         }
         None

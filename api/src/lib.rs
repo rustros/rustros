@@ -12,7 +12,7 @@ pub mod frame;
 pub mod module;
 pub mod sys;
 
-pub use frame::{Frame, HEADROOM, Verdict};
+pub use frame::{Frame, HEADROOM, Offload, Verdict};
 
 // Native modules are only loaded by a kernel built from the same rustc and
 // the same rustros-api (see build.rs).

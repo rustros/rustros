@@ -12,6 +12,26 @@
 /// L2TP + PPP encapsulation).
 pub const HEADROOM: usize = 64;
 
+/// Checksum and segmentation offload state of a frame (virtio-net TSO /
+/// GRO): what the host left for later.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Offload {
+    /// The TCP/UDP checksum field holds only the pseudo-header sum (not
+    /// complemented); the sender completes it. Address rewrites adjust it
+    /// like a sum (`!adj(!c)`), port rewrites leave it alone.
+    pub csum_partial: bool,
+    /// A TCP segment bigger than the MTU (the IPv4 total length says how
+    /// big), cut into `gso_size`-byte segments on the way out; 0: an
+    /// ordinary packet.
+    pub gso_size: u16,
+}
+
+impl Offload {
+    pub fn is_none(&self) -> bool {
+        *self == Offload::default()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
     /// Not mine: continue to the next app, then the system stack.
@@ -35,13 +55,17 @@ pub struct Frame<'a> {
     /// The kernel's buffer number (leave it alone).
     #[doc(hidden)]
     pub slot: u8,
+    /// Offloads pending on this frame. Only apps that say so
+    /// (`Module::offloads`) see frames with any; for the rest the system
+    /// completes checksums and cuts segments first.
+    pub offload: Offload,
 }
 
 impl<'a> Frame<'a> {
     /// A frame of `len` bytes at `buf[start..]`.
     pub fn new(buf: &'a mut [u8], start: usize, len: usize) -> Frame<'a> {
         let end = (start + len).min(buf.len());
-        Frame { buf, start: start.min(end), end, verdict: Verdict::Pass, nic: 0, slot: 0 }
+        Frame { buf, start: start.min(end), end, verdict: Verdict::Pass, nic: 0, slot: 0, offload: Offload::default() }
     }
 
     pub fn data(&self) -> &[u8] {

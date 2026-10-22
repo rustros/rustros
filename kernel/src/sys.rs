@@ -11,7 +11,7 @@ use rustros_util::wire::{Ip, IpFmt};
 use kvstore::Store;
 use rustros_api::{
     IfConf, NetConf, RouteConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetError, NetInfo, RawSocket, SocketAddr, StorageInfo, Sys, TcpListener, TcpStream,
-    UdpSocket, UpdateInfo,
+    UdpSocket, UpdateInfo, Frame, Verdict,
 };
 
 use devices::{BlockDevice, NetDevice};
@@ -66,6 +66,31 @@ pub fn if_send(nics: &mut [Box<dyn NetDevice>], ifmap: &[IfMap], i: usize, frame
     }
 }
 
+/// Send a frame with offloads pending out of logical interface `i`: as it
+/// is if the NIC finishes offloads, else as plain packets.
+pub fn if_send_offload(nics: &mut [Box<dyn NetDevice>], ifmap: &[IfMap], i: usize, frame: &[u8], off: rustros_api::Offload) -> bool {
+    if off.is_none() {
+        return if_send(nics, ifmap, i, frame);
+    }
+    let Some(m) = ifmap.get(i) else { return false };
+    let Some(n) = nics.get_mut(m.phys) else { return false };
+    if frame.len() < 14 {
+        return false;
+    }
+    // into a buffer of its own, with room for the device header (and a tag)
+    let mut b = devices::buf_for(frame.len() + 4);
+    let mut start = devices::HEADROOM;
+    let mut len = frame.len();
+    b[start..start + len].copy_from_slice(frame);
+    if let Some(v) = m.vlan {
+        start -= 4;
+        b.copy_within(start + 4..start + 16, start);
+        b[start + 12..start + 16].copy_from_slice(&[0x81, 0x00, (v >> 8) as u8, v as u8]);
+        len += 4;
+    }
+    n.send_swap(&mut b, start, len, off)
+}
+
 pub struct Kernel {
     /// All NICs; 0 is the primary.
     pub nics: Vec<Box<dyn NetDevice>>,
@@ -93,7 +118,7 @@ pub struct Kernel {
     pub perf: crate::perf::Perf,
     /// Frames put back on the packet path: (interface, after which module
     /// order, frame).
-    pub injected: alloc::collections::VecDeque<(u8, i32, Vec<u8>)>,
+    pub injected: alloc::collections::VecDeque<(u8, i32, Vec<u8>, rustros_api::Offload)>,
     /// Frames the system's stack sends: they pass the egress hook (shapers)
     /// before the NIC, like forwarded ones. (interface, frame)
     pub stack_tx: alloc::collections::VecDeque<(u8, Vec<u8>)>,
@@ -528,6 +553,9 @@ impl Packet for Ctx<'_> {
     fn send_frame_on(&mut self, nic: usize, frame: &[u8]) -> bool {
         if_send(&mut self.k.nics, &self.k.ifmap, nic, frame)
     }
+    fn send_frame_offload(&mut self, nic: usize, frame: &[u8], offload: rustros_api::Offload) -> bool {
+        if_send_offload(&mut self.k.nics, &self.k.ifmap, nic, frame, offload)
+    }
     fn route(&self, dst: Ip) -> Option<(usize, Ip)> {
         self.k.stack.route(dst)
     }
@@ -542,12 +570,27 @@ impl Packet for Ctx<'_> {
         let (st, mut l) = self.k.net();
         st.send_packet(&mut l, packet)
     }
-    fn inject(&mut self, nic: usize, frame: &[u8], after_order: i32) -> bool {
-        if nic >= self.k.ifmap.len() || self.k.injected.len() >= INJECT_MAX || frame.len() > devices::BUF_SIZE - devices::HEADROOM {
+    fn inject(&mut self, nic: usize, frame: &[u8], offload: rustros_api::Offload, after_order: i32) -> bool {
+        let max = if offload.gso_size > 0 { 65_600 } else { devices::BUF_SIZE - devices::HEADROOM };
+        if nic >= self.k.ifmap.len() || self.k.injected.len() >= INJECT_MAX || frame.len() > max {
             return false;
         }
-        self.k.injected.push_back((nic as u8, after_order, frame.to_vec()));
+        self.k.injected.push_back((nic as u8, after_order, frame.to_vec(), offload));
         true
+    }
+    fn resolve(&mut self, f: &mut Frame, after_order: i32) -> bool {
+        if f.offload.gso_size == 0 {
+            if f.offload.csum_partial {
+                rustros_util::offload::complete_csum(f.data_mut());
+            }
+            f.offload = rustros_api::Offload::default();
+            return true;
+        }
+        for p in crate::offload::plain(f.data(), f.offload) {
+            self.k.injected.push_back((f.nic, after_order, p, rustros_api::Offload::default()));
+        }
+        f.verdict = Verdict::Consumed;
+        false
     }
 }
 

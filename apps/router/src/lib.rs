@@ -49,6 +49,12 @@ fn ip_at(p: &[u8], o: usize) -> Ip {
     u32::from_be_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]])
 }
 
+/// Length of the packets a big TCP segment becomes: headers plus `mss`.
+fn segment_len(d: &[u8], ihl: usize, mss: u16) -> usize {
+    let thl = d.get(ETH + ihl + 12).map_or(20, |b| (b >> 4) as usize * 4);
+    ihl + thl + mss as usize
+}
+
 impl Router {
     pub fn new() -> Router {
         Router::default()
@@ -105,7 +111,9 @@ impl Router {
         if d[ETH + 8] <= 1 {
             return self.icmp(pk, f, 11, 0, 0); // time exceeded
         }
-        if total > nic.mtu {
+        // a big segment goes out in pieces: each must fit
+        let wire = if f.offload.gso_size > 0 { segment_len(d, ihl, f.offload.gso_size) } else { total };
+        if wire > nic.mtu {
             if be16(d, ETH + 6) & 0x4000 != 0 {
                 return self.icmp(pk, f, 3, 4, nic.mtu as u16); // fragmentation needed
             }
@@ -133,8 +141,11 @@ impl Router {
                 f.verdict = Verdict::Transmit;
             }
             None => {
-                // the next hop is not resolved yet: the system queues it
-                pk.send_packet(&f.data()[ETH..ETH + total]);
+                // the next hop is not resolved yet: the system queues it (a
+                // plain packet; a big segment is dropped, TCP sends it again)
+                if f.offload.gso_size == 0 && pk.resolve(f, 100) {
+                    pk.send_packet(&f.data()[ETH..ETH + total]);
+                }
                 f.verdict = Verdict::Consumed;
             }
         }
@@ -153,6 +164,11 @@ impl Module for Router {
 
     fn order(&self) -> i32 {
         100 // after NAT and tunnels
+    }
+
+    /// Big segments are forwarded as they are (the NIC cuts them).
+    fn offloads(&self) -> bool {
+        true
     }
 
     fn start(&mut self, sys: &mut dyn Sys) {

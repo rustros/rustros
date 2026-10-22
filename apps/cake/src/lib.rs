@@ -43,6 +43,8 @@ const UPDATER_PORT: u16 = 9000;
 
 pub struct Pkt {
     pub data: Vec<u8>,
+    /// offloads still pending on it (a big segment counts with all its bytes)
+    pub offload: rustros_api::Offload,
     /// the interface it goes out of (egress) or came in on (ingress)
     pub nic: u8,
     enq_ns: u64,
@@ -206,11 +208,11 @@ impl Shaper {
         self.new_flows.len() + self.old_flows.len()
     }
 
-    pub fn enqueue(&mut self, now: u64, data: Vec<u8>, nic: u8) {
+    pub fn enqueue(&mut self, now: u64, data: Vec<u8>, offload: rustros_api::Offload, nic: u8) {
         let i = flow_of(&data);
         let len = data.len() as u32;
         let f = &mut self.flows[i];
-        f.q.push_back(Pkt { data, nic, enq_ns: now });
+        f.q.push_back(Pkt { data, offload, nic, enq_ns: now });
         f.backlog += len;
         self.backlog += len;
         if f.list == 0 {
@@ -422,8 +424,8 @@ impl Cake {
             x.shaper.release(now, &mut out);
             for p in out.drain(..) {
                 if x.egress {
-                    pk.send_frame_on(p.nic as usize, &p.data);
-                } else if !pk.inject(p.nic as usize, &p.data, ORDER) {
+                    pk.send_frame_offload(p.nic as usize, &p.data, p.offload);
+                } else if !pk.inject(p.nic as usize, &p.data, p.offload, ORDER) {
                     self.inject_drops += 1;
                 }
             }
@@ -436,7 +438,7 @@ impl Cake {
         if exempt(f.data()) {
             return;
         }
-        self.instances[i].shaper.enqueue(now, f.data().to_vec(), f.nic);
+        self.instances[i].shaper.enqueue(now, f.data().to_vec(), f.offload, f.nic);
         f.verdict = Verdict::Consumed;
     }
 }
@@ -452,6 +454,11 @@ impl Module for Cake {
 
     fn order(&self) -> i32 {
         ORDER
+    }
+
+    /// Big segments are shaped by their bytes and sent on as they are.
+    fn offloads(&self) -> bool {
+        true
     }
 
     fn start(&mut self, sys: &mut dyn Sys) {

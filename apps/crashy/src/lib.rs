@@ -20,7 +20,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use rustros_util::conn::Conn;
-use rustros_api::{Module, Sys, TcpListener, say};
+use rustros_api::{Caps, Frame, Module, Sys, TcpListener, say};
 
 const PORT: u16 = 7001;
 
@@ -77,6 +77,16 @@ impl Crashy {
 impl Module for Crashy {
     fn name(&self) -> &'static str {
         "crashy"
+    }
+
+    // a packet app that wants plain packets (tests the system's offload
+    // fallback); it only looks
+    fn caps(&self) -> Caps {
+        Caps::NET | Caps::KV | Caps::PACKET
+    }
+
+    fn on_frames(&mut self, _sys: &mut dyn Sys, frames: &mut [Frame]) {
+        assert!(frames.iter().all(|f| f.offload.is_none()), "offloads reached an app that did not ask for them");
     }
 
     fn start(&mut self, sys: &mut dyn Sys) {

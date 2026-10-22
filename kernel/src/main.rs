@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod modules;
+mod offload;
 mod klog;
 mod perf;
 mod acpi;
@@ -31,7 +32,7 @@ use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use rustros_api::{Module, Caps, Frame, HEADROOM, Verdict};
+use rustros_api::{Module, Caps, Frame, HEADROOM, Offload, Verdict};
 use devices::NetDevice;
 use netstack::Stack;
 use rustros_util::wire::{IpFmt, cmdline_get, parse_cidr, parse_ip};
@@ -229,15 +230,6 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             blks.push(d);
         }
     });
-    let nics: Vec<Box<dyn NetDevice>> = nets.iter().filter_map(virtio_net::VirtioNet::new).map(|n| Box::new(n) as Box<dyn NetDevice>).collect();
-    if nics.is_empty() {
-        kprintln!("no usable virtio-net device found, halting");
-        arch::halt_forever();
-    }
-    for (i, n) in nics.iter().enumerate() {
-        kprintln!("net: nic{} {} mac {}", i, n.kind(), rustros_util::wire::MacFmt(n.mac()));
-    }
-
     let disks: Vec<_> = blks.iter().filter_map(virtio_blk::VirtioBlk::new).collect();
     let boot = match slots::Updater::new(&cmdline, disks) {
         Ok((mut disk, upd)) => {
@@ -295,6 +287,18 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     } else {
         kprintln!("net: ip {} gw {}", IpFmt(ip), IpFmt(gw));
     }
+    // NIC offloads (TSO / checksums) unless turned off: "offload=off" on the
+    // command line or net_offload=off in grubenv
+    let offloads = cmdline_get(&cmdline, "offload").or_else(|| boot.as_ref().and_then(|b| b.upd.get("net_offload"))) != Some("off");
+    let nics: Vec<Box<dyn NetDevice>> = nets.iter().filter_map(|d| virtio_net::VirtioNet::new(d, offloads)).map(|n| Box::new(n) as Box<dyn NetDevice>).collect();
+    if nics.is_empty() {
+        kprintln!("no usable virtio-net device found, halting");
+        arch::halt_forever();
+    }
+    for (i, n) in nics.iter().enumerate() {
+        kprintln!("net: nic{} {} mac {}", i, n.kind(), rustros_util::wire::MacFmt(n.mac()));
+    }
+
     let mut stack = Stack::new(nics[0].mac(), ip, mask, gw);
     if let Some(mtu) = cmdline_get(&cmdline, "mtu").and_then(|m| m.parse::<usize>().ok()) {
         stack.primary().mtu = mtu.clamp(576, 1500);
@@ -549,22 +553,27 @@ const BATCH: usize = 32;
 /// the system stack. False when nothing was received.
 fn receive_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf]) -> bool {
     // frames a shaper released go first, in batches of their own
-    if let Some(&(_, after, _)) = k.injected.front() {
-        let (mut lens, mut from, starts) = ([0usize; BATCH], [0u8; BATCH], [HEADROOM; BATCH]);
+    if let Some(&(_, after, _, _)) = k.injected.front() {
+        let (mut lens, mut from, starts, mut offs) = ([0usize; BATCH], [0u8; BATCH], [HEADROOM; BATCH], [Offload::default(); BATCH]);
         let mut n = 0;
         while n < BATCH && k.injected.front().is_some_and(|f| f.1 == after) {
-            let (nic, _, data) = k.injected.pop_front().unwrap();
+            let (nic, _, data, off) = k.injected.pop_front().unwrap();
+            if pool[n].len() < HEADROOM + data.len() {
+                pool[n] = devices::buf_for(data.len());
+            }
             pool[n][HEADROOM..HEADROOM + data.len()].copy_from_slice(&data);
             lens[n] = data.len();
             from[n] = nic;
+            offs[n] = off;
             n += 1;
         }
-        process_batch(k, slots, pool, n, &starts, &lens, &from, after);
+        process_batch(k, slots, pool, n, &starts, &lens, &from, &offs, after);
         return true;
     }
     let mut lens = [0usize; BATCH];
     let mut from = [0u8; BATCH];
     let mut starts = [HEADROOM; BATCH];
+    let mut offs = [Offload::default(); BATCH];
     let mut n = 0;
     // take from every NIC in turn so none can starve the others
     let mut idle = 0;
@@ -572,8 +581,9 @@ fn receive_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf]) 
     while n < BATCH && idle < k.nics.len() {
         // zero copy: the frame's buffer comes in exchange for pool[n]
         match k.nics[nic].recv_swap(&mut pool[n]) {
-            Some(len) => {
+            Some((len, off)) => {
                 idle = 0;
+                offs[n] = off;
                 let b = &mut pool[n];
                 if len >= 18 && b[HEADROOM + 12..HEADROOM + 14] == [0x81, 0x00] {
                     // 802.1Q: to its VLAN interface, untagged
@@ -600,7 +610,7 @@ fn receive_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf]) 
     if n == 0 {
         return false;
     }
-    process_batch(k, slots, pool, n, &starts, &lens, &from, i32::MIN);
+    process_batch(k, slots, pool, n, &starts, &lens, &from, &offs, i32::MIN);
     true
 }
 
@@ -614,13 +624,16 @@ fn stack_tx_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf])
     let mut n = 0;
     while n < BATCH {
         let Some((nic, data)) = k.stack_tx.pop_front() else { break };
+        if pool[n].len() < HEADROOM + data.len() {
+            pool[n] = devices::buf_for(data.len());
+        }
         pool[n][HEADROOM..HEADROOM + data.len()].copy_from_slice(&data);
         lens[n] = data.len();
         from[n] = nic;
         n += 1;
     }
     // already decided: to be sent, past every module but the egress hook
-    process_batch(k, slots, pool, n, &starts, &lens, &from, i32::MAX);
+    process_batch(k, slots, pool, n, &starts, &lens, &from, &[Offload::default(); BATCH], i32::MAX);
     true
 }
 
@@ -628,12 +641,46 @@ fn stack_tx_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf])
 /// `after` (and the egress hook), send what they say, give the rest to the
 /// system stack.
 #[allow(clippy::too_many_arguments)]
-fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], n: usize, starts: &[usize; BATCH], lens: &[usize; BATCH], from: &[u8; BATCH], after: i32) {
+/// Finish the offloads of the undecided frames (`frames[..live]`) for an app
+/// that wants plain packets: checksums in place; a big segment is cut into
+/// packets that come back after `after`, and so does every frame behind it
+/// (in order: a connection's packets must not overtake each other). Those
+/// frames are consumed here. Returns how many are still undecided.
+fn plain_for(k: &mut Kernel, frames: &mut [Frame], live: usize, after: i32) -> usize {
+    let Some(first) = frames[..live].iter().position(|f| f.offload.gso_size > 0) else {
+        for f in frames[..live].iter_mut().filter(|f| f.offload.csum_partial) {
+            rustros_util::offload::complete_csum(f.data_mut());
+            f.offload = Offload::default();
+        }
+        return live;
+    };
+    for f in frames[..live].iter_mut() {
+        if f.offload.csum_partial && f.offload.gso_size == 0 {
+            rustros_util::offload::complete_csum(f.data_mut());
+            f.offload = Offload::default();
+        }
+    }
+    for f in frames[first..live].iter_mut() {
+        if f.offload.gso_size > 0 {
+            for p in offload::plain(f.data(), f.offload) {
+                k.injected.push_back((f.nic, after, p, Offload::default()));
+            }
+        } else {
+            k.injected.push_back((f.nic, after, f.data().to_vec(), Offload::default()));
+        }
+        f.verdict = Verdict::Consumed;
+    }
+    first
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], n: usize, starts: &[usize; BATCH], lens: &[usize; BATCH], from: &[u8; BATCH], offs: &[Offload; BATCH], after: i32) {
     let mut bufs = pool.iter_mut();
     let mut frames: [Frame; BATCH] = core::array::from_fn(|i| {
         let mut f = Frame::new(&mut bufs.next().unwrap()[..], starts[i], lens[i]);
         f.nic = from[i];
         f.slot = i as u8;
+        f.offload = offs[i];
         if after == i32::MAX {
             f.verdict = Verdict::Transmit; // the stack's own: only the egress hook
         }
@@ -664,6 +711,13 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
         if live == 0 {
             break;
         }
+        let (ord, offloads) = slots[id].app().map_or((0, false), |a| (a.order(), a.offloads()));
+        if !offloads {
+            live = plain_for(k, &mut frames, live, ord.saturating_sub(1));
+            if live == 0 {
+                break;
+            }
+        }
         modules::call(k, slots, id, |app, ctx| app.on_frames(ctx, &mut frames[..live]));
         // stable partition: undecided frames to the front
         let mut j = 0;
@@ -686,12 +740,28 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
     if t > live {
         for id in 0..slots.len() {
             if k.caps.get(id).is_some_and(|c| c.contains(Caps::PACKET)) {
+                if !slots[id].app().is_some_and(|a| a.offloads()) {
+                    // plain packets for it: they come back to the egress hook,
+                    // with every frame behind the first big one (in order)
+                    if let Some(first) = frames[live..t].iter().position(|f| f.verdict == Verdict::Transmit && f.offload.gso_size > 0) {
+                        for f in frames[live + first..t].iter_mut().filter(|f| f.verdict == Verdict::Transmit) {
+                            for p in offload::plain(f.data(), f.offload) {
+                                k.injected.push_back((f.nic, i32::MAX, p, Offload::default()));
+                            }
+                            f.verdict = Verdict::Consumed;
+                        }
+                    }
+                    for f in frames[live..t].iter_mut().filter(|f| f.verdict == Verdict::Transmit && f.offload.csum_partial) {
+                        rustros_util::offload::complete_csum(f.data_mut());
+                        f.offload = Offload::default();
+                    }
+                }
                 modules::call(k, slots, id, |app, ctx| app.on_egress(ctx, &mut frames[live..t]));
             }
         }
     }
-    // frames to send: (pool slot, start, length, NIC)
-    let mut out = [(0u8, 0usize, 0usize, 0usize); BATCH];
+    // frames to send: (pool slot, start, length, NIC, offloads)
+    let mut out = [(0u8, 0usize, 0usize, 0usize, Offload::default()); BATCH];
     let mut sends = 0;
     for f in frames[live..n].iter_mut() {
         if f.verdict == Verdict::Transmit {
@@ -705,19 +775,29 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
                 d.copy_within(4..16, 0);
                 d[12..16].copy_from_slice(&[0x81, 0x00, (v >> 8) as u8, v as u8]);
             }
-            out[sends] = (f.slot, f.headroom(), f.len(), m.phys);
+            out[sends] = (f.slot, f.headroom(), f.len(), m.phys, f.offload);
             sends += 1;
         }
     }
     let (st, mut link) = k.net();
-    for f in &frames[..live] {
+    for f in frames[..live].iter_mut() {
+        // the stack takes plain packets
+        if f.offload.gso_size > 0 {
+            for p in offload::plain(f.data(), f.offload) {
+                st.input(&mut link, f.nic as usize, &p);
+            }
+            continue;
+        }
+        if f.offload.csum_partial {
+            rustros_util::offload::complete_csum(f.data_mut());
+        }
         st.input(&mut link, f.nic as usize, f.data());
     }
     drop(frames);
     // zero copy: the buffers themselves go onto the TX rings (a spare one
     // comes back into the pool slot)
-    for &(slot, start, len, phys) in &out[..sends] {
-        k.nics[phys].send_swap(&mut pool[slot as usize], start, len);
+    for &(slot, start, len, phys, off) in &out[..sends] {
+        k.nics[phys].send_swap(&mut pool[slot as usize], start, len, off);
     }
     for nic in k.nics.iter_mut() {
         nic.flush();

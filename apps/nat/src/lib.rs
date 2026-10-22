@@ -234,7 +234,15 @@ impl NatModule {
             f.verdict = Verdict::Drop;
             return;
         };
-        if total > nic.mtu {
+        // a big segment goes out in pieces: each must fit
+        let wire = match f.offload.gso_size {
+            0 => total,
+            mss => {
+                let ihl = (f.data()[ETH] & 15) as usize * 4;
+                ihl + f.data().get(ETH + ihl + 12).map_or(20, |b| (b >> 4) as usize * 4) + mss as usize
+            }
+        };
+        if wire > nic.mtu {
             // too big for the way out: tell the sender if it asked not to fragment
             if f.data()[ETH + 6] & 0x40 != 0 {
                 let from = self.nics.get(f.nic as usize).map_or(0, |n| n.ip);
@@ -253,7 +261,11 @@ impl NatModule {
                 f.verdict = Verdict::Transmit;
             }
             None => {
-                pk.send_packet(&f.data()[ETH..ETH + total]);
+                // the system queues it until ARP answers (a plain packet; a
+                // big segment is dropped, TCP sends it again)
+                if f.offload.gso_size == 0 && pk.resolve(f, 0) {
+                    pk.send_packet(&f.data()[ETH..ETH + total]);
+                }
                 f.verdict = Verdict::Consumed;
             }
         }
@@ -270,7 +282,8 @@ impl NatModule {
         if let Some(fixed) = self.fixed.as_mut().filter(|x| !x.is_empty()) {
             let local = &self.local;
             let total = be16(f.data(), ETH + 2) as usize;
-            if fixed.process(now, &mut f.data_mut()[ETH..ETH + total], &|a| local.binary_search(&a).is_ok()) {
+            let partial = f.offload.csum_partial;
+            if fixed.process(now, &mut f.data_mut()[ETH..ETH + total], &|a| local.binary_search(&a).is_ok(), partial) {
                 return; // the router forwards it, by its new source
             }
         }
@@ -294,7 +307,8 @@ impl NatModule {
             if !wan {
                 return;
             }
-            match nat.outbound(now, &mut f.data_mut()[ETH..], nic as u32) {
+            let partial = f.offload.csum_partial;
+            match nat.outbound(now, &mut f.data_mut()[ETH..], nic as u32, partial) {
                 // out of the egress address's own WAN
                 Ok(egress) => {
                     let (out, hop) = pk.route_from(egress, dst).unwrap_or((out, hop));
@@ -310,7 +324,8 @@ impl NatModule {
                 }
             }
         } else {
-            match nat.inbound(now, &mut f.data_mut()[ETH..]) {
+            let partial = f.offload.csum_partial;
+            match nat.inbound(now, &mut f.data_mut()[ETH..], partial) {
                 Inbound::NotOurs => {}
                 Inbound::Forward { to, tag } => self.forward(pk, f, tag as usize, to),
                 Inbound::Drop(Drop::TtlExceeded) => {
@@ -331,6 +346,11 @@ impl NatModule {
 impl Module for NatModule {
     fn name(&self) -> &'static str {
         "nat"
+    }
+
+    /// Big segments are translated as they are (partial checksums kept).
+    fn offloads(&self) -> bool {
+        true
     }
 
     fn caps(&self) -> Caps {
