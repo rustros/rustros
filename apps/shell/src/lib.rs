@@ -4,6 +4,8 @@
 
 extern crate alloc;
 
+mod curl;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -77,6 +79,7 @@ pub struct Shell {
     ping: Option<Ping>,
     http: Option<HttpGet>,
     greeted: bool,
+    curl: Option<curl::Curl>,
     /// asking for a secret setting: (module, key, the first entry)
     secret: Option<(String, String, Option<String>)>,
 }
@@ -96,7 +99,7 @@ impl Shell {
         match cmd {
             "help" => say!(
                 sys,
-                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping <ip> [count] [src <ip> | interface nicN]   ICMP echo (Ctrl-C stops)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
+                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping [-c n] [-I nicN|ip] <ip>   ICMP echo (Ctrl-C stops; -I: the interface\n                      or our address to send from, an extra one too)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  curl [-i] [-I] [-v] [-m s] [--interface nicN|ip] [--dns-servers ip] [http://]host[:port][/path]\n                      HTTP from the command line (DNS: cfg shell dns <ip>, default 1.1.1.1)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
             ),
             "cfg" => match (args.next(), args.next(), args.next()) {
                 (Some(m), None, _) => {
@@ -140,39 +143,48 @@ impl Shell {
                 say!(sys, "{}\n", apps.join(", "));
             }
             "ping" => {
-                const USAGE: &str = "usage: ping a.b.c.d [count] [src a.b.c.d | interface nicN]\n";
-                let Some(dst) = args.next().and_then(parse_ip) else {
-                    say!(sys, "{}", USAGE);
-                    return;
-                };
+                const USAGE: &str = "usage: ping [-c count] [-I nicN|a.b.c.d] a.b.c.d [count]\n";
                 if self.icmp.is_none() {
                     say!(sys, "ping: no ICMP socket\n");
                     return;
                 }
-                let (mut count, mut src) = (4, 0);
+                let (mut dst, mut count, mut src) = (None, 4, 0);
                 while let Some(a) = args.next() {
-                    let addr = match (a, args.clone().next()) {
-                        ("src", Some(v)) => parse_ip(v),
-                        ("interface", Some(v)) => netcmd::find_nic(sys, v).and_then(|i| net(sys).nic_info(i)).map(|n| n.ip),
-                        (n, _) => match n.parse() {
-                            Ok(c) => {
-                                count = c;
-                                continue;
-                            }
-                            Err(_) => None,
-                        },
+                    if let Some(ip) = parse_ip(a).filter(|_| dst.is_none()) {
+                        dst = Some(ip);
+                        continue;
+                    }
+                    if let Ok(c) = a.parse() {
+                        count = c;
+                        continue;
+                    }
+                    let Some(v) = args.next().filter(|_| matches!(a, "-c" | "-I" | "src" | "interface" | "dev")) else {
+                        say!(sys, "ping: unknown option '{}'\n{}", a, USAGE);
+                        return;
                     };
-                    args.next();
-                    // replies only reach an interface's own address
-                    let ours = |ip: Ip, sys: &mut dyn Sys| (0..net(sys).nic_count()).any(|i| net(sys).nic_info(i).is_some_and(|n| n.ip == ip));
-                    match addr {
-                        Some(ip) if ip != 0 && ours(ip, sys) => src = ip,
-                        _ => {
-                            say!(sys, "ping: {} is not an interface's address\n{}", a, USAGE);
+                    if a == "-c" {
+                        match v.parse() {
+                            Ok(c) => count = c,
+                            Err(_) => {
+                                say!(sys, "ping: bad count '{}'\n", v);
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    // an interface or one of our addresses (an extra one too)
+                    match curl::our_address(sys, v) {
+                        Ok(ip) => src = ip,
+                        Err(e) => {
+                            say!(sys, "ping: {}\n", e);
                             return;
                         }
                     }
                 }
+                let Some(dst) = dst else {
+                    say!(sys, "{}", USAGE);
+                    return;
+                };
                 if src != 0 && sys.packet().is_none() {
                     say!(sys, "ping: no packet access for a chosen source\n");
                     return;
@@ -183,6 +195,13 @@ impl Shell {
                     say!(sys, "PING {}\n", IpFmt(dst));
                 }
                 self.ping = Some(Ping { dst, src, id: sys.random() as u16, seq: 0, count, received: 0, next_at: 0, sent_at: Vec::new() });
+            }
+            "curl" => {
+                let rest: Vec<&str> = args.collect();
+                match curl::Curl::start(sys, &rest) {
+                    Ok(c) => self.curl = Some(c),
+                    Err(e) => say!(sys, "{}", e),
+                }
             }
             "http" => {
                 let Some(ip) = args.next().and_then(parse_ip) else {
@@ -454,6 +473,10 @@ impl Module for Shell {
         }
         self.ping_poll(sys);
         self.http_poll(sys);
+        if self.curl.as_mut().is_some_and(|c| c.poll(sys)) {
+            self.curl = None;
+            self.prompt(sys);
+        }
     }
 
     fn key(&mut self, sys: &mut dyn Sys, c: u8) {
@@ -467,14 +490,15 @@ impl Module for Shell {
             }
             3 => {
                 let http = self.http.take().map(|mut h| h.conn.abort(net(sys))).is_some();
-                if self.ping.take().is_some() | http {
+                let curl = self.curl.take().map(|mut c| c.abort(sys)).is_some();
+                if self.ping.take().is_some() | http | curl {
                     say!(sys, "^C\n");
                     self.prompt(sys);
                 }
             }
             _ => {
                 const COMMANDS: &[&str] = &[
-                    "help", "ip", "mtu", "cand", "apply", "revert", "confirm", "discard", "save", "arp", "conns", "modules", "ping", "http", "kv", "df", "crash",
+                    "help", "ip", "mtu", "cand", "apply", "revert", "confirm", "discard", "save", "arp", "conns", "modules", "ping", "http", "curl", "kv", "df", "crash",
                     "mod", "cfg", "uptime", "slot", "log", "reboot", "poweroff",
                 ];
                 if let Some(line) = self.edit.key(sys, c, "rustros> ", &|s, w| netcmd::complete(s, w, COMMANDS)) {
@@ -499,7 +523,7 @@ impl Module for Shell {
                     if !netcmd::console_line(sys, &mut self.ask, &line) {
                         self.command(sys, &line);
                     }
-                    if self.ping.is_none() && self.http.is_none() && self.ask.is_none() && self.secret.is_none() {
+                    if self.ping.is_none() && self.http.is_none() && self.curl.is_none() && self.ask.is_none() && self.secret.is_none() {
                         self.prompt(sys);
                     }
                 }

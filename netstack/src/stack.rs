@@ -107,9 +107,9 @@ impl Stack {
         let Some(pkt) = f.handle(link, frame, &elsewhere) else { return };
         match pkt.proto {
             PROTO_TCP => {
-                if pkt.dst == self.ifs.0[nic].ip {
-                    self.tcp.input(&mut self.ifs, link, &pkt);
-                }
+                // an extra address only serves connections made from it
+                let open = pkt.dst == self.ifs.0[nic].ip;
+                self.tcp.input(&mut self.ifs, link, &pkt, open);
             }
             PROTO_UDP => {
                 let Some((sport, dport, data)) = parse_udp(&pkt) else { return };
@@ -342,7 +342,16 @@ impl Stack {
 
     /// Start an outgoing connection from a free ephemeral port.
     pub fn tcp_connect(&mut self, owner: usize, link: &mut dyn Link, to: SocketAddr) -> R<TcpStream> {
+        self.tcp_connect_from(owner, link, 0, to)
+    }
+
+    /// Connect from our address `src` (an interface's or an extra one; 0:
+    /// the one towards `to`).
+    pub fn tcp_connect_from(&mut self, owner: usize, link: &mut dyn Link, src: Ip, to: SocketAddr) -> R<TcpStream> {
         if self.ifs.src_for(to.ip) == 0 || to.ip == 0 || to.port == 0 {
+            return Err(NetError::NoRoute);
+        }
+        if src != 0 && !self.ifs.0.iter().any(|f| f.is_local(src)) {
             return Err(NetError::NoRoute);
         }
         let span = EPHEMERAL.end - EPHEMERAL.start;
@@ -351,7 +360,7 @@ impl Stack {
             .map(|i| (EPHEMERAL.start + (start + i) % span) as u16)
             .find(|&p| !self.tcp.port_in_use(p))
             .ok_or(NetError::AddrInUse)?;
-        let h = self.tcp.connect(&mut self.ifs, link, to.ip, to.port, lport, owner).ok_or(NetError::AddrInUse)?;
+        let h = self.tcp.connect(&mut self.ifs, link, src, to.ip, to.port, lport, owner).ok_or(NetError::AddrInUse)?;
         Ok(stream(h))
     }
 

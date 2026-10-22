@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod conn;
+pub mod dns;
 pub mod lineedit;
 pub mod logcmd;
 pub mod netcmd;

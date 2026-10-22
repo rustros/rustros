@@ -428,6 +428,11 @@ impl Net for Ctx<'_> {
         let (st, mut l) = self.k.net();
         st.tcp_connect(id, &mut l, to)
     }
+    fn tcp_connect_from(&mut self, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError> {
+        let id = self.id;
+        let (st, mut l) = self.k.net();
+        st.tcp_connect_from(id, &mut l, src, to)
+    }
     fn tcp_is_connected(&self, s: TcpStream) -> Result<bool, NetError> {
         self.k.stack.tcp_is_connected(self.id, s)
     }

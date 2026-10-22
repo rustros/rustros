@@ -295,14 +295,15 @@ impl Tcp {
 
     /// Active open: send a SYN from `lport` to `rip:rport`. Data may be
     /// written right away; it goes out once the connection is established.
-    pub fn connect(&mut self, iface: &mut Ifaces, link: &mut dyn Link, rip: Ip, rport: u16, lport: u16, owner: usize) -> Option<Handle> {
+    /// `lip`: our address to connect from (0: the one towards `rip`).
+    pub fn connect(&mut self, iface: &mut Ifaces, link: &mut dyn Link, lip: Ip, rip: Ip, rport: u16, lport: u16, owner: usize) -> Option<Handle> {
         if self.slots.iter().filter(|s| s.sock.is_some()).count() >= self.max_conns {
             return None;
         }
         let iss = link.random() as u32;
         let s = Sock {
             state: State::SynSent,
-            lip: iface.src_for(rip),
+            lip: iface.src_or(lip, rip),
             lport,
             rip,
             rport,
@@ -431,7 +432,10 @@ impl Tcp {
         }
     }
 
-    pub fn input(&mut self, iface: &mut Ifaces, link: &mut dyn Link, pkt: &IpPkt) {
+    /// `open`: new connections and resets for unknown ones (an interface's
+    /// own address); otherwise only existing connections (an extra address
+    /// a connection was made from).
+    pub fn input(&mut self, iface: &mut Ifaces, link: &mut dyn Link, pkt: &IpPkt, open: bool) {
         let seg = pkt.payload;
         if seg.len() < 20 || checksum(seg, pseudo(pkt.src, pkt.dst, PROTO_TCP, seg.len())) != 0 {
             return;
@@ -446,10 +450,10 @@ impl Tcp {
         let now = link.now_ms();
 
         let found = self.slots.iter().position(|s| {
-            s.sock.as_ref().is_some_and(|s| s.lport == dport && s.rport == sport && s.rip == pkt.src)
+            s.sock.as_ref().is_some_and(|s| s.lport == dport && s.rport == sport && s.rip == pkt.src && s.lip == pkt.dst)
         });
         let Some(idx) = found else {
-            if flags & RST != 0 {
+            if flags & RST != 0 || !open {
                 return;
             }
             let live = self.slots.iter().filter(|s| s.sock.is_some()).count();

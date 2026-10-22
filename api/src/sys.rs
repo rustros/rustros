@@ -308,6 +308,8 @@ pub trait Net: Base {
     /// the handshake completes is sent afterwards. A refused or timed-out
     /// connection shows up as `Err(Closed)` on later calls.
     fn tcp_connect(&mut self, to: SocketAddr) -> Result<TcpStream, NetError>;
+    /// Connect from our address `src` (an interface's or an extra one), routed by it.
+    fn tcp_connect_from(&mut self, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError>;
     /// `Ok(false)` while the handshake is still in progress.
     fn tcp_is_connected(&self, s: TcpStream) -> Result<bool, NetError>;
     /// `Ok(0)` means the peer has closed its side and all data was read.
