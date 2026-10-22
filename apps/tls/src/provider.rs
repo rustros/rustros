@@ -45,6 +45,16 @@ fn fill(buf: &mut [u8]) -> Result<(), GetRandomFailed> {
     RNG.lock().as_mut().map(|r| r.fill_bytes(buf)).ok_or(GetRandomFailed)
 }
 
+/// Random bytes from the (seeded) generator: false if it was never seeded.
+pub fn random(buf: &mut [u8]) -> bool {
+    fill(buf).is_ok()
+}
+
+/// The X25519 public key of a private one (WireGuard keys).
+pub fn x25519_public(private: [u8; 32]) -> [u8; 32] {
+    x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private)).to_bytes()
+}
+
 /// The generator for key generation in the RustCrypto crates.
 struct Rng;
 impl RngCore for Rng {

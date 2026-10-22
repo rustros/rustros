@@ -144,28 +144,6 @@ fn addr_of(ifs: &[(String, Ip, Ip, Ip)], v: &str) -> Option<Ip> {
     parse_ip(v).or_else(|| ifs.iter().find(|f| f.0 == v).map(|f| f.1).filter(|&a| a != 0))
 }
 
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let (mut acc, mut bits) = (0u32, 0);
-    for c in s.trim().bytes().take_while(|&c| c != b'=') {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return None,
-        };
-        acc = acc << 6 | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
 fn http_error(status: &str, extra: &str) -> Vec<u8> {
     let body = format!("{status}\n");
     format!("HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len()).into_bytes()
@@ -206,7 +184,7 @@ fn parse_http(inst: &Instance, head: &[u8], rest: &[u8]) -> Result<(String, u16,
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("Proxy-Authorization"))
             .and_then(|(_, v)| v.strip_prefix("Basic ").or_else(|| v.strip_prefix("basic ")))
-            .and_then(b64_decode)
+            .and_then(rustros_util::base64::decode)
             .is_some_and(|cred| match cred.iter().position(|&b| b == b':') {
                 Some(p) => inst.login(&cred[..p], &cred[p + 1..]),
                 None => false,

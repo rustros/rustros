@@ -1,9 +1,11 @@
-//! `curl`: an HTTP GET (or HEAD) with curl's options, through a DNS lookup,
-//! from a chosen local address; HTTPS through the `tls` crate (TLS 1.3,
-//! certificates checked against the Mozilla roots).
+//! `curl`: an HTTP request with curl's options, through a DNS lookup, from
+//! a chosen local address; HTTPS through the `tls` crate (TLS 1.3,
+//! certificates checked against the Mozilla roots). Other commands use it
+//! too (`Curl::request`), keeping the answer instead of printing it.
 //!
 //! ```text
-//! curl [-i] [-I] [-v] [-s] [-m secs] [--interface nicN|a.b.c.d] [--dns-servers a.b.c.d] [http[s]://]host[:port][/path]
+//! curl [-i] [-I] [-v] [-s] [-m secs] [-X method] [-H header]... [-d data]
+//!      [--interface nicN|a.b.c.d] [--dns-servers a.b.c.d] [http[s]://]host[:port][/path]
 //! ```
 
 use alloc::format;
@@ -15,7 +17,7 @@ use rustros_util::conn::Conn;
 use rustros_util::dns;
 use rustros_util::wire::{Ip, IpFmt, parse_ip};
 
-pub const USAGE: &str = "usage: curl [-i] [-I] [-v] [-s] [-m secs] [--interface nicN|a.b.c.d] [--dns-servers a.b.c.d] [http[s]://]host[:port][/path]\n";
+pub const USAGE: &str = "usage: curl [-i] [-I] [-v] [-s] [-m secs] [-X method] [-H header]... [-d data] [--interface nicN|a.b.c.d] [--dns-servers a.b.c.d] [http[s]://]host[:port][/path]\n";
 /// The resolver if neither `--dns-servers` nor `cfg shell dns` names one.
 const DNS_DEFAULT: Ip = 0x0101_0101;
 const DNS_RETRY_MS: u64 = 2000;
@@ -49,12 +51,36 @@ impl Tls {
     fn feed(&mut self, _: &[u8]) {}
 }
 
+/// A request for `Curl::request`.
+#[derive(Default)]
+pub struct Request<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub headers: Vec<String>,
+    pub body: Option<Vec<u8>>,
+    pub src: Ip,
+    pub max_secs: u64,
+}
+
+/// What a request kept (`Curl::request`): the status and the body, or why it failed.
+pub type Answer = Result<(u16, Vec<u8>), String>;
+
 pub struct Curl {
     host: String,
     port: u16,
     path: String,
     https: bool,
     src: Ip,
+    method: String,
+    headers: Vec<String>,
+    data: Option<Vec<u8>>,
+    /// keep the answer (`answer`) instead of printing it
+    capture: bool,
+    answer: Option<Answer>,
+    status: u16,
+    /// the body comes in chunks: kept whole and decoded at the end
+    chunked: bool,
+    body: Vec<u8>,
     head_only: bool,
     include: bool,
     verbose: bool,
@@ -85,6 +111,7 @@ impl Curl {
     pub fn start(sys: &mut dyn Sys, args: &[&str]) -> Result<Curl, String> {
         let (mut include, mut head_only, mut verbose, mut silent) = (false, false, false, false);
         let (mut src, mut dns_server, mut max_secs, mut url) = (0, None, 15u64, None);
+        let (mut method, mut headers, mut data) = (None, Vec::new(), None::<Vec<u8>>);
         let mut it = args.iter().copied();
         while let Some(a) = it.next() {
             let mut value = |name: &str| it.next().ok_or_else(|| format!("curl: {name} needs a value\n{USAGE}"));
@@ -95,6 +122,17 @@ impl Curl {
                     dns_server = Some(v.split(',').next().and_then(parse_ip).ok_or_else(|| format!("curl: bad DNS server '{v}'\n"))?);
                 }
                 "-m" | "--max-time" => max_secs = value(a)?.parse().ok().filter(|&s| s > 0).ok_or_else(|| String::from("curl: bad --max-time\n"))?,
+                "-X" | "--request" => method = Some(String::from(value(a)?)),
+                "-H" | "--header" => headers.push(String::from(value(a)?)),
+                "-d" | "--data" | "--data-raw" => {
+                    // several -d: joined with '&', as curl does
+                    let v = value(a)?;
+                    let d = data.get_or_insert_with(Vec::new);
+                    if !d.is_empty() {
+                        d.push(b'&');
+                    }
+                    d.extend_from_slice(v.as_bytes());
+                }
                 "--include" => include = true,
                 "--head" => head_only = true,
                 "--verbose" => verbose = true,
@@ -115,6 +153,44 @@ impl Curl {
             }
         }
         let Some(url) = url else { return Err(String::from(USAGE)) };
+        if data.is_some() && !headers.iter().any(|h| h.to_ascii_lowercase().starts_with("content-type:")) {
+            headers.push(String::from("Content-Type: application/x-www-form-urlencoded"));
+        }
+        let method = method.unwrap_or_else(|| String::from(if head_only { "HEAD" } else if data.is_some() { "POST" } else { "GET" }));
+        let mut c = Curl::new(sys, url, src, dns_server, max_secs)?;
+        (c.method, c.headers, c.data) = (method, headers, data);
+        c.head_only = head_only;
+        c.include = include || head_only;
+        (c.verbose, c.silent) = (verbose, silent);
+        if let (true, Phase::Resolve { server, .. }) = (verbose, &c.phase) {
+            say!(sys, "* Resolving {} via {}\n", c.host, IpFmt(*server));
+        }
+        Ok(c)
+    }
+
+    /// A request whose answer is kept: poll until done, then `answer`.
+    pub fn request(sys: &mut dyn Sys, r: Request) -> Result<Curl, String> {
+        let mut c = Curl::new(sys, r.url, r.src, None, if r.max_secs == 0 { 15 } else { r.max_secs })?;
+        c.method = String::from(r.method);
+        (c.headers, c.data, c.capture) = (r.headers, r.body, true);
+        Ok(c)
+    }
+
+    /// The answer of a finished `request`.
+    pub fn answer(&mut self) -> Answer {
+        self.answer.take().unwrap_or_else(|| Err(String::from("no answer")))
+    }
+
+    /// Report a failure: printed, or kept as the answer.
+    fn fail(&mut self, sys: &mut dyn Sys, msg: String) {
+        if self.capture {
+            self.answer = Some(Err(String::from(msg.trim_end())));
+        } else {
+            sys.print(&msg);
+        }
+    }
+
+    fn new(sys: &mut dyn Sys, url: &str, src: Ip, dns_server: Option<Ip>, max_secs: u64) -> Result<Curl, String> {
         let https = url.starts_with("https://");
         let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url);
         let (hostport, path) = match rest.find('/') {
@@ -151,10 +227,18 @@ impl Curl {
             path: String::from(path),
             https,
             src,
-            head_only,
-            include: include || head_only,
-            verbose,
-            silent,
+            method: String::from("GET"),
+            headers: Vec::new(),
+            data: None,
+            capture: false,
+            answer: None,
+            status: 0,
+            chunked: false,
+            body: Vec::new(),
+            head_only: false,
+            include: false,
+            verbose: false,
+            silent: false,
             started: now,
             deadline: now + max_secs * 1000,
             phase: Phase::Start(0),
@@ -169,9 +253,6 @@ impl Curl {
                 let net = sys.net().ok_or_else(|| String::from("curl: no network\n"))?;
                 let sock = net.udp_bind(0).map_err(|e| format!("curl: {e:?}\n"))?;
                 let id = sys.random() as u16;
-                if c.verbose {
-                    say!(sys, "* Resolving {} via {}\n", c.host, IpFmt(server));
-                }
                 c.phase = Phase::Resolve { sock, id, server, sent: 0, tries: 0 };
             }
         }
@@ -183,30 +264,52 @@ impl Curl {
         let net = sys.net().ok_or_else(|| String::from("curl: no network\n"))?;
         let s = if self.src != 0 { net.tcp_connect_from(self.src, to) } else { net.tcp_connect(to) }.map_err(|e| format!("curl: cannot connect to {to}: {e:?}\n"))?;
         let mut conn = Conn::new(s, to);
-        let method = if self.head_only { "HEAD" } else { "GET" };
         let default_port = if self.https { 443 } else { 80 };
         let host = if self.port == default_port { self.host.clone() } else { format!("{}:{}", self.host, self.port) };
-        let req = format!("{method} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: curl/8.0 (RustROS)\r\nAccept: */*\r\nConnection: close\r\n\r\n", self.path);
+        let mut req = format!("{} {} HTTP/1.1\r\nHost: {host}\r\n", self.method, self.path);
+        let has = |name: &str| self.headers.iter().any(|h| h.len() > name.len() && h[..name.len()].eq_ignore_ascii_case(name) && h.as_bytes()[name.len()] == b':');
+        if !has("User-Agent") {
+            req.push_str("User-Agent: curl/8.0 (RustROS)\r\n");
+        }
+        if !has("Accept") {
+            req.push_str("Accept: */*\r\n");
+        }
+        for h in &self.headers {
+            req.push_str(h);
+            req.push_str("\r\n");
+        }
+        if let Some(d) = &self.data {
+            req.push_str(&format!("Content-Length: {}\r\n", d.len()));
+        }
+        req.push_str("Connection: close\r\n\r\n");
         if self.verbose {
             let from = if self.src != 0 { format!(" from {}", IpFmt(self.src)) } else { String::new() };
             say!(sys, "*   Trying {}{}...\n", to, from);
             for l in req.split("\r\n").filter(|l| !l.is_empty()) {
-                say!(sys, "> {}\n", l);
+                if l.len() > 15 && l[..14].eq_ignore_ascii_case("authorization:") {
+                    say!(sys, "> {} ***\n", &l[..14]);
+                } else {
+                    say!(sys, "> {}\n", l);
+                }
             }
+        }
+        let mut req = req.into_bytes();
+        if let Some(d) = &self.data {
+            req.extend_from_slice(d);
         }
         #[cfg(feature = "tls")]
         let tls = if self.https {
             tls::set_time(sys.unix_time());
             let mut t = tls::TlsClient::new(&self.host).map_err(|e| format!("curl: (35) TLS: {e}\n"))?;
-            t.write(req.as_bytes()); // sent once the handshake is done
+            t.write(&req); // sent once the handshake is done
             Some(t)
         } else {
-            conn.write(req.as_bytes());
+            conn.write(&req);
             None
         };
         #[cfg(not(feature = "tls"))]
         let tls: Option<Tls> = {
-            conn.write(req.as_bytes());
+            conn.write(&req);
             None
         };
         self.phase = Phase::Fetch { conn, tls, connected: false, head: Vec::new(), header_done: false, shown: 0 };
@@ -217,7 +320,7 @@ impl Curl {
     pub fn poll(&mut self, sys: &mut dyn Sys) -> bool {
         let now = sys.now_ms();
         if now >= self.deadline {
-            say!(sys, "curl: (28) timed out after {} ms\n", now - self.started);
+            self.fail(sys, format!("curl: (28) timed out after {} ms\n", now - self.started));
             self.abort(sys);
             return true;
         }
@@ -225,7 +328,7 @@ impl Curl {
             Phase::Start(ip) => {
                 let ip = *ip;
                 if let Err(e) = self.connect(sys, ip) {
-                    say!(sys, "{}", e);
+                    self.fail(sys, e);
                     return true;
                 }
                 false
@@ -247,14 +350,14 @@ impl Curl {
                             return match self.connect(sys, ip) {
                                 Ok(()) => false,
                                 Err(e) => {
-                                    say!(sys, "{}", e);
+                                    self.fail(sys, e);
                                     true
                                 }
                             };
                         }
                         Some(Err(())) => {
                             net.udp_close(sock);
-                            say!(sys, "curl: (6) Could not resolve host: {}\n", self.host);
+                            self.fail(sys, format!("curl: (6) Could not resolve host: {}\n", self.host));
                             return true;
                         }
                         None => {}
@@ -263,7 +366,7 @@ impl Curl {
                 if *sent == 0 || now - *sent >= DNS_RETRY_MS {
                     if *tries >= DNS_TRIES {
                         net.udp_close(sock);
-                        say!(sys, "curl: (6) no answer from DNS server {}\n", IpFmt(server));
+                        self.fail(sys, format!("curl: (6) no answer from DNS server {}\n", IpFmt(server)));
                         return true;
                     }
                     *tries += 1;
@@ -272,7 +375,7 @@ impl Curl {
                         let _ = net.udp_send_to(sock, SocketAddr { ip: server, port: 53 }, &q);
                     } else {
                         net.udp_close(sock);
-                        say!(sys, "curl: (3) bad host name '{}'\n", self.host);
+                        self.fail(sys, format!("curl: (3) bad host name '{}'\n", self.host));
                         return true;
                     }
                 }
@@ -300,10 +403,11 @@ impl Curl {
                         say!(sys, "* TLS 1.3 handshake done, certificate for {} verified\n", self.host);
                     }
                     if let Some(e) = t.error.take() {
-                        say!(sys, "curl: (60) TLS: {}\n", e);
+                        let msg = format!("curl: (60) TLS: {}\n", e);
                         if let Some(net) = sys.net() {
                             conn.abort(net);
                         }
+                        self.fail(sys, msg);
                         return true;
                     }
                     conn.inbuf = t.take_received();
@@ -326,6 +430,12 @@ impl Curl {
                         Some(end) => {
                             *header_done = true;
                             let h = &head[..end + 4];
+                            let text = String::from_utf8_lossy(h);
+                            self.status = text.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+                            self.chunked = text.split("\r\n").any(|l| {
+                                l.split_once(':').is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked"))
+                            });
+                            let keep = self.chunked || self.capture;
                             if self.include {
                                 out.extend_from_slice(h);
                             } else if self.verbose {
@@ -333,25 +443,53 @@ impl Curl {
                                     out.extend_from_slice(format!("< {l}\n").as_bytes());
                                 }
                             }
-                            out.extend_from_slice(&head[end + 4..]);
+                            if keep {
+                                self.body.extend_from_slice(&head[end + 4..]);
+                            } else {
+                                out.extend_from_slice(&head[end + 4..]);
+                            }
                             body = &[];
                         }
                         None => body = &[],
                     }
                 }
-                out.extend_from_slice(body);
-                if !out.is_empty() && *shown < SHOW_MAX {
+                if self.chunked || self.capture {
+                    self.body.extend_from_slice(body);
+                } else {
+                    out.extend_from_slice(body);
+                }
+                let done = !alive || conn.eof;
+                if done && *header_done {
+                    if self.chunked {
+                        self.body = dechunk(&self.body);
+                    }
+                    if !self.capture {
+                        out.extend_from_slice(&self.body);
+                    }
+                }
+                if !out.is_empty() && *shown < SHOW_MAX && !self.capture {
                     let n = out.len().min(SHOW_MAX - *shown);
                     say!(sys, "{}", String::from_utf8_lossy(&out[..n]));
                     *shown += n;
                     self.at_line_start = out[n - 1] == b'\n';
                 }
-                if !alive || conn.eof {
+                if done {
                     if let (true, Some(net)) = (alive, sys.net()) {
                         conn.close();
                         conn.pump(net, 0);
                     }
-                    if !*connected {
+                    let (connected, header_done) = (*connected, *header_done);
+                    if self.capture {
+                        self.answer = Some(if header_done {
+                            Ok((self.status, core::mem::take(&mut self.body)))
+                        } else if connected {
+                            Err(String::from("curl: (52) Empty reply from server"))
+                        } else {
+                            Err(format!("curl: (7) Failed to connect to {} port {}", self.host, self.port))
+                        });
+                        return true;
+                    }
+                    if !connected {
                         say!(sys, "curl: (7) Failed to connect to {} port {}\n", self.host, self.port);
                     } else if !self.silent && self.verbose {
                         say!(sys, "* closed after {} ms\n", now - self.started);
@@ -374,4 +512,18 @@ impl Curl {
             Phase::Fetch { conn, .. } => conn.abort(net),
         }
     }
+}
+
+/// A chunked body, decoded (what arrived of it).
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(eol) = b.windows(2).position(|w| w == b"\r\n") {
+        let size = core::str::from_utf8(&b[..eol]).ok().and_then(|l| usize::from_str_radix(l.split(';').next().unwrap_or("").trim(), 16).ok());
+        let Some(size) = size.filter(|&n| n > 0) else { break };
+        b = &b[eol + 2..];
+        let n = size.min(b.len());
+        out.extend_from_slice(&b[..n]);
+        b = b.get(n + 2..).unwrap_or(&[]);
+    }
+    out
 }

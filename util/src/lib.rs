@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod base64;
 pub mod conn;
 pub mod dns;
 pub mod lineedit;

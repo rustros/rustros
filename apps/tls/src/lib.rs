@@ -21,7 +21,7 @@ use rustls::client::UnbufferedClientConnection;
 use rustls::pki_types::ServerName;
 use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, InsufficientSizeError, UnbufferedStatus};
 
-pub use provider::{seed, set_time};
+pub use provider::{random, seed, set_time, x25519_public};
 
 pub struct TlsClient {
     conn: UnbufferedClientConnection,
