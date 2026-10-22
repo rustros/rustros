@@ -21,7 +21,6 @@ netstack = { path = "../netstack" }
 devices = { path = "../devices" }
 slots = { path = "../slots" }
 storage = { path = "../storage" }
-ext4 = { path = "../ext4" }
 kvstore = { path = "../kvstore" }
 rescue = { path = "../apps/rescue", optional = true }
 dhcp = { path = "../apps/dhcp", optional = true }

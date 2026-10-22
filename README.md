@@ -5,6 +5,7 @@
 - 一张 raw 盘同时支持 **BIOS 和 UEFI** 启动（GRUB 2 + multiboot2）
 - 面向 KVM/VPS：**virtio-net**、**virtio-blk**，modern（1.0）和 legacy 设备都支持
 - **在线更新**：通过网络上传新内核写入备用槽，试启动一次，确认后才切换；不确认就自动回滚
+- **内核保持在 256 KiB 以内**：内核只做驱动、内存、协议栈、块存储和模块加载；文件系统驱动（ext4）、应用、WebAssembly 运行时都是可以在线安装和更新的模块
 - unsafe 只出现在 `kernel/`（以及 `wasmhost` 的一处）；其余 crate 和应用都是 `#![forbid(unsafe_code)]`
 
 ## 目录结构

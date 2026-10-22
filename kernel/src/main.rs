@@ -280,46 +280,11 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 }
                 None => kprintln!("log: no cache partition, the console log is not kept"),
             }
-            // the files partition: its ext4, made on first use
-            let files = store.as_ref().and_then(|(_, part)| part.files).and_then(|(start, n)| {
-                let mut v = ext4::Vol { dev: &mut disk, start };
-                let fs = match ext4::Fs::mount(&mut v) {
-                    Ok(fs) => fs,
-                    Err(ext4::Error::NotExt4) => {
-                        let mut uuid = [0u8; 16];
-                        uuid[..8].copy_from_slice(&arch::rdtsc().to_le_bytes());
-                        uuid[8..].copy_from_slice(&arch::rdtsc().rotate_left(29).to_le_bytes());
-                        match ext4::Fs::format(&mut v, n, uuid, "rustros-files", arch::unix_time() as u32) {
-                            Ok(fs) => {
-                                kprintln!("storage: files partition formatted (ext4)");
-                                fs
-                            }
-                            Err(e) => {
-                                kprintln!("storage: files partition: cannot format: {:?}", e);
-                                return None;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        kprintln!("storage: files partition: {:?}", e);
-                        return None;
-                    }
-                };
-                let mut fs = fs;
-                match fs.add_journal(&mut v, arch::unix_time() as u32) {
-                    Ok(true) => kprintln!("storage: files partition: journal added"),
-                    Ok(false) => {}
-                    Err(e) => kprintln!("storage: files partition: no journal: {:?}", e),
-                }
-                let (total, free) = fs.usage();
-                let how = match (fs.writable, fs.has_journal()) {
-                    (false, _) => ", read only",
-                    (true, true) => ", journaled",
-                    (true, false) => "",
-                };
-                kprintln!("storage: files partition {} MiB (ext4{}), {} MiB used", total >> 20, how, (total - free) >> 20);
-                Some((fs, start))
-            });
+            // the files partition: its file system is a driver module's (mounted when it loads)
+            let files = store.as_ref().and_then(|(_, part)| part.files);
+            if let Some((_, n)) = files {
+                kprintln!("storage: files partition {} MiB", n >> 11);
+            }
             Some(sys::Boot { disk: Box::new(disk), upd, store, log, files })
         }
         Err(e) => {

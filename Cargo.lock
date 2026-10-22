@@ -335,6 +335,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext4fs"
+version = "0.1.0"
+dependencies = [
+ "devices",
+ "ext4",
+ "rustros-api",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -835,7 +844,6 @@ dependencies = [
  "devices",
  "dhcp",
  "echo",
- "ext4",
  "httpd",
  "kvstore",
  "netstack",

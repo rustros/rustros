@@ -47,10 +47,10 @@
 <li>virtio 网卡和磁盘（KVM 云主机基本都是）。有多块网卡时 RustROS 用第一块</li>
 </ul>
 <h3>选项</h3>
-<p>通过 <code>sh -s --</code> 传给脚本，例如 <code>curl -fsSL https://rustros.com/install.sh | sh -s -- --apps shell,webadmin</code>：</p>
+<p>通过 <code>sh -s --</code> 传给脚本，例如 <code>curl -fsSL https://rustros.com/install.sh | sh -s -- --apps ext4,shell,webadmin</code>：</p>
 <table>
 <tr><th>选项</th><th>作用</th></tr>
-<tr><td><code>--apps a,b</code></td><td>首次启动时安装的应用（默认 <code>shell</code>）</td></tr>
+<tr><td><code>--apps a,b</code></td><td>首次启动时安装的应用（默认 <code>ext4,shell</code>）</td></tr>
 <tr><td><code>--ip A/N --gw G</code></td><td>静态地址</td></tr>
 <tr><td><code>--dhcp</code></td><td>用 DHCP</td></tr>
 <tr><td><code>--panel URL</code></td><td>接入管理面板</td></tr>
@@ -90,7 +90,7 @@ save           # 写进 GRUB 环境块，重启后也用它</pre></div>
 <p>直接 <code>ip nic0 A/N GW</code> 立即生效但不保存，重启恢复。<code>ip nic0 add A</code> 给网卡加额外地址（NAT 出口用）。</p>
 
 <h2 id="apps">应用与 pkg</h2>
-<p>功能都在应用里，内核只带 rescue、dhcp 和 updater。应用从签名的发布版安装：</p>
+<p>功能都在模块里，内核只带 rescue、dhcp 和 updater。应用、文件系统驱动（<code>ext4</code>）、WebAssembly 运行时都是模块，从签名的发布版安装：</p>
 <div class="cmd"><pre>pkg update            # 读取最新清单并校验签名
 pkg list              # 已装版本、可用版本、哪些能升级
 pkg install nat router wireguard
@@ -127,7 +127,7 @@ cfg webadmin password      # 输入两次，不回显</pre></div>
 <tr><td>512 MiB – 1 GiB</td><td>数据分区：崩溃安全的键值存储（设置、已安装的应用）</td></tr>
 <tr><td>1 GiB – 磁盘末尾</td><td>文件分区：标准 ext4，带 jbd2 日志和元数据校验（metadata_csum、64bit），应用各有自己的目录</td></tr>
 </table>
-<p>分区都在第一次启动时创建。文件分区可以拿到 Linux 上直接挂载和 e2fsck；Linux 用默认参数格式化的 ext4，RustROS 也能读写。</p>
+<p>分区都在第一次启动时创建。文件分区由文件系统驱动模块挂载（现在是 <code>ext4</code>；没装驱动时文件分区不挂载，其他功能照常）；它认不出的分区不会被格式化。文件分区可以拿到 Linux 上直接挂载和 e2fsck；Linux 用默认参数格式化的 ext4，RustROS 也能读写。</p>
 
 <h2 id="security">安全</h2>
 <ul>
@@ -165,10 +165,10 @@ It asks you to type <code>yes</code>, writes the image over the system disk and 
 <li>virtio NIC and disk (as KVM clouds give). With several NICs RustROS uses the first</li>
 </ul>
 <h3>Options</h3>
-<p>Passed through <code>sh -s --</code>, e.g. <code>curl -fsSL https://rustros.com/install.sh | sh -s -- --apps shell,webadmin</code>:</p>
+<p>Passed through <code>sh -s --</code>, e.g. <code>curl -fsSL https://rustros.com/install.sh | sh -s -- --apps ext4,shell,webadmin</code>:</p>
 <table>
 <tr><th>Option</th><th>What it does</th></tr>
-<tr><td><code>--apps a,b</code></td><td>apps installed at first boot (default <code>shell</code>)</td></tr>
+<tr><td><code>--apps a,b</code></td><td>apps installed at first boot (default <code>ext4,shell</code>)</td></tr>
 <tr><td><code>--ip A/N --gw G</code></td><td>a static address</td></tr>
 <tr><td><code>--dhcp</code></td><td>DHCP</td></tr>
 <tr><td><code>--panel URL</code></td><td>connect to a management panel</td></tr>
@@ -208,7 +208,7 @@ save           # into the GRUB environment block: kept across reboots</pre></div
 <p><code>ip nic0 A/N GW</code> applies at once but is not saved. <code>ip nic0 add A</code> adds an address (for NAT egress).</p>
 
 <h2 id="apps-en">Apps and pkg</h2>
-<p>What RustROS does is in apps; the kernel carries only rescue, dhcp and the updater. Apps come from the signed releases:</p>
+<p>What RustROS does is in modules; the kernel carries only rescue, dhcp and the updater. Apps, file system drivers (<code>ext4</code>) and the WebAssembly runtime are modules, from the signed releases:</p>
 <div class="cmd"><pre>pkg update            # the latest manifest, signature checked
 pkg list              # installed and available versions, what can be upgraded
 pkg install nat router wireguard
@@ -245,7 +245,7 @@ cfg webadmin password      # asked twice, not shown</pre></div>
 <tr><td>512 MiB – 1 GiB</td><td>data partition: a crash-safe key-value store (settings, installed apps)</td></tr>
 <tr><td>1 GiB – the end</td><td>files partition: a standard ext4 with a jbd2 journal and metadata checksums (metadata_csum, 64bit); each app has its own directory</td></tr>
 </table>
-<p>The partitions are made at first boot. Linux mounts and e2fscks the files partition as it is, and RustROS reads and writes ext4 that Linux formatted with its defaults.</p>
+<p>The partitions are made at first boot. A file system driver module mounts the files partition (<code>ext4</code> for now; without one it stays unmounted and the rest works as usual); a partition it does not recognise is never formatted. Linux mounts and e2fscks the files partition as it is, and RustROS reads and writes ext4 that Linux formatted with its defaults.</p>
 
 <h2 id="security-en">Security</h2>
 <ul>

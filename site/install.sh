@@ -2,7 +2,7 @@
 # Install RustROS on this machine (a Linux VPS or server booted by GRUB).
 #
 #   curl -fsSL https://rustros.com/install.sh | sh
-#   curl -fsSL https://rustros.com/install.sh | sh -s -- --apps shell,webadmin
+#   curl -fsSL https://rustros.com/install.sh | sh -s -- --apps ext4,shell,webadmin
 #
 # Step 1 (this): download the release (its signature and checksums checked),
 # make the disk image for this machine, and boot RustROS once as a test:
@@ -11,7 +11,7 @@
 # writes RustROS over the system disk. Everything on it is lost.
 #
 # Options (python3 /root/rustros/install.py --help for all):
-#   --apps a,b      apps installed at first boot (default: shell)
+#   --apps a,b      apps installed at first boot (default: ext4,shell)
 #   --ip A/N --gw G a static address (default: as Linux has it now; DHCP if Linux got it by DHCP)
 #   --dhcp          DHCP whatever Linux uses
 #   --panel URL     connect to a management panel
@@ -409,7 +409,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--write", action="store_true", help="write the prepared image over the system disk")
     ap.add_argument("--clean", action="store_true", help="not installing after all: remove the test entry and the downloads")
-    ap.add_argument("--apps", default="shell", help="apps installed at first boot, comma separated (default: shell)")
+    ap.add_argument("--apps", default="ext4,shell", help="apps installed at first boot, comma separated (default: ext4,shell)")
     ap.add_argument("--ip", default="", help="a static address A.B.C.D/N")
     ap.add_argument("--gw", default="", help="its gateway")
     ap.add_argument("--dhcp", action="store_true", help="use DHCP")

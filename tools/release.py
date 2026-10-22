@@ -41,6 +41,7 @@ APPS = {
     "wasm": "the WebAssembly runtime for wasm apps",
     "panel": "connects the machine to a management panel",
     "sites": "websites: static files, reverse proxy, Let's Encrypt",
+    "ext4": "the ext4 file system driver: mounts the files partition (journal, metadata checksums)",
 }
 
 

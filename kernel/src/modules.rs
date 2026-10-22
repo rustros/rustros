@@ -10,6 +10,7 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use rustros_api::module::Export;
@@ -17,7 +18,7 @@ use rustros_api::{Module, ModuleInfo, ModuleKind, Caps};
 
 use crate::loader;
 use crate::sys::{Ctx, Kernel};
-use crate::{Global, kprintln};
+use crate::{Global, arch, kprintln};
 
 const PREFIX: &str = "sys/app/";
 /// The WebAssembly runtime is the native module installed under this name.
@@ -79,6 +80,12 @@ static CURRENT_NATIVE: Global<Option<&'static str>> = Global::new(None);
 pub fn current_native() -> Option<&'static str> {
     // Safety: single core; written only by the main loop around app calls.
     unsafe { *CURRENT_NATIVE.get() }
+}
+
+/// The native module the next calls go into; returns the one before.
+pub fn set_current_native(n: Option<&'static str>) -> Option<&'static str> {
+    // Safety: as above
+    unsafe { core::mem::replace(CURRENT_NATIVE.get(), n) }
 }
 
 /// Call into app `id` (with crash attribution and housekeeping afterwards).
@@ -282,9 +289,13 @@ pub fn boot(k: &mut Kernel) {
             }
         }
     }
-    // the runtime first: WebAssembly modules need it
+    // file system drivers first (apps find their files mounted), then the
+    // runtime (WebAssembly modules need it)
     let mut names = installed(k);
-    names.sort_by_key(|n| n != RUNTIME);
+    let fs: Vec<bool> = names.iter().map(|n| get(k, &key(n, ROLE)).as_deref() == Some(ROLE_FS)).collect();
+    let mut order: Vec<(bool, bool, String)> = names.drain(..).zip(fs).map(|(n, fs)| (!fs, n != RUNTIME, n)).collect();
+    order.sort();
+    let names: Vec<String> = order.into_iter().map(|(_, _, n)| n).collect();
     for name in names {
         k.app_ops.push(ModuleOp::Start(name));
     }
@@ -448,6 +459,12 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
             apply_runtime(k, slots, matches!(op, ModuleOp::Start(_)), &pending);
             continue;
         }
+        // a file system driver of that name goes (unmounting what it had)
+        let was_fs = drop_filesystem(k, name);
+        if was_fs && matches!(op, ModuleOp::Stop(_)) {
+            kprintln!("modules: {} stopped", name);
+            continue;
+        }
         // take down the running instance, whatever its form
         let existing = (0..slots.len()).find(|&i| slots[i].kind().is_some() && k.names.get(i) == Some(&name));
         if let Some(id) = existing {
@@ -480,6 +497,10 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
                 unsafe { *CURRENT_NATIVE.get() = None };
                 match r {
                     Ok(m) if matches!(m.export, Some(Export::Module(_))) => Slot::Native(m),
+                    Ok(m) if matches!(m.export, Some(Export::Filesystem(_))) => {
+                        add_filesystem(k, leaked, m, image.len());
+                        continue;
+                    }
                     Ok(_) => {
                         kprintln!("modules: {}: a runtime module must be installed as \"{}\"", name, RUNTIME);
                         Slot::Empty
@@ -530,5 +551,107 @@ pub fn refresh_status(k: &mut Kernel, slots: &mut [Slot]) {
                 st.params = params.iter().map(rustros_api::ParamInfo::from).collect();
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- file system drivers
+
+/// The kv mark a file system driver gets once loaded (so it starts first later).
+const ROLE: &str = "role";
+const ROLE_FS: &[u8] = b"fs";
+
+/// A file system driver loaded: kept, and the files partition mounted with
+/// it if it is the one for it.
+fn add_filesystem(k: &mut Kernel, name: &'static str, m: crate::loader::Module, size: usize) {
+    let Some(Export::Filesystem(fs)) = m.export.as_ref() else { return };
+    let (fs_name, version) = (fs.name(), fs.version());
+    if get(k, &key(name, ROLE)).as_deref() != Some(ROLE_FS) {
+        let _ = put(k, &key(name, ROLE), ROLE_FS);
+    }
+    k.filesystems.push((name, m));
+    kprintln!("modules: {} started (file system {}, {} KiB)", name, fs_name, size / 1024);
+    k.app_status.push(ModuleStatus { name, kind: ModuleKind::Native, state: format!("file system {fs_name}"), restarts: 0, params: Vec::new(), version });
+    mount_files(k);
+}
+
+/// A driver going: the files partition unmounted first if it is its.
+fn drop_filesystem(k: &mut Kernel, name: &str) -> bool {
+    let Some(i) = k.filesystems.iter().position(|(n, _)| *n == name) else { return false };
+    if k.files_fs == Some(i) {
+        k.with_files(|fs, d| fs.close(d));
+        k.files_fs = None;
+        kprintln!("storage: files partition unmounted");
+    } else if let Some(m) = k.files_fs.as_mut() {
+        if *m > i {
+            *m -= 1;
+        }
+    }
+    k.filesystems.remove(i);
+    k.app_status.retain(|s| s.name != name);
+    true
+}
+
+/// The files partition mounted, if it is not yet, with the driver that
+/// recognises it; a blank one is first made with the default (ext4).
+fn mount_files(k: &mut Kernel) {
+    if k.files_fs.is_some() || k.filesystems.is_empty() {
+        return;
+    }
+    let Some(b) = k.boot.as_mut() else { return };
+    let Some((start, sectors)) = b.files else { return };
+    let now = arch::unix_time() as u32;
+    let mut found = None;
+    for (i, (name, m)) in k.filesystems.iter_mut().enumerate() {
+        let Some(Export::Filesystem(fs)) = m.export.as_mut() else { continue };
+        let mut d = crate::sys::PartDisk { disk: &mut *b.disk, start, sectors };
+        let before = set_current_native(Some(name));
+        let mine = fs.probe(&mut d);
+        set_current_native(before);
+        if mine {
+            found = Some(i);
+            break;
+        }
+    }
+    if found.is_none() {
+        // nothing recognises it: made anew only if it holds nothing at all
+        let mut head = vec![0u8; 128 * 1024];
+        if !b.disk.read(start, &mut head) || head.iter().any(|&x| x != 0) {
+            kprintln!("storage: files partition: no installed file system driver recognises it (left alone)");
+            return;
+        }
+        let i = k.filesystems.iter().position(|(_, m)| matches!(m.export.as_ref(), Some(Export::Filesystem(fs)) if fs.name() == "ext4")).unwrap_or(0);
+        let (name, m) = &mut k.filesystems[i];
+        let Some(Export::Filesystem(fs)) = m.export.as_mut() else { return };
+        let mut uuid = [0u8; 16];
+        uuid[..8].copy_from_slice(&arch::rdtsc().to_le_bytes());
+        uuid[8..].copy_from_slice(&arch::rdtsc().rotate_left(29).to_le_bytes());
+        let mut d = crate::sys::PartDisk { disk: &mut *b.disk, start, sectors };
+        let before = set_current_native(Some(name));
+        let r = fs.format(&mut d, uuid, now);
+        set_current_native(before);
+        match r {
+            Ok(()) => kprintln!("storage: files partition formatted ({})", fs.name()),
+            Err(e) => {
+                kprintln!("storage: files partition: cannot format: {}", e);
+                return;
+            }
+        }
+        found = Some(i);
+    }
+    let i = found.expect("found or made");
+    k.files_fs = Some(i);
+    match k.with_files(|fs, d| fs.mount(d, now)) {
+        Some(Ok(msg)) => {
+            kprintln!("storage: files partition {}", msg);
+            let name = k.filesystems[i].0;
+            if let Some(st) = k.app_status.iter_mut().find(|s| s.name == name) {
+                st.state.push_str(", files partition mounted");
+            }
+        }
+        Some(Err(e)) => {
+            kprintln!("storage: files partition: {}", e);
+            k.files_fs = None;
+        }
+        None => k.files_fs = None,
     }
 }

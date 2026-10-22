@@ -15,8 +15,9 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 
-use crate::sys::Module;
+use crate::sys::{KvError, Module};
 
 pub const ENTRY: &str = "rustros_module_init";
 
@@ -37,6 +38,50 @@ pub enum Export {
     Module(Box<dyn Module>),
     /// Runs applications in another format (the WebAssembly runtime).
     Runtime(Box<dyn Runtime>),
+    /// A file system driver ("ext4", "xfs", ...): the kernel mounts the
+    /// files partition with the one that recognises it.
+    Filesystem(Box<dyn Filesystem>),
+}
+
+/// A file system driver, a module of its own. The kernel lends it the files
+/// partition's sectors; apps reach the mounted file system through `Kv`'s
+/// file calls (each in its own directory). Paths are from its root.
+pub trait Filesystem {
+    /// The file system's name: "ext4", "xfs", ...
+    fn name(&self) -> &'static str;
+    /// The release this driver is from (see `BUILD`).
+    fn version(&self) -> &'static str {
+        crate::BUILD
+    }
+    /// Whether `disk` holds this file system.
+    fn probe(&mut self, disk: &mut dyn Disk) -> bool;
+    /// Make an empty one on `disk` (the kernel asks only for a blank partition).
+    fn format(&mut self, disk: &mut dyn Disk, uuid: [u8; 16], now: u32) -> Result<(), String>;
+    /// Mount it (a line for the log).
+    fn mount(&mut self, disk: &mut dyn Disk, now: u32) -> Result<String, String>;
+    /// (total, used) bytes of the mounted file system.
+    fn usage(&self) -> (u64, u64);
+    /// Create or replace a whole file (the directories above it are made).
+    fn put(&mut self, disk: &mut dyn Disk, path: &str, data: &[u8], now: u32) -> Result<(), KvError>;
+    /// Bytes of a file from `offset`: how many (0 at its end).
+    fn read(&mut self, disk: &mut dyn Disk, path: &str, offset: u64, buf: &mut [u8]) -> Option<usize>;
+    /// (size, modification time, directory)
+    fn stat(&mut self, disk: &mut dyn Disk, path: &str) -> Option<(u64, u64, bool)>;
+    /// A directory's entries: (name, size, directory).
+    fn list(&mut self, disk: &mut dyn Disk, path: &str) -> Option<Vec<(String, u64, bool)>>;
+    /// Remove a file or an empty directory; false if there was none.
+    fn remove(&mut self, disk: &mut dyn Disk, path: &str, now: u32) -> bool;
+    /// Everything to the disk, the file system marked clean (a planned restart).
+    fn close(&mut self, disk: &mut dyn Disk);
+}
+
+/// Sectors the kernel lends a module: LBAs count from their start.
+pub trait Disk {
+    /// `buf.len()` bytes (a multiple of 512) from sector `lba`.
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool;
+    /// Durable when it returns true.
+    fn write(&mut self, lba: u64, buf: &[u8]) -> bool;
+    fn sectors(&self) -> u64;
 }
 
 /// An application runtime: turns application images of its format into apps.

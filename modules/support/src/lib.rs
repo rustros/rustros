@@ -96,6 +96,20 @@ macro_rules! export_module {
     };
 }
 
+/// Export a file system driver.
+#[macro_export]
+macro_rules! export_filesystem {
+    ($ctor:expr) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rustros_module_init(
+            host: *const $crate::rustros_api::module::HostTable,
+            out: *mut Option<$crate::rustros_api::module::Export>,
+        ) -> u64 {
+            unsafe { $crate::init(host, out, || $crate::rustros_api::module::Export::Filesystem($crate::Box::new($ctor))) }
+        }
+    };
+}
+
 /// Export an application runtime (e.g. the WebAssembly runtime).
 #[macro_export]
 macro_rules! export_runtime {

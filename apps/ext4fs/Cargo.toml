@@ -1,0 +1,14 @@
+[package]
+name = "ext4fs"
+version.workspace = true
+edition.workspace = true
+description = "the ext4 file system driver module"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+rustros-api = { path = "../../api" }
+devices = { path = "../../devices" }
+ext4 = { path = "../../ext4" }

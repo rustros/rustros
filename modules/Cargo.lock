@@ -262,6 +262,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "devices"
+version = "0.1.0"
+dependencies = [
+ "rustros-api",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -342,6 +349,30 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "ext4"
+version = "0.1.0"
+dependencies = [
+ "devices",
+]
+
+[[package]]
+name = "ext4-mod"
+version = "0.1.0"
+dependencies = [
+ "ext4fs",
+ "rustros-module",
+]
+
+[[package]]
+name = "ext4fs"
+version = "0.1.0"
+dependencies = [
+ "devices",
+ "ext4",
+ "rustros-api",
 ]
 
 [[package]]

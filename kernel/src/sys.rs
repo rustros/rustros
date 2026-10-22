@@ -16,7 +16,7 @@ use rustros_api::{
 
 use devices::{BlockDevice, NetDevice};
 
-use rustros_api::module::{Export, Runtime};
+use rustros_api::module::{Export, Filesystem, Runtime};
 
 use crate::{arch, console, kprintln, modules};
 
@@ -32,8 +32,33 @@ pub struct Boot {
     pub store: Option<(Store, storage::Info)>,
     /// this boot's console log (cache partition)
     pub log: Option<crate::klog::DiskLog>,
-    /// the files partition: (its ext4, first sector)
-    pub files: Option<(ext4::Fs, u64)>,
+    /// the files partition: (first sector, sectors); its file system is a module's
+    pub files: Option<(u64, u64)>,
+}
+
+/// The files partition, lent to a file system driver (LBAs from its start).
+pub struct PartDisk<'a> {
+    pub disk: &'a mut dyn BlockDevice,
+    pub start: u64,
+    pub sectors: u64,
+}
+
+impl PartDisk<'_> {
+    fn inside(&self, lba: u64, len: usize) -> bool {
+        len % 512 == 0 && lba.checked_add(len as u64 / 512).is_some_and(|end| end <= self.sectors)
+    }
+}
+
+impl rustros_api::module::Disk for PartDisk<'_> {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        self.inside(lba, buf.len()) && self.disk.read(self.start + lba, buf)
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> bool {
+        self.inside(lba, buf.len()) && self.disk.write(self.start + lba, buf)
+    }
+    fn sectors(&self) -> u64 {
+        self.sectors
+    }
 }
 
 /// A logical interface: a NIC, or a VLAN on one. The NICs come first, so
@@ -108,6 +133,10 @@ pub struct Kernel {
     pub builtin_names: Vec<&'static str>,
     /// The WebAssembly runtime: a native module installed as "wasm".
     pub runtime_module: Option<crate::loader::Module>,
+    /// file system drivers: (module name, module)
+    pub filesystems: Vec<(&'static str, crate::loader::Module)>,
+    /// the driver that has the files partition mounted
+    pub files_fs: Option<usize>,
     /// Requested installs/switches/removals, applied by the main loop.
     pub app_ops: Vec<modules::ModuleOp>,
     pub app_status: Vec<modules::ModuleStatus>,
@@ -143,6 +172,8 @@ impl Kernel {
             caps: Vec::new(),
             builtin_names: Vec::new(),
             runtime_module: None,
+            filesystems: Vec::new(),
+            files_fs: None,
             app_ops: Vec::new(),
             app_status: Vec::new(),
             unstable_boots: 1,
@@ -247,11 +278,24 @@ impl Kernel {
             if let Some(l) = b.log.as_mut() {
                 l.flush(&mut *b.disk);
             }
-            // the files partition marked clean (else the next mount just finds an empty log)
-            if let Some((fs, start)) = b.files.as_mut() {
-                let _ = fs.close(&mut ext4::Vol { dev: &mut *b.disk, start: *start });
-            }
         }
+        // the files partition marked clean (else the next mount just finds an empty log)
+        self.with_files(|fs, d| fs.close(d));
+    }
+
+    /// A call into the driver that has the files partition mounted (a crash
+    /// in it is pinned on that module).
+    pub fn with_files<T>(&mut self, f: impl FnOnce(&mut dyn Filesystem, &mut PartDisk) -> T) -> Option<T> {
+        let i = self.files_fs?;
+        let b = self.boot.as_mut()?;
+        let (start, sectors) = b.files?;
+        let (name, m) = self.filesystems.get_mut(i)?;
+        let Some(Export::Filesystem(fs)) = m.export.as_mut() else { return None };
+        let mut d = PartDisk { disk: &mut *b.disk, start, sectors };
+        let before = modules::set_current_native(Some(name));
+        let r = f(fs.as_mut(), &mut d);
+        modules::set_current_native(before);
+        Some(r)
     }
 
     pub fn runtime(&mut self) -> Option<&mut dyn Runtime> {
@@ -571,46 +615,33 @@ impl Kv for Ctx<'_> {
             return Err(KvError::TooLarge);
         }
         let now = arch::unix_time() as u32;
-        let b = self.k.boot.as_mut().ok_or(KvError::NoStorage)?;
-        let (fs, start) = b.files.as_mut().ok_or(KvError::NoStorage)?;
-        let mut v = ext4::Vol { dev: &mut *b.disk, start: *start };
-        fs.write_file(&mut v, &path, data, now).map_err(|e| match e {
-            ext4::Error::Full => KvError::Full,
-            ext4::Error::Io => KvError::Io,
-            _ => KvError::TooLarge,
-        })
+        self.k.with_files(|fs, d| fs.put(d, &path, data, now)).unwrap_or(Err(KvError::NoStorage))
     }
     fn file_read(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Option<usize> {
         let path = self.file_path(name)?;
-        let b = self.k.boot.as_mut()?;
-        let (fs, start) = b.files.as_mut()?;
-        fs.read(&mut ext4::Vol { dev: &mut *b.disk, start: *start }, &path, offset, buf).ok()
+        self.k.with_files(|fs, d| fs.read(d, &path, offset, buf))?
     }
     fn file_stat(&mut self, name: &str) -> Option<(u64, u64)> {
         let path = self.file_path(name)?;
-        let b = self.k.boot.as_mut()?;
-        let (fs, start) = b.files.as_mut()?;
-        let st = fs.stat(&mut ext4::Vol { dev: &mut *b.disk, start: *start }, &path).ok()?;
-        (!st.dir).then_some((st.size, st.mtime as u64))
+        let (size, mtime, dir) = self.k.with_files(|fs, d| fs.stat(d, &path))??;
+        (!dir).then_some((size, mtime))
     }
     fn file_list(&mut self, prefix: &str) -> Vec<(String, u64)> {
         let owner = format!("/{}", self.app_name());
-        let Some(b) = self.k.boot.as_mut() else { return Vec::new() };
-        let Some((fs, start)) = b.files.as_mut() else { return Vec::new() };
-        let mut v = ext4::Vol { dev: &mut *b.disk, start: *start };
         let mut out = Vec::new();
         let mut dirs = alloc::vec![String::new()];
         while let Some(rel) = dirs.pop() {
-            let Ok(list) = fs.list(&mut v, &format!("{owner}/{rel}")) else { continue };
-            for (name, st) in list {
+            let path = format!("{owner}/{rel}");
+            let Some(Some(list)) = self.k.with_files(|fs, d| fs.list(d, &path)) else { continue };
+            for (name, size, dir) in list {
                 let p = if rel.is_empty() { name } else { format!("{rel}/{name}") };
-                if st.dir {
+                if dir {
                     // only directories that can hold something under the prefix
                     if prefix.starts_with(&p) || p.starts_with(prefix.trim_end_matches('/')) || prefix.is_empty() {
                         dirs.push(p);
                     }
                 } else if p.starts_with(prefix) {
-                    out.push((p, st.size));
+                    out.push((p, size));
                 }
             }
         }
@@ -620,13 +651,13 @@ impl Kv for Ctx<'_> {
     fn file_delete(&mut self, name: &str) -> bool {
         let Some(path) = self.file_path(name) else { return false };
         let now = arch::unix_time() as u32;
-        let Some(b) = self.k.boot.as_mut() else { return false };
-        let Some((fs, start)) = b.files.as_mut() else { return false };
-        fs.remove(&mut ext4::Vol { dev: &mut *b.disk, start: *start }, &path, now).unwrap_or(false)
+        self.k.with_files(|fs, d| fs.remove(d, &path, now)).unwrap_or(false)
     }
     fn files_usage(&self) -> Option<(u64, u64)> {
-        let (total, free) = self.k.boot.as_ref()?.files.as_ref()?.0.usage();
-        Some((total, total - free))
+        match self.k.filesystems.get(self.k.files_fs?)?.1.export.as_ref()? {
+            Export::Filesystem(fs) => Some(fs.usage()),
+            _ => None,
+        }
     }
 }
 
