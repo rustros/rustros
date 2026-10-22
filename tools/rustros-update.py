@@ -80,6 +80,9 @@ def command(host, port, key, cmd, payload=b"", encrypt=False):
     if len(payload) > 65536:
         print(f"  ({time.time() - t0:.1f}s)")
     s.sendall(mac)
+    # on a slow link most of the payload may still be on its way: the answer
+    # comes once it has arrived and been written
+    s.settimeout(max(s.gettimeout() or 10, 30 + len(payload) // 4096))
     reply = b""
     try:
         # 'I' and listings send several lines and close; the others answer one line

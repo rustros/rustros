@@ -181,6 +181,8 @@ impl VirtioNet {
             }
             want |= F_CSUM | F_HOST_TSO4 | F_HOST_ECN;
         }
+        // interrupts by message where the device can: some hosts give no line
+        let msix = dev.enable_msix(pci, crate::arch::MSI_VECTOR);
         let mut feat = dev.begin(want)?;
         if !dev.is_modern() && modern {
             // fell back to legacy: none of the modern-only features
@@ -271,11 +273,19 @@ impl VirtioNet {
             );
         }
         let line = pci.read8(0x3C);
-        n.irq = n.dev.isr().is_some_and(|isr| crate::virtio::register_irq(line, isr));
-        if n.irq {
-            pci.enable_intx();
+        if msix && n.dev.msix_ok() {
+            n.irq = true;
+            crate::kprintln!("net: interrupts by MSI-X");
+        } else if msix {
+            // with MSI-X on, the line stays quiet too
+            crate::kprintln!("net: the device refused an MSI-X vector, the timer paces receiving");
         } else {
-            crate::kprintln!("net: no usable interrupt line ({}), the timer paces receiving", line);
+            n.irq = n.dev.isr().is_some_and(|isr| crate::virtio::register_irq(line, isr));
+            if n.irq {
+                pci.enable_intx();
+            } else {
+                crate::kprintln!("net: no usable interrupt line ({}), the timer paces receiving", line);
+            }
         }
         Some(n)
     }

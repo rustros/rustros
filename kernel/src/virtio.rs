@@ -91,6 +91,10 @@ pub struct Virtio {
     legacy_io: Option<Lio>,
     /// "00:05.0", for messages
     at: alloc::string::String,
+    /// queues interrupt by MSI-X (table entry 0)
+    msix: bool,
+    /// the device did not take an MSI-X vector for a queue
+    msix_refused: core::cell::Cell<bool>,
 }
 
 unsafe fn rd<T>(a: usize) -> T {
@@ -113,6 +117,7 @@ const C_DFSEL: usize = 0;
 const C_DF: usize = 4;
 const C_GFSEL: usize = 8;
 const C_GF: usize = 12;
+const C_MSIX_CONFIG: usize = 16;
 const C_STATUS: usize = 20;
 const C_QSEL: usize = 22;
 const C_QSIZE: usize = 24;
@@ -131,6 +136,10 @@ const L_QSIZE: u16 = 12;
 const L_QSEL: u16 = 14;
 const L_QNOTIFY: u16 = 16;
 const L_STATUS: u16 = 18;
+/// with MSI-X on: the vectors for configuration changes and the selected
+/// queue come here, and the device's configuration moves 4 bytes on
+const L_CVEC: u16 = 20;
+const L_QVEC: u16 = 22;
 const L_CONFIG: u16 = 20;
 
 impl Virtio {
@@ -198,7 +207,7 @@ impl Virtio {
                 }
             },
         };
-        Some(Virtio { t, legacy_io, at })
+        Some(Virtio { t, legacy_io, at, msix: false, msix_refused: core::cell::Cell::new(false) })
     }
 
     /// The ISR status register (reading it acknowledges the interrupt).
@@ -209,6 +218,46 @@ impl Virtio {
             Transport::Legacy { io: Lio::Port(p) } => Some(Isr::Port(p + 19)),
             Transport::Legacy { io: Lio::Mem(a) } => Some(Isr::Mmio(a + 19)),
         }
+    }
+
+    /// Interrupt by MSI-X on `vector` of this CPU (before `begin`): true if
+    /// the device has MSI-X and the local APIC works. Whether the device
+    /// took it shows once the queues are set up (`msix_ok`).
+    pub fn enable_msix(&mut self, pci: &PciDev, vector: u8) -> bool {
+        let Some(apic) = crate::arch::lapic_init() else { return false };
+        let Some(cap) = pci.caps().find(|&c| pci.read8(c) == 0x11) else { return false };
+        let ctl = pci.read16(cap + 2);
+        let table = pci.read32(cap + 4);
+        let (base, io) = pci.bar((table & 7) as u8);
+        let entries = (ctl & 0x7FF) as u64 + 1;
+        let at = base + (table & !7) as u64;
+        if io || base == 0 || !crate::mem::map_device(at, 16 * entries) {
+            return false;
+        }
+        unsafe {
+            // every entry masked but the first, which all queues use
+            for e in 0..entries as usize {
+                wr::<u32>(at as usize + 16 * e + 12, 1);
+            }
+            let e = at as usize;
+            wr::<u32>(e, 0xFEE0_0000 | (apic as u32) << 12);
+            wr::<u32>(e + 4, 0);
+            wr::<u32>(e + 8, vector as u32); // fixed delivery, edge
+            wr::<u32>(e + 12, 0);
+        }
+        pci.write16(cap + 2, (ctl | 0x8000) & !0x4000);
+        self.msix = true;
+        true
+    }
+
+    /// The queues interrupt by MSI-X.
+    pub fn msix_ok(&self) -> bool {
+        self.msix && !self.msix_refused.get()
+    }
+
+    /// Where a legacy device's own configuration starts.
+    fn l_config(&self) -> u16 {
+        if self.msix { L_CONFIG + 4 } else { L_CONFIG }
     }
 
     pub fn is_modern(&self) -> bool {
@@ -314,7 +363,7 @@ impl Virtio {
         unsafe {
             match self.t {
                 Transport::Modern { device, .. } => rd::<u8>(device + off),
-                Transport::Legacy { io } => io.r8(L_CONFIG + off as u16),
+                Transport::Legacy { io } => io.r8(self.l_config() + off as u16),
             }
         }
     }
@@ -323,7 +372,7 @@ impl Virtio {
         unsafe {
             match self.t {
                 Transport::Modern { device, .. } => rd::<u32>(device + off),
-                Transport::Legacy { io } => io.r32(L_CONFIG + off as u16),
+                Transport::Legacy { io } => io.r32(self.l_config() + off as u16),
             }
         }
     }
@@ -358,7 +407,15 @@ impl Virtio {
             let notify = match self.t {
                 Transport::Modern { common, notify, notify_mul, .. } => {
                     wr::<u16>(common + C_QSIZE, size);
-                    wr::<u16>(common + C_QMSIX, 0xFFFF);
+                    if self.msix {
+                        wr::<u16>(common + C_MSIX_CONFIG, 0xFFFF);
+                        wr::<u16>(common + C_QMSIX, 0);
+                        if rd::<u16>(common + C_QMSIX) != 0 {
+                            self.msix_refused.set(true);
+                        }
+                    } else {
+                        wr::<u16>(common + C_QMSIX, 0xFFFF);
+                    }
                     wr::<u64>(common + C_QDESC, desc as u64);
                     wr::<u64>(common + C_QDRIVER, avail as u64);
                     wr::<u64>(common + C_QDEVICE, used as u64);
@@ -367,6 +424,13 @@ impl Virtio {
                     Notify::Mmio(notify + off * notify_mul as usize)
                 }
                 Transport::Legacy { io } => {
+                    if self.msix {
+                        io.w16(L_CVEC, 0xFFFF);
+                        io.w16(L_QVEC, 0);
+                        if io.r16(L_QVEC) != 0 {
+                            self.msix_refused.set(true);
+                        }
+                    }
                     io.w32(L_QPFN, (mem >> 12) as u32);
                     match io {
                         Lio::Port(p) => Notify::Port(p + L_QNOTIFY),

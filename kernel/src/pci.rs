@@ -30,6 +30,10 @@ impl PciDev {
     }
     // Some devices (QEMU's i6300esb) only act on config writes of the exact
     // register width, so these must not be emulated with 32-bit writes.
+    pub fn read16(&self, off: u8) -> u16 {
+        (self.read32(off & !3) >> ((off & 2) * 8)) as u16
+    }
+
     pub fn write16(&self, off: u8, v: u16) {
         unsafe {
             outl(0xCF8, addr(self.bus, self.dev, self.func, off));

@@ -399,3 +399,72 @@ pub fn unix_time() -> u64 {
         b => b + now_ms() / 1000,
     }
 }
+
+// ---------------------------------------------------------------- local APIC
+
+/// Where boot.rs's `isr_other` acknowledges (EOI) interrupts of vectors >= 48.
+const LAPIC: u64 = 0xFEE0_0000;
+/// The vector devices' MSI-X messages arrive on (handled by `isr_other`).
+pub const MSI_VECTOR: u8 = 0x50;
+
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe { asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack)) }
+    (hi as u64) << 32 | lo as u64
+}
+
+unsafe fn wrmsr(msr: u32, v: u64) {
+    unsafe { asm!("wrmsr", in("ecx") msr, in("eax") v as u32, in("edx") (v >> 32) as u32, options(nomem, nostack)) }
+}
+
+/// The local APIC's id once it takes message-signalled interrupts (see
+/// `lapic_init`).
+static LAPIC_ID: Global<Option<Option<u8>>> = Global::new(None);
+
+/// Switch the local APIC on (xAPIC mode, at its usual address) so devices
+/// can interrupt us by message (MSI-X); the PIC's interrupts keep coming
+/// through LINT0. Returns our APIC id, None if there is no usable APIC.
+pub fn lapic_init() -> Option<u8> {
+    // Safety: single core; done once, at boot.
+    let cached = unsafe { LAPIC_ID.get() };
+    if let Some(id) = *cached {
+        return id;
+    }
+    let id = lapic_setup();
+    *cached = Some(id);
+    id
+}
+
+fn lapic_setup() -> Option<u8> {
+    use core::arch::x86_64::__cpuid;
+    if __cpuid(1).edx & (1 << 9) == 0 {
+        return None;
+    }
+    unsafe {
+        let mut base = rdmsr(0x1B);
+        if base & 0xFFFF_F000 != LAPIC {
+            return None; // moved: isr_other would acknowledge at the wrong place
+        }
+        if base & (1 << 10) != 0 {
+            // x2APIC (no MMIO): back to xAPIC goes through "disabled"
+            wrmsr(0x1B, base & !(3 << 10));
+            base &= !(3 << 10);
+        }
+        if base & (1 << 11) == 0 {
+            wrmsr(0x1B, base | 1 << 11);
+        }
+        if !crate::mem::map_device(LAPIC, 4096) {
+            return None;
+        }
+        let reg = |off: u64| (LAPIC + off) as *mut u32;
+        let svr = core::ptr::read_volatile(reg(0xF0));
+        if svr & 0x100 == 0 {
+            // it was off: wire the PIC through LINT0 (ExtINT) and NMIs through LINT1
+            core::ptr::write_volatile(reg(0x350), 0x700);
+            core::ptr::write_volatile(reg(0x360), 0x400);
+        }
+        core::ptr::write_volatile(reg(0x80), 0); // accept every priority
+        core::ptr::write_volatile(reg(0xF0), 0x1FF); // enabled, spurious vector 0xFF
+        Some((core::ptr::read_volatile(reg(0x20)) >> 24) as u8)
+    }
+}
