@@ -2,7 +2,7 @@
 # unlike the kernel). Built by `make modules`; each module is a static-pie
 # ELF whose entry point is rustros_module_init.
 [workspace]
-members = ["support", "echo", "crashy", "httpd", "shell", "nat", "l2tp", "router", "cake", "wasm", "webadmin", "wireguard", "proxy"]
+members = ["support", "echo", "crashy", "httpd", "shell", "nat", "l2tp", "router", "cake", "wasm", "webadmin", "wireguard", "proxy", "anytls"]
 resolver = "3"
 
 [workspace.package]

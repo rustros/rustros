@@ -38,6 +38,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "anytls"
+version = "0.1.0"
+dependencies = [
+ "rustros-api",
+ "rustros-util",
+ "tls",
+]
+
+[[package]]
+name = "anytls-mod"
+version = "0.1.0"
+dependencies = [
+ "anytls",
+ "rustros-module",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -291,6 +308,7 @@ version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
+ "pkcs8",
  "signature",
 ]
 
@@ -319,6 +337,7 @@ dependencies = [
  "generic-array",
  "group",
  "hkdf",
+ "pkcs8",
  "rand_core",
  "sec1",
  "subtle",

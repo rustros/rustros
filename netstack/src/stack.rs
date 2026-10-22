@@ -66,7 +66,7 @@ impl Stack {
     pub fn new(mac: [u8; 6], ip: Ip, mask: Ip, gw: Ip) -> Stack {
         Stack {
             ifs: Ifaces(alloc::vec![Iface::new(0, mac, ip, mask, gw)], Vec::new(), VecDeque::new()),
-            tcp: Tcp::new(256),
+            tcp: Tcp::new(1024),
             listeners: Vec::new(),
             udp: Vec::new(),
             raw: Vec::new(),

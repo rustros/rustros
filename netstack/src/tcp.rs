@@ -25,7 +25,7 @@ const SYN_RETRIES: u32 = 5;
 const TIME_WAIT_MS: u64 = 2000;
 const FIN_WAIT2_MS: u64 = 60_000;
 /// Connections per listening port that the application has not accepted yet.
-const BACKLOG: usize = 16;
+const BACKLOG: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
@@ -462,7 +462,11 @@ impl Tcp {
             }
             let live = self.slots.iter().filter(|s| s.sock.is_some()).count();
             let waiting = self.connections().filter(|s| s.lport == dport && !s.accepted).count();
-            if flags & (SYN | ACK) == SYN && self.listening.contains(&dport) && live < self.max_conns && waiting < BACKLOG {
+            if flags & (SYN | ACK) == SYN && self.listening.contains(&dport) && (live >= self.max_conns || waiting >= BACKLOG) {
+                // full: dropped, not refused, so the client tries again (as Linux does)
+                return;
+            }
+            if flags & (SYN | ACK) == SYN && self.listening.contains(&dport) {
                 let iss = link.random() as u32;
                 let s = Sock {
                     state: State::SynRcvd,

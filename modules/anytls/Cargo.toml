@@ -1,0 +1,14 @@
+[package]
+name = "anytls-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "anytls"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+anytls = { path = "../../apps/anytls" }

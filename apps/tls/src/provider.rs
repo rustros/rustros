@@ -502,11 +502,142 @@ static ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
 
 // ---------------------------------------------------------------- the provider
 
+// ---------------------------------------------------------------- server keys
+
+/// Private keys of server certificates: ECDSA P-256, Ed25519 and RSA (PKCS#8,
+/// SEC1 or PKCS#1), signing as TLS 1.3 allows.
 #[derive(Debug)]
-struct NoKeys;
-impl KeyProvider for NoKeys {
-    fn load_private_key(&self, _key: PrivateKeyDer<'static>) -> Result<Arc<dyn SigningKey>, rustls::Error> {
-        Err(rustls::Error::General("no client certificates".into()))
+struct Keys;
+impl KeyProvider for Keys {
+    fn load_private_key(&self, key: PrivateKeyDer<'static>) -> Result<Arc<dyn SigningKey>, rustls::Error> {
+        use p256::pkcs8::DecodePrivateKey;
+        let bad = || rustls::Error::General("unsupported private key (ECDSA P-256, Ed25519 or RSA)".into());
+        match &key {
+            PrivateKeyDer::Pkcs8(k) => {
+                let der = k.secret_pkcs8_der();
+                if let Ok(k) = p256::ecdsa::SigningKey::from_pkcs8_der(der) {
+                    return Ok(Arc::new(EcdsaKey(k)));
+                }
+                if let Ok(k) = ed25519_dalek::SigningKey::from_pkcs8_der(der) {
+                    return Ok(Arc::new(Ed25519Key(k)));
+                }
+                if let Ok(k) = rsa::RsaPrivateKey::from_pkcs8_der(der) {
+                    return Ok(Arc::new(RsaKey(k)));
+                }
+                Err(bad())
+            }
+            PrivateKeyDer::Sec1(k) => p256::SecretKey::from_sec1_der(k.secret_sec1_der()).map(|k| Arc::new(EcdsaKey(k.into())) as Arc<dyn SigningKey>).map_err(|_| bad()),
+            PrivateKeyDer::Pkcs1(k) => {
+                use rsa::pkcs1::DecodeRsaPrivateKey;
+                rsa::RsaPrivateKey::from_pkcs1_der(k.secret_pkcs1_der()).map(|k| Arc::new(RsaKey(k)) as Arc<dyn SigningKey>).map_err(|_| bad())
+            }
+            _ => Err(bad()),
+        }
+    }
+}
+
+struct EcdsaKey(p256::ecdsa::SigningKey);
+impl core::fmt::Debug for EcdsaKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("EcdsaKey")
+    }
+}
+impl SigningKey for EcdsaKey {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
+        offered.contains(&SignatureScheme::ECDSA_NISTP256_SHA256).then(|| Box::new(EcdsaSigner(self.0.clone())) as Box<dyn rustls::sign::Signer>)
+    }
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::ECDSA
+    }
+}
+struct EcdsaSigner(p256::ecdsa::SigningKey);
+impl core::fmt::Debug for EcdsaSigner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("EcdsaSigner")
+    }
+}
+impl rustls::sign::Signer for EcdsaSigner {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        use p256::ecdsa::signature::Signer;
+        let sig: p256::ecdsa::Signature = self.0.sign(message);
+        Ok(sig.to_der().as_bytes().to_vec())
+    }
+    fn scheme(&self) -> SignatureScheme {
+        SignatureScheme::ECDSA_NISTP256_SHA256
+    }
+}
+
+struct Ed25519Key(ed25519_dalek::SigningKey);
+impl core::fmt::Debug for Ed25519Key {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Ed25519Key")
+    }
+}
+impl SigningKey for Ed25519Key {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
+        offered.contains(&SignatureScheme::ED25519).then(|| Box::new(Ed25519Signer(self.0.clone())) as Box<dyn rustls::sign::Signer>)
+    }
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::ED25519
+    }
+}
+struct Ed25519Signer(ed25519_dalek::SigningKey);
+impl core::fmt::Debug for Ed25519Signer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Ed25519Signer")
+    }
+}
+impl rustls::sign::Signer for Ed25519Signer {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        use ed25519_dalek::Signer;
+        Ok(self.0.sign(message).to_bytes().to_vec())
+    }
+    fn scheme(&self) -> SignatureScheme {
+        SignatureScheme::ED25519
+    }
+}
+
+struct RsaKey(rsa::RsaPrivateKey);
+impl core::fmt::Debug for RsaKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RsaKey")
+    }
+}
+impl SigningKey for RsaKey {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
+        // TLS 1.3: RSA signs with PSS
+        [SignatureScheme::RSA_PSS_SHA256, SignatureScheme::RSA_PSS_SHA384]
+            .into_iter()
+            .find(|s| offered.contains(s))
+            .map(|s| Box::new(RsaSigner(self.0.clone(), s)) as Box<dyn rustls::sign::Signer>)
+    }
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::RSA
+    }
+}
+struct RsaSigner(rsa::RsaPrivateKey, SignatureScheme);
+impl core::fmt::Debug for RsaSigner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RsaSigner")
+    }
+}
+impl rustls::sign::Signer for RsaSigner {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+        let fail = |_| rustls::Error::General("RSA signing failed".into());
+        match self.1 {
+            SignatureScheme::RSA_PSS_SHA384 => {
+                let k = rsa::pss::BlindedSigningKey::<sha2::Sha384>::new(self.0.clone());
+                k.try_sign_with_rng(&mut Rng, message).map(|s| s.to_vec()).map_err(fail)
+            }
+            _ => {
+                let k = rsa::pss::BlindedSigningKey::<sha2::Sha256>::new(self.0.clone());
+                k.try_sign_with_rng(&mut Rng, message).map(|s| s.to_vec()).map_err(fail)
+            }
+        }
+    }
+    fn scheme(&self) -> SignatureScheme {
+        self.1
     }
 }
 
@@ -523,6 +654,6 @@ pub fn provider() -> CryptoProvider {
         kx_groups: alloc::vec![&X25519_KX, &P256_KX],
         signature_verification_algorithms: ALGORITHMS,
         secure_random: &Random,
-        key_provider: &NoKeys,
+        key_provider: &Keys,
     }
 }

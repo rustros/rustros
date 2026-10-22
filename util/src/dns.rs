@@ -87,3 +87,68 @@ mod tests {
         assert!(query(1, "").is_none() && query(1, "a..b").is_none());
     }
 }
+
+/// One name being looked up, polled: `Lookup::start`, then `poll` until it
+/// says how it ended.
+pub struct Lookup {
+    sock: rustros_api::UdpSocket,
+    id: u16,
+    server: Ip,
+    name: alloc::string::String,
+    sent: u64,
+    tries: u8,
+}
+
+/// How a lookup ended.
+pub enum Looked {
+    Found(Ip),
+    /// The name does not resolve (or is no name).
+    NoSuchName,
+    /// The server did not answer.
+    NoAnswer,
+}
+
+impl Lookup {
+    const RETRY_MS: u64 = 2000;
+    const TRIES: u8 = 3;
+
+    pub fn start(net: &mut dyn rustros_api::Net, name: &str, server: Ip) -> Option<Lookup> {
+        let sock = net.udp_bind(0).ok()?;
+        Some(Lookup { sock, id: net.random() as u16, server, name: alloc::string::String::from(name), sent: 0, tries: 0 })
+    }
+
+    /// None while waiting; the socket is closed once it has ended.
+    pub fn poll(&mut self, net: &mut dyn rustros_api::Net, now: u64) -> Option<Looked> {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = net.udp_recv_from(self.sock, &mut buf) {
+            if from.ip != self.server {
+                continue;
+            }
+            match answer(&buf[..n], self.id) {
+                Some(Ok(ip)) => return Some(self.end(net, Looked::Found(ip))),
+                Some(Err(())) => return Some(self.end(net, Looked::NoSuchName)),
+                None => {}
+            }
+        }
+        if self.sent == 0 || now - self.sent >= Self::RETRY_MS {
+            if self.tries >= Self::TRIES {
+                return Some(self.end(net, Looked::NoAnswer));
+            }
+            self.tries += 1;
+            self.sent = now.max(1);
+            let Some(q) = query(self.id, &self.name) else { return Some(self.end(net, Looked::NoSuchName)) };
+            let _ = net.udp_send_to(self.sock, rustros_api::SocketAddr { ip: self.server, port: 53 }, &q);
+        }
+        None
+    }
+
+    /// Give up (the socket is closed).
+    pub fn cancel(self, net: &mut dyn rustros_api::Net) {
+        net.udp_close(self.sock);
+    }
+
+    fn end(&mut self, net: &mut dyn rustros_api::Net, r: Looked) -> Looked {
+        net.udp_close(self.sock);
+        r
+    }
+}
