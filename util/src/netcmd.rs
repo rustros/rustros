@@ -425,3 +425,73 @@ pub fn console(sys: &mut dyn Sys, words: &[&str]) {
     let t = run(sys, words).unwrap_or_else(|e| e);
     sys.print(&t);
 }
+
+/// A configuration as the commands that make it (`ip ...`, `mtu ...`), for
+/// export: `conf_from_commands` on them gives it back.
+pub fn conf_commands(net: &NetConf) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in &net.ifs {
+        let name = c.name();
+        if let Some(v) = c.vlan {
+            out.push(alloc::format!("ip vlan add nic{} {}", c.phys, v));
+        }
+        if c.ip != 0 {
+            let gw = if c.gw != 0 { alloc::format!(" {}", IpFmt(c.gw)) } else { String::new() };
+            out.push(alloc::format!("ip {} {}/{}{}", name, IpFmt(c.ip), c.mask.count_ones(), gw));
+        }
+        if !c.extra.is_empty() {
+            out.push(alloc::format!("ip {} add {}", name, fmt_ip_list(&c.extra)));
+        }
+        if c.mtu != 1500 && c.mtu != 0 {
+            out.push(alloc::format!("mtu {} {}", name, c.mtu));
+        }
+    }
+    for r in &net.routes {
+        let from = if r.src_mask != 0 { alloc::format!(" from {}/{}", IpFmt(r.src), r.src_mask.count_ones()) } else { String::new() };
+        out.push(alloc::format!("ip route add {}/{} {}{}", IpFmt(r.net), r.mask.count_ones(), IpFmt(r.gw), from));
+    }
+    out
+}
+
+/// The configuration `cmds` (as `conf_commands` writes them) make on the
+/// NICs of `base`: its VLANs, addresses and routes are not kept.
+pub fn conf_from_commands(base: &NetConf, cmds: &[&str]) -> Result<NetConf, String> {
+    let mut net = NetConf {
+        ifs: base.ifs.iter().filter(|c| c.vlan.is_none()).map(|c| IfConf { phys: c.phys, vlan: None, mtu: 1500, ..IfConf::default() }).collect(),
+        routes: Vec::new(),
+    };
+    for line in cmds {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let r = match w.as_slice() {
+            ["ip", rest @ ..] => edit_ip(&mut net, rest),
+            ["mtu", rest @ ..] => edit_mtu(&mut net, rest),
+            _ => Err(String::from("not a network command\n")),
+        };
+        r.map_err(|e| alloc::format!("{}: {}", line, e.trim_end()))?;
+    }
+    Ok(net)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_round_trip() {
+        let base = NetConf { ifs: alloc::vec![IfConf { phys: 0, mtu: 1500, ..IfConf::default() }, IfConf { phys: 1, mtu: 1500, ..IfConf::default() }], routes: Vec::new() };
+        let cmds = [
+            "ip nic0 203.0.113.240/24 203.0.113.1",
+            "ip vlan add nic1 109",
+            "ip nic1.109 198.51.100.1/24 198.51.100.254",
+            "ip nic1.109 add 198.51.100.2-198.51.100.9,198.51.100.20",
+            "mtu nic1.109 1400",
+            "ip route add 0.0.0.0/0 198.51.100.254 from 10.20.0.0/24",
+        ];
+        let net = conf_from_commands(&base, &cmds).unwrap();
+        let again = conf_commands(&net);
+        let back = conf_from_commands(&base, &again.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+        assert_eq!(net, back);
+        assert!(again.iter().any(|l| l == "ip route add 0.0.0.0/0 198.51.100.254 from 10.20.0.0/24"), "{again:?}");
+        assert!(conf_from_commands(&base, &["ip nic7 1.2.3.4/24"]).is_err());
+    }
+}

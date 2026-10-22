@@ -34,7 +34,8 @@ use rustros_util::wire::{Ip, IpFmt, fmt_ip_list, parse_cidr, parse_ip};
 
 const DEFAULT_PORT: u16 = 8080;
 const MAX_HEAD: usize = 8192;
-const MAX_BODY: usize = 16 * 1024;
+/// Big enough for a configuration being imported.
+const MAX_BODY: usize = 256 * 1024;
 const RELOAD_MS: u64 = 2000;
 const SESSION_MS: u64 = 30 * 60 * 1000;
 const CHALLENGE_MS: u64 = 60_000;
@@ -369,6 +370,31 @@ impl WebAdmin {
                     Err(e) => json(&format!("{{\"ok\":false,\"out\":{}}}", js(&e))),
                 }
             }
+            ("GET", "/api/config") => response("200 OK", "text/plain; charset=utf-8", "", export(sys, false).as_bytes()),
+            ("POST", "/api/config/export") => {
+                // passwords and keys only for whoever types the password again
+                if now < self.locked_until {
+                    return error("429 Too Many Requests", "too many wrong passwords: wait a minute");
+                }
+                if !self.proven(now, form) {
+                    self.fails += 1;
+                    if self.fails >= MAX_FAILS {
+                        self.fails = 0;
+                        self.locked_until = now + LOCKOUT_MS;
+                    }
+                    return error("403 Forbidden", "wrong password");
+                }
+                say!(sys, "webadmin: configuration exported with secrets\n");
+                response("200 OK", "text/plain; charset=utf-8", "", export(sys, true).as_bytes())
+            }
+            ("POST", "/api/config/import") => {
+                let text = field(form, "text").unwrap_or_default();
+                let replace = field(form, "mode").as_deref() == Some("replace");
+                let net = field(form, "net").as_deref() == Some("1");
+                let (ok, out) = import(sys, &text, replace, net);
+                say!(sys, "webadmin: configuration imported ({}{})\n", if replace { "replace" } else { "merge" }, if ok { "" } else { ", with errors" });
+                json(&format!("{{\"ok\":{ok},\"out\":{}}}", js(&out)))
+            }
             ("GET", "/api/logs") => {
                 let Some(a) = sys.admin() else { return error("403 Forbidden", "no admin") };
                 let this = a.log_this_boot();
@@ -407,6 +433,20 @@ impl WebAdmin {
         }
     }
 
+    /// The form answers a challenge with the password (each challenge works once).
+    fn proven(&mut self, now: u64, form: &str) -> bool {
+        let Some(pw) = self.pw else { return false };
+        let nonce = field(form, "nonce").and_then(|n| unhex16(&n));
+        let proof = field(form, "proof").unwrap_or_default();
+        self.challenges.retain(|c| c.1 > now);
+        let fresh = nonce.and_then(|n| self.challenges.iter().position(|c| c.0 == n)).map(|i| self.challenges.swap_remove(i));
+        fresh.is_some_and(|(n, _)| {
+            let mut h = Hmac::new(&pw);
+            h.update(hex(&n).as_bytes());
+            ct_eq(hex(&h.finish()).as_bytes(), proof.as_bytes())
+        })
+    }
+
     fn login(&mut self, sys: &mut dyn Sys, now: u64, r: &Request) -> Vec<u8> {
         if !r.custom {
             return error("403 Forbidden", "missing X-RustROS header");
@@ -414,19 +454,11 @@ impl WebAdmin {
         if now < self.locked_until {
             return error("429 Too Many Requests", "too many failed logins: wait a minute");
         }
-        let Some(pw) = self.pw else { return error("403 Forbidden", "no password set: cfg webadmin password <text>") };
+        if self.pw.is_none() {
+            return error("403 Forbidden", "no password set: cfg webadmin password <text>");
+        }
         let form = core::str::from_utf8(r.body).unwrap_or("");
-        let nonce = field(form, "nonce").and_then(|n| unhex16(&n));
-        let proof = field(form, "proof").unwrap_or_default();
-        self.challenges.retain(|c| c.1 > now);
-        // each challenge works once
-        let fresh = nonce.and_then(|n| self.challenges.iter().position(|c| c.0 == n)).map(|i| self.challenges.swap_remove(i));
-        let ok = fresh.is_some_and(|(n, _)| {
-            let mut h = Hmac::new(&pw);
-            h.update(hex(&n).as_bytes());
-            ct_eq(hex(&h.finish()).as_bytes(), proof.as_bytes())
-        });
-        if !ok {
+        if !self.proven(now, form) {
             self.fails += 1;
             if self.fails >= MAX_FAILS {
                 self.fails = 0;
@@ -445,6 +477,139 @@ impl WebAdmin {
         say!(sys, "webadmin: login\n");
         response("200 OK", "application/json", &format!("Set-Cookie: hs={}; Path=/; HttpOnly; SameSite=Strict\r\n", hex(&t)), b"{\"ok\":true}")
     }
+}
+
+/// "2026-10-22 08:58:52 UTC"
+fn utc(unix: u64) -> String {
+    let (days, secs) = (unix / 86400, unix % 86400);
+    // civil from days (Howard Hinnant's algorithm)
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as u64;
+    format!("{y}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+/// The whole configuration as lines to import again: the running network
+/// (`net ip ...`) and every module's settings (`cfg <module> <key> <value>`).
+/// Without `secrets`, passwords and keys are listed as `#secret cfg ...`.
+fn export(sys: &mut dyn Sys, secrets: bool) -> String {
+    let mut o = String::from("# RustROS configuration\n");
+    let t = sys.unix_time();
+    if t != 0 {
+        let _ = writeln!(o, "# exported {}", utc(t));
+    }
+    let _ = writeln!(o, "# {}", if secrets { "with passwords and keys: keep this file safe" } else { "passwords and keys are not included (#secret lines)" });
+    let Some(a) = sys.admin() else { return o };
+    o += "\n# network (imported into the candidate: apply it on the network page)\n";
+    for c in rustros_util::netcmd::conf_commands(&a.net_running()) {
+        let _ = writeln!(o, "net {c}");
+    }
+    for m in a.module_list() {
+        let cfg = a.module_config(&m.name);
+        let _ = writeln!(o, "\n# module {}{}", m.name, if cfg.is_empty() { " (no settings)" } else { "" });
+        for (k, v) in cfg {
+            let secret = rustros_util::secret::is_secret(&k) || m.params.iter().any(|p| p.kind == "secret" && key_matches(&p.key, &k));
+            if secret && !secrets {
+                let _ = writeln!(o, "#secret cfg {} {}", m.name, k);
+            } else {
+                let _ = writeln!(o, "cfg {} {} {}", m.name, k, v);
+            }
+        }
+    }
+    o
+}
+
+/// Apply an exported configuration. Module settings take effect at once
+/// (`replace`: a module's settings missing from the text are removed, but
+/// not its `#secret` ones); the network lines (with `net`) become the
+/// candidate. Returns (no errors, report).
+fn import(sys: &mut dyn Sys, text: &str, replace: bool, net: bool) -> (bool, String) {
+    let mut report = String::new();
+    let mut errors = 0;
+    let Some(a) = sys.admin() else { return (false, String::from("not permitted\n")) };
+    let installed: Vec<String> = a.module_list().into_iter().map(|m| m.name).collect();
+    // module -> keys in the text (set or #secret)
+    let mut seen: Vec<(String, Vec<String>)> = Vec::new();
+    let mut net_lines = Vec::new();
+    let (mut set, mut removed) = (0, 0);
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        let mut note = |m: &str, k: &str| match seen.iter_mut().find(|s| s.0 == m) {
+            Some(s) => s.1.push(String::from(k)),
+            None => seen.push((String::from(m), alloc::vec![String::from(k)])),
+        };
+        if let Some(rest) = line.strip_prefix("#secret cfg ") {
+            if let Some((m, k)) = rest.split_once(' ') {
+                note(m, k.trim());
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("net ") {
+            net_lines.push(rest);
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("cfg ") else {
+            errors += 1;
+            let _ = writeln!(report, "line {}: not cfg/net: {}", n + 1, line);
+            continue;
+        };
+        let mut w = rest.splitn(3, ' ');
+        let (Some(m), Some(k)) = (w.next(), w.next()) else {
+            errors += 1;
+            let _ = writeln!(report, "line {}: cfg <module> <key> <value>", n + 1);
+            continue;
+        };
+        let v = w.next().unwrap_or("").trim();
+        note(m, k);
+        match a.module_config_set(m, k, Some(v)) {
+            Ok(()) => set += 1,
+            Err(e) => {
+                errors += 1;
+                let _ = writeln!(report, "line {}: {} {}: {}", n + 1, m, k, e);
+            }
+        }
+    }
+    if replace {
+        for (m, keys) in &seen {
+            for (k, _) in a.module_config(m) {
+                if !keys.contains(&k) && a.module_config_set(m, &k, None).is_ok() {
+                    removed += 1;
+                    let _ = writeln!(report, "removed {m} {k}");
+                }
+            }
+        }
+    }
+    for (m, _) in &seen {
+        if !installed.contains(m) {
+            let _ = writeln!(report, "note: module {m} is not installed (its settings are kept for it)");
+        }
+    }
+    let mut net_msg = String::new();
+    if net && !net_lines.is_empty() {
+        match rustros_util::netcmd::conf_from_commands(&a.net_running(), &net_lines) {
+            Ok(c) => {
+                a.net_set_candidate(Some(c));
+                net_msg = format!("network: {} lines in the candidate; check and apply it on the network page\n", net_lines.len());
+            }
+            Err(e) => {
+                errors += 1;
+                net_msg = format!("network not imported: {e}\n");
+            }
+        }
+    } else if !net_lines.is_empty() {
+        net_msg = format!("network: {} lines skipped (not chosen)\n", net_lines.len());
+    }
+    let head = format!("{set} settings set, {removed} removed, {errors} errors\n{net_msg}");
+    (errors == 0, head + &report)
 }
 
 fn status(sys: &mut dyn Sys) -> String {

@@ -71,7 +71,7 @@ table.cards tr.note{border:0;padding:0}}
 </div>
 <div id="app" hidden>
 <header><b>RustROS</b>
-<nav id="tabs"><button data-t="status">状态</button><button data-t="net">网络</button><button data-t="mods">模块</button><button data-t="log">日志</button><button data-t="sys">系统</button></nav>
+<nav id="tabs"><button data-t="status">状态</button><button data-t="net">网络</button><button data-t="mods">模块</button><button data-t="config">配置</button><button data-t="log">日志</button><button data-t="sys">系统</button></nav>
 <span id="who"></span><button class="b" id="out">退出</button></header>
 <main>
 <div id="applybar" class="banner" hidden></div>
@@ -100,6 +100,26 @@ table.cards tr.note{border:0;padding:0}}
   <div class="card"><h3>原始设置（键值）</h3>
     <div class="row"><select id="mname"></select><input id="mkey" placeholder="设置项，如 srcnat.10.20.0.1"><input id="mval" class="grow" placeholder="值（留空则删除）"><button class="b p" id="mset">设置</button></div>
     <div id="mcfg"></div>
+  </div>
+</section>
+
+<section id="t-config" hidden>
+  <div class="card"><h3>全部配置</h3>
+    <p class="mut">网络（<code>net ...</code>）和每个模块的设置（<code>cfg 模块 键 值</code>），可以原样导入。密码和密钥显示为 <code>#secret</code> 行，不含值。</p>
+    <div class="row"><button class="b" id="crefresh">刷新</button><button class="b p" id="cdown">下载（不含密码）</button></div>
+    <div class="row"><input id="cpw" type="password" autocomplete="current-password" placeholder="webadmin 密码"><button class="b" id="cdownall">下载（含密码和密钥）</button><span class="mut">需要再输一次密码；文件里是明文，请妥善保管</span></div>
+    <pre id="ctext" style="max-height:60vh"></pre>
+  </div>
+  <div class="card"><h3>导入</h3>
+    <div class="row"><input type="file" id="cfile" accept=".txt,.conf,text/plain"><span class="mut">或把内容粘贴到下面</span></div>
+    <textarea id="cin" rows="10" style="width:100%;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace" placeholder="cfg proxy p1.listen 1080"></textarea>
+    <div class="row">
+      <label><input type="radio" name="cmode" value="merge" checked> 合并：只设置文件里的项</label>
+      <label><input type="radio" name="cmode" value="replace"> 替换：文件里出现的模块，删掉文件里没有的设置（<code>#secret</code> 行的保留）</label>
+    </div>
+    <div class="row"><label><input type="checkbox" id="cnet"> 网络配置写入候选（之后到“网络”页应用，有自动回滚）</label></div>
+    <div class="row"><button class="b p" id="cimport">导入</button></div>
+    <pre id="cout" hidden></pre>
   </div>
 </section>
 
@@ -182,13 +202,13 @@ $("go").onclick=login;$("pw").onkeydown=e=>{if(e.key==="Enter")login()};
 $("out").onclick=async()=>{await api("/api/logout",{});showLogin()};
 
 // each page has its own address (#net, #mods, ...): reload, back and forward work
-const TABS=["status","net","mods","log","sys"];
+const TABS=["status","net","mods","config","log","sys"];
 const fromHash=()=>{const h=location.hash.slice(1).split("/")[0];return TABS.includes(h)?h:"status"};
 const hashMod=()=>decodeURIComponent(location.hash.slice(1).split("/")[1]||"");
 let cur=fromHash(),timer=null;
 function tab(t){cur=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
-  ["status","net","mods","log","sys"].forEach(x=>$("t-"+x).hidden=x!==t);
-  clearInterval(timer);const f={status:loadStatus,net:loadNet,mods:loadMods,log:loadLog,sys:async()=>{}}[t];
+  TABS.forEach(x=>$("t-"+x).hidden=x!==t);
+  clearInterval(timer);const f={status:loadStatus,net:loadNet,mods:loadMods,log:loadLog,config:loadConfig,sys:async()=>{}}[t];
   const run=()=>f().then(()=>oopsClear("刷新失败"),e=>oops("刷新失败",e));
   run();if(t==="status"||t==="log"||t==="net")timer=setInterval(run,t==="net"?3000:2000)}
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{location.hash=b.dataset.t});
@@ -381,6 +401,31 @@ function newInst(b,ci){const i=b.previousElementSibling,n=i.value.trim();if(!/^[
   div.innerHTML=`<h4>${esc(n)}（新）</h4>`+renderNode(COLLS[ci],pre,[n],{},{},m.name);
   b.parentElement.before(div);div.querySelectorAll("[data-k]").forEach(e=>e.addEventListener("input",()=>e.classList.toggle("dirty",val(e)!==e.dataset.o)))}
 function modAct(n,a){if(confirm(`把 ${n} 切到 ${a}？`))modCall({name:n,action:a})}
+
+// ---- the whole configuration: view, export, import
+async function loadConfig(){$("ctext").textContent=await api("/api/config")}
+function download(text,name){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type:"text/plain"}));a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+const stamp=()=>new Date().toISOString().slice(0,19).replace(/[-:T]/g,"");
+$("crefresh").onclick=()=>loadConfig().catch(e=>oops("读取配置失败",e));
+$("cdown").onclick=async()=>{try{download(await api("/api/config"),`rustros-config-${stamp()}.txt`)}catch(e){oops("导出失败",e)}};
+$("cdownall").onclick=async()=>{
+  try{
+    if(!$("cpw").value){oops("导出失败","先输入 webadmin 密码");return}
+    const c=await api("/api/challenge");
+    const proof=hex(hmac(sha256(utf8("rustros-web:"+$("cpw").value)),utf8(c.nonce)));
+    const t=await api("/api/config/export",{nonce:c.nonce,proof});$("cpw").value="";
+    download(t,`rustros-config-full-${stamp()}.txt`)}
+  catch(e){oops("导出（含密码）失败",e)}};
+$("cfile").onchange=async()=>{const f=$("cfile").files[0];if(f)$("cin").value=await f.text()};
+$("cimport").onclick=async()=>{
+  const text=$("cin").value,mode=document.querySelector("[name=cmode]:checked").value,net=$("cnet").checked;
+  if(!text.trim()){oops("导入失败","没有内容：选个文件或粘贴进来");return}
+  const n=text.split("\n").filter(l=>/^(cfg|net) /.test(l.trim())).length;
+  if(!confirm(`导入 ${n} 行（${mode==="replace"?"替换":"合并"}${net?"，网络写入候选":""}）？模块设置会立即生效。`))return;
+  const out=$("cout");out.hidden=false;out.textContent="导入中…";
+  try{const r=await api("/api/config/import",{text,mode,net:net?"1":"0"});out.textContent=r.out;out.className=r.ok?"":"bad";
+    if(!r.ok)oops("导入有错误",r.out.split("\n")[0]);loadConfig().catch(()=>{})}
+  catch(e){out.textContent="导入失败："+e.message;oops("导入失败",e)}};
 
 async function loadLog(){
   const sel=$("boots");
