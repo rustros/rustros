@@ -394,6 +394,13 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 modules::set_current_native(before);
                 match r {
                     Ok(m) if matches!(m.export, Some(rustros_api::module::Export::Module(_))) => slots.push(Slot::Native(m)),
+                    Ok(mut m) if matches!(m.export, Some(rustros_api::module::Export::Apps(_))) => {
+                        // several apps sharing one binary: it stays loaded for good
+                        if let Some(rustros_api::module::Export::Apps(apps)) = m.export.take() {
+                            slots.extend(apps.into_iter().map(Slot::Boot));
+                        }
+                        Box::leak(Box::new(m));
+                    }
                     Ok(_) => kprintln!("modules: boot module {} is not an app", name),
                     Err(e) => kprintln!("modules: boot module {}: {}", name, e),
                 }

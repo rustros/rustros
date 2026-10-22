@@ -13,9 +13,10 @@ GW  ?= 10.0.2.2
 MTU ?=
 KEY ?=
 # Modules built into the kernel (everything else is a loadable module, see modules/):
-# apps built into the kernel itself (none: rescue, dhcp and the updater are boot modules)
+# apps built into the kernel itself (none: rescue, dhcp and the updater are the boot module)
 APPS ?=
-BOOT_MODULES := rescue dhcp updater
+# one binary with rescue, dhcp and the updater (modules/boot)
+BOOT_MODULES := boot
 # The online update key is generated once and kept here:
 KEY_FILE ?= build/update.key
 

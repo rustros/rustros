@@ -38,6 +38,8 @@ pub enum Export {
     Module(Box<dyn Module>),
     /// Runs applications in another format (the WebAssembly runtime).
     Runtime(Box<dyn Runtime>),
+    /// Several apps from one binary (sharing its code): the boot modules.
+    Apps(alloc::vec::Vec<Box<dyn Module>>),
     /// A file system driver ("ext4", "xfs", ...): the kernel mounts the
     /// files partition with the one that recognises it.
     Filesystem(Box<dyn Filesystem>),

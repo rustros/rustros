@@ -15,6 +15,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 pub use alloc::boxed::Box;
+pub use alloc::vec as alloc_vec;
 pub use rustros_api;
 use rustros_api::module::{Export, HostTable};
 
@@ -92,6 +93,20 @@ macro_rules! export_module {
             out: *mut Option<$crate::rustros_api::module::Export>,
         ) -> u64 {
             unsafe { $crate::init(host, out, || $crate::rustros_api::module::Export::Module($crate::Box::new($ctor))) }
+        }
+    };
+}
+
+/// Export several apps from one binary (they share its code).
+#[macro_export]
+macro_rules! export_apps {
+    ($($ctor:expr),+ $(,)?) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rustros_module_init(
+            host: *const $crate::rustros_api::module::HostTable,
+            out: *mut Option<$crate::rustros_api::module::Export>,
+        ) -> u64 {
+            unsafe { $crate::init(host, out, || $crate::rustros_api::module::Export::Apps($crate::alloc_vec![$($crate::Box::new($ctor) as $crate::Box<dyn $crate::rustros_api::Module>),+])) }
         }
     };
 }

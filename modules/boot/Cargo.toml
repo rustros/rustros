@@ -1,10 +1,10 @@
 [package]
-name = "rescue-mod"
+name = "boot-mod"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "rescue"
+name = "boot"
 path = "src/main.rs"
 test = false
 bench = false
@@ -12,3 +12,5 @@ bench = false
 [dependencies]
 rustros-module = { path = "../support" }
 rescue = { path = "../../apps/rescue" }
+dhcp = { path = "../../apps/dhcp" }
+updater = { path = "../../apps/updater" }

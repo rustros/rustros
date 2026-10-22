@@ -29,6 +29,8 @@ const LEGACY_WASM: &str = "sys/wasm/";
 /// An entry of the app table; the index is the app id.
 pub enum Slot {
     Builtin(Box<dyn Module>),
+    /// An app from the boot modules' binary (which stays loaded for good).
+    Boot(Box<dyn Module>),
     Native(loader::Module),
     /// An instance created by a runtime (WebAssembly).
     Hosted(Box<dyn Module>),
@@ -38,7 +40,7 @@ pub enum Slot {
 impl Slot {
     pub fn app(&mut self) -> Option<&mut dyn Module> {
         match self {
-            Slot::Builtin(a) | Slot::Hosted(a) => Some(a.as_mut()),
+            Slot::Builtin(a) | Slot::Boot(a) | Slot::Hosted(a) => Some(a.as_mut()),
             Slot::Native(m) => match m.export.as_mut() {
                 Some(Export::Module(a)) => Some(a.as_mut()),
                 _ => None,
@@ -92,7 +94,7 @@ pub fn set_current_native(n: Option<&'static str>) -> Option<&'static str> {
 pub fn call(k: &mut Kernel, slots: &mut [Slot], id: usize, f: impl FnOnce(&mut dyn Module, &mut Ctx)) {
     // a hosted (WebAssembly) app runs inside the runtime module's code
     let culprit = match slots[id] {
-        Slot::Native(_) => k.names.get(id).copied(),
+        Slot::Native(_) | Slot::Boot(_) => k.names.get(id).copied(),
         Slot::Hosted(_) => Some(RUNTIME),
         _ => None,
     };

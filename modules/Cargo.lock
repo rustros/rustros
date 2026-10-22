@@ -97,6 +97,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-mod"
+version = "0.1.0"
+dependencies = [
+ "dhcp",
+ "rescue",
+ "rustros-module",
+ "updater",
+]
+
+[[package]]
 name = "cake"
 version = "0.1.0"
 dependencies = [
@@ -274,14 +284,6 @@ version = "0.1.0"
 dependencies = [
  "rustros-api",
  "rustros-util",
-]
-
-[[package]]
-name = "dhcp-mod"
-version = "0.1.0"
-dependencies = [
- "dhcp",
- "rustros-module",
 ]
 
 [[package]]
@@ -811,14 +813,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rescue-mod"
-version = "0.1.0"
-dependencies = [
- "rescue",
- "rustros-module",
-]
-
-[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1118,14 +1112,6 @@ version = "0.1.0"
 dependencies = [
  "rustros-api",
  "rustros-util",
-]
-
-[[package]]
-name = "updater-mod"
-version = "0.1.0"
-dependencies = [
- "rustros-module",
- "updater",
 ]
 
 [[package]]

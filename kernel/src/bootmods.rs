@@ -1,5 +1,5 @@
-//! Boot modules: the modules that come with the kernel (rescue, dhcp,
-//! updater), in its image after the ELF. They start before the installed
+//! Boot modules: the modules that come with the kernel (one binary with
+//! rescue, dhcp and the updater, LZ4-compressed), in its image after the ELF. They start before the installed
 //! modules, in safe mode too, and are updated and rolled back with the
 //! kernel (one file, one slot). GRUB hands the image over again as a
 //! module (`module2`); without that the kernel reads its slot.
@@ -47,11 +47,12 @@ pub fn parse(img: &[u8]) -> Result<Vec<(String, Vec<u8>)>, &'static str> {
         let e = &head[16 + i * ENTRY..16 + (i + 1) * ENTRY];
         let name = String::from(String::from_utf8_lossy(&e[..32]).trim_end_matches('\0'));
         let (off, len) = (le32(e, 32) * 512, le32(e, 36));
-        let data = img.get(at + off..at + off + len).ok_or("a boot module past the image's end")?;
-        if Sha256::digest(data)[..] != e[40..72] {
+        let stored = img.get(at + off..at + off + len).ok_or("a boot module past the image's end")?;
+        let data = if le32(e, 76) & 1 != 0 { lz4(stored, le32(e, 72)).ok_or("a boot module does not decompress")? } else { stored.to_vec() };
+        if Sha256::digest(&data)[..] != e[40..72] {
             return Err("a boot module does not match its checksum");
         }
-        out.push((name, data.to_vec()));
+        out.push((name, data));
     }
     Ok(out)
 }
@@ -74,4 +75,46 @@ pub fn read_slot(disk: &mut dyn BlockDevice, lba: u64, sectors: u64) -> Option<V
     }
     let mut img = vec![0u8; end.next_multiple_of(512)];
     disk.read(lba, &mut img).then_some(img)
+}
+
+/// An LZ4 block (as tools/pack.py makes it) of `len` bytes, unpacked.
+fn lz4(src: &[u8], len: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(len);
+    let mut i = 0;
+    let more = |i: &mut usize, mut n: usize| -> Option<usize> {
+        if n == 15 {
+            loop {
+                let b = *src.get(*i)?;
+                *i += 1;
+                n += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        Some(n)
+    };
+    while i < src.len() {
+        let token = src[i];
+        i += 1;
+        let lit = more(&mut i, (token >> 4) as usize)?;
+        out.extend_from_slice(src.get(i..i + lit)?);
+        i += lit;
+        if i >= src.len() {
+            break;
+        }
+        let off = u16::from_le_bytes([*src.get(i)?, *src.get(i + 1)?]) as usize;
+        i += 2;
+        let n = more(&mut i, (token & 15) as usize)? + 4;
+        if off == 0 || off > out.len() || out.len() + n > len {
+            return None;
+        }
+        // byte by byte: a match may overlap what it copies
+        let from = out.len() - off;
+        for k in 0..n {
+            let b = out[from + k];
+            out.push(b);
+        }
+    }
+    (out.len() == len).then_some(out)
 }

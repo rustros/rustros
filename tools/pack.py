@@ -273,19 +273,22 @@ def pack(kernel: bytes) -> bytes:
 
 
 BUNDLE_MAGIC = b"RRSBNDL1"
-BUNDLE_HEAD = 4096   # magic, count, then 80-byte entries: name (32), offset in sectors (4), bytes (4), SHA-256 (32), pad (8)
+BUNDLE_HEAD = 4096   # magic, count, then 80-byte entries: name (32), offset in sectors (4), stored bytes (4),
+                     # SHA-256 of the module (32), its bytes (4), flags (4: 1 = stored LZ4-compressed)
 BUNDLE_ENTRY = 80
 
 
 def boot_bundle(specs):
-    """The boot modules, after the kernel ELF (see kernel/src/bootmods.rs)."""
+    """The boot modules, LZ4-compressed, after the kernel ELF (see kernel/src/bootmods.rs)."""
     import hashlib
     entries, blobs, at = [], [], BUNDLE_HEAD // 512
     for spec in specs:
         name, path = spec.split("=", 1)
         data = open(path, "rb").read()
-        entries.append(name.encode().ljust(32, b"\0") + struct.pack("<II", at, len(data)) + hashlib.sha256(data).digest() + bytes(8))
-        padded = data + bytes(-len(data) % 512)
+        packed = lz4_compress(data)
+        assert lz4_decompress(packed) == data, "LZ4 round trip"
+        entries.append(name.encode().ljust(32, b"\0") + struct.pack("<II", at, len(packed)) + hashlib.sha256(data).digest() + struct.pack("<II", len(data), 1))
+        padded = packed + bytes(-len(packed) % 512)
         blobs.append(padded)
         at += len(padded) // 512
     head = (BUNDLE_MAGIC + struct.pack("<II", len(entries), 0) + b"".join(entries)).ljust(BUNDLE_HEAD, b"\0")
