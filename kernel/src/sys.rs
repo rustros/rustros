@@ -579,20 +579,20 @@ impl Kv for Ctx<'_> {
     fn file_read(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Option<usize> {
         let path = self.file_path(name)?;
         let b = self.k.boot.as_mut()?;
-        let (fs, start) = b.files.as_ref()?;
+        let (fs, start) = b.files.as_mut()?;
         fs.read(&mut ext4::Vol { dev: &mut *b.disk, start: *start }, &path, offset, buf).ok()
     }
     fn file_stat(&mut self, name: &str) -> Option<(u64, u64)> {
         let path = self.file_path(name)?;
         let b = self.k.boot.as_mut()?;
-        let (fs, start) = b.files.as_ref()?;
+        let (fs, start) = b.files.as_mut()?;
         let st = fs.stat(&mut ext4::Vol { dev: &mut *b.disk, start: *start }, &path).ok()?;
         (!st.dir).then_some((st.size, st.mtime as u64))
     }
     fn file_list(&mut self, prefix: &str) -> Vec<(String, u64)> {
         let owner = format!("/{}", self.app_name());
         let Some(b) = self.k.boot.as_mut() else { return Vec::new() };
-        let Some((fs, start)) = b.files.as_ref() else { return Vec::new() };
+        let Some((fs, start)) = b.files.as_mut() else { return Vec::new() };
         let mut v = ext4::Vol { dev: &mut *b.disk, start: *start };
         let mut out = Vec::new();
         let mut dirs = alloc::vec![String::new()];

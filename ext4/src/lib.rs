@@ -1,10 +1,21 @@
-//! ext4, no_std: format a partition, then create, read, replace, list and
-//! remove files and directories, as Linux reads and checks them (e2fsck).
+//! ext4, no_std: format a partition; files, directories, symbolic and hard
+//! links, special files, as Linux reads and checks them (e2fsck).
+//!
+//! Two ways in: by inode, as a VFS wants it (`lookup`, `create`, `mkdir`,
+//! `pread`, `pwrite`, `truncate`, `rename`, `link`, `symlink`, `setattr`,
+//! ...), and by path for whole files (`write_file`, `read`, `list`, `stat`,
+//! `remove`, `mkdir_p`).
+//!
+//! Metadata (bitmaps, inode tables, directories, extent trees) goes through
+//! a block cache and reaches the disk at `sync`, which every changing call
+//! does when it ends unless `auto_sync` is off; file data is written
+//! straight away.
 //!
 //! What it makes: 4 KiB blocks, 128 MiB block groups, 256-byte inodes,
-//! files and directories mapped by extents, linear directories; features
-//! `extents`, `filetype`, `sparse_super`, `large_file`; no journal and no
-//! checksums (so after a crash run e2fsck; a journal comes later).
+//! files and directories mapped by extents (trees of any depth), linear
+//! directories; features `extents`, `filetype`, `sparse_super`,
+//! `large_file`, `extra_isize`; no journal and no checksums yet (so after a
+//! crash run e2fsck).
 //!
 //! What it reads: also file systems Linux made (flex_bg, 64-bit, checksums
 //! and journals are ignored when reading). It writes only to those whose
@@ -14,18 +25,25 @@
 
 extern crate alloc;
 
-use alloc::string::String;
+mod cache;
+mod dir;
+mod extent;
+mod file;
+mod ns;
+
 use alloc::vec;
 use alloc::vec::Vec;
 
 use devices::BlockDevice;
+
+pub use ns::SetAttr;
 
 pub const BLOCK: usize = 4096;
 const SECTORS_PER_BLOCK: u64 = (BLOCK / 512) as u64;
 const BLOCKS_PER_GROUP: u32 = 32768;
 const INODES_PER_GROUP: u32 = 2048;
 const INODE_SIZE: usize = 256;
-const ROOT: u32 = 2;
+pub const ROOT: u32 = 2;
 const LOST_FOUND: u32 = 11;
 const FIRST_INO: u32 = 11;
 const MAGIC: u16 = 0xEF53;
@@ -46,16 +64,12 @@ const RO_EXTRA_ISIZE: u32 = 0x40;
 const INCOMPAT_WRITABLE: u32 = INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_FLEX_BG;
 const RO_WRITABLE: u32 = RO_SPARSE_SUPER | RO_LARGE_FILE | RO_HUGE_FILE | RO_DIR_NLINK | RO_EXTRA_ISIZE;
 
-const S_IFDIR: u16 = 0x4000;
-const S_IFREG: u16 = 0x8000;
+const S_IFMT: u16 = 0xF000;
 const EXT4_EXTENTS_FL: u32 = 0x80000;
 /// A hash-indexed directory (dir_index): read as a plain one, and made one when changed.
 const EXT4_INDEX_FL: u32 = 0x1000;
-const EXTENT_MAGIC: u16 = 0xF30A;
-const FT_REG: u8 = 1;
-const FT_DIR: u8 = 2;
-/// One extent covers at most this many blocks.
-const EXTENT_MAX: u32 = 32768;
+/// The most links an inode takes (a directory: subdirectories + 2).
+const MAX_LINKS: u16 = 65000;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -71,6 +85,9 @@ pub enum Error {
     BadName,
     Full,
     TooBig,
+    /// Not for this kind of inode, or a directory into itself.
+    Invalid,
+    TooManyLinks,
     Corrupt(&'static str),
 }
 
@@ -110,12 +127,86 @@ impl Vol<'_> {
     }
 }
 
+/// What an inode is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Dir,
+    Symlink,
+    CharDev,
+    BlockDev,
+    Fifo,
+    Socket,
+}
+
+impl Kind {
+    fn from_mode(mode: u16) -> Option<Kind> {
+        Some(match mode & S_IFMT {
+            0x8000 => Kind::File,
+            0x4000 => Kind::Dir,
+            0xA000 => Kind::Symlink,
+            0x2000 => Kind::CharDev,
+            0x6000 => Kind::BlockDev,
+            0x1000 => Kind::Fifo,
+            0xC000 => Kind::Socket,
+            _ => return None,
+        })
+    }
+    fn ifmt(self) -> u16 {
+        match self {
+            Kind::File => 0x8000,
+            Kind::Dir => 0x4000,
+            Kind::Symlink => 0xA000,
+            Kind::CharDev => 0x2000,
+            Kind::BlockDev => 0x6000,
+            Kind::Fifo => 0x1000,
+            Kind::Socket => 0xC000,
+        }
+    }
+    /// The directory entry's file type.
+    fn ft(self) -> u8 {
+        match self {
+            Kind::File => 1,
+            Kind::Dir => 2,
+            Kind::CharDev => 3,
+            Kind::BlockDev => 4,
+            Kind::Fifo => 5,
+            Kind::Socket => 6,
+            Kind::Symlink => 7,
+        }
+    }
+    pub fn from_ft(ft: u8) -> Option<Kind> {
+        Some(match ft {
+            1 => Kind::File,
+            2 => Kind::Dir,
+            3 => Kind::CharDev,
+            4 => Kind::BlockDev,
+            5 => Kind::Fifo,
+            6 => Kind::Socket,
+            7 => Kind::Symlink,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stat {
     pub ino: u32,
+    pub kind: Kind,
+    /// permission bits (and setuid, setgid, sticky)
+    pub mode: u16,
+    pub links: u16,
+    pub uid: u32,
+    pub gid: u32,
     pub size: u64,
-    pub dir: bool,
+    /// space used, in 512-byte units
+    pub blocks: u64,
+    pub atime: u32,
     pub mtime: u32,
+    pub ctime: u32,
+    /// a device file's (major, minor)
+    pub rdev: (u32, u32),
+    pub dir: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,6 +230,11 @@ pub struct Fs {
     desc_size: usize,
     first_data_block: u64,
     pub writable: bool,
+    /// Every changing call ends with `sync` (on by default).
+    pub auto_sync: bool,
+    cache: cache::Cache,
+    /// the superblock or group descriptors changed since the last sync
+    meta_dirty: bool,
 }
 
 /// An inode as read from its table.
@@ -152,8 +248,11 @@ impl Inode {
     fn mode(&self) -> u16 {
         le16(&self.raw, 0)
     }
+    fn kind(&self) -> Option<Kind> {
+        Kind::from_mode(self.mode())
+    }
     fn is_dir(&self) -> bool {
-        self.mode() & 0xF000 == S_IFDIR
+        self.mode() & S_IFMT == 0x4000
     }
     fn size(&self) -> u64 {
         le32(&self.raw, 4) as u64 | (le32(&self.raw, 0x6C) as u64) << 32
@@ -171,23 +270,115 @@ impl Inode {
     fn flags(&self) -> u32 {
         le32(&self.raw, 0x20)
     }
+    fn set_flags(&mut self, f: u32) {
+        put32(&mut self.raw, 0x20, f);
+    }
+    fn has_extents(&self) -> bool {
+        self.flags() & EXT4_EXTENTS_FL != 0
+    }
+    /// A symbolic link whose target is in the inode itself.
+    fn fast_symlink(&self) -> bool {
+        self.kind() == Some(Kind::Symlink) && !self.has_extents() && self.size() < 60
+    }
     /// i_blocks in 512-byte units
+    fn blocks512(&self) -> u64 {
+        le32(&self.raw, 0x1C) as u64 | (le16(&self.raw, 0x74) as u64) << 32
+    }
     fn set_blocks(&mut self, fs_blocks: u64) {
         let s = fs_blocks * SECTORS_PER_BLOCK;
         put32(&mut self.raw, 0x1C, s as u32);
         put16(&mut self.raw, 0x74, (s >> 32) as u16);
     }
+    fn uid(&self) -> u32 {
+        le16(&self.raw, 0x02) as u32 | (le16(&self.raw, 0x78) as u32) << 16
+    }
+    fn set_uid(&mut self, u: u32) {
+        put16(&mut self.raw, 0x02, u as u16);
+        put16(&mut self.raw, 0x78, (u >> 16) as u16);
+    }
+    fn gid(&self) -> u32 {
+        le16(&self.raw, 0x18) as u32 | (le16(&self.raw, 0x7A) as u32) << 16
+    }
+    fn set_gid(&mut self, g: u32) {
+        put16(&mut self.raw, 0x18, g as u16);
+        put16(&mut self.raw, 0x7A, (g >> 16) as u16);
+    }
+    fn atime(&self) -> u32 {
+        le32(&self.raw, 0x08)
+    }
     fn mtime(&self) -> u32 {
         le32(&self.raw, 0x10)
     }
+    fn ctime(&self) -> u32 {
+        le32(&self.raw, 0x0C)
+    }
+    /// The nanosecond fields (in the extra part) are cleared: times are whole seconds.
+    fn extra_times(&self) -> bool {
+        self.raw.len() > 128 && le16(&self.raw, 0x80) >= 0x10
+    }
+    fn set_atime(&mut self, t: u32) {
+        put32(&mut self.raw, 0x08, t);
+        if self.extra_times() {
+            put32(&mut self.raw, 0x8C, 0);
+        }
+    }
+    fn set_mtime(&mut self, t: u32) {
+        put32(&mut self.raw, 0x10, t);
+        if self.extra_times() {
+            put32(&mut self.raw, 0x88, 0);
+        }
+    }
+    fn set_ctime(&mut self, t: u32) {
+        put32(&mut self.raw, 0x0C, t);
+        if self.extra_times() {
+            put32(&mut self.raw, 0x84, 0);
+        }
+    }
+    /// Contents changed: mtime and ctime.
     fn touch(&mut self, now: u32) {
-        put32(&mut self.raw, 0x0C, now); // ctime
-        put32(&mut self.raw, 0x10, now); // mtime
+        self.set_ctime(now);
+        self.set_mtime(now);
+    }
+    fn rdev(&self) -> (u32, u32) {
+        let (old, new) = (le32(&self.raw, 0x28), le32(&self.raw, 0x2C));
+        if old != 0 {
+            (old >> 8 & 0xFF, old & 0xFF)
+        } else {
+            (new >> 8 & 0xFFF, (new & 0xFF) | (new >> 12 & 0xFFF00))
+        }
+    }
+    fn set_rdev(&mut self, (major, minor): (u32, u32)) {
+        if major < 256 && minor < 256 {
+            put32(&mut self.raw, 0x28, major << 8 | minor);
+            put32(&mut self.raw, 0x2C, 0);
+        } else {
+            put32(&mut self.raw, 0x28, 0);
+            put32(&mut self.raw, 0x2C, (minor & 0xFF) | (major & 0xFFF) << 8 | (minor & !0xFF) << 12);
+        }
+    }
+    /// The extended attribute block (0: none).
+    fn xattr_block(&self) -> u64 {
+        le32(&self.raw, 0x68) as u64 | (le16(&self.raw, 0x76) as u64) << 32
+    }
+    fn stat(&self) -> Stat {
+        let kind = self.kind().unwrap_or(Kind::File);
+        Stat {
+            ino: self.ino,
+            kind,
+            mode: self.mode() & 0o7777,
+            links: self.links(),
+            uid: self.uid(),
+            gid: self.gid(),
+            size: self.size(),
+            blocks: self.blocks512(),
+            atime: self.atime(),
+            mtime: self.mtime(),
+            ctime: self.ctime(),
+            rdev: if matches!(kind, Kind::CharDev | Kind::BlockDev) { self.rdev() } else { (0, 0) },
+            dir: kind == Kind::Dir,
+        }
     }
 }
-
-/// A run of the file's blocks: (first logical block, first disk block, count).
-type Run = (u32, u64, u32);
 
 fn has_super(g: u32) -> bool {
     let pow = |mut n: u32, b: u32| {
@@ -260,8 +451,11 @@ impl Fs {
             desc_size: 32,
             first_data_block: 0,
             writable: true,
+            auto_sync: true,
+            cache: cache::Cache::default(),
+            meta_dirty: true,
         };
-        // bitmaps and empty inode tables
+        // bitmaps and empty inode tables (straight to the disk: nothing is cached yet)
         let zero = vec![0u8; BLOCK * 16];
         for g in 0..groups {
             let gr = fs.groups[g as usize];
@@ -337,34 +531,19 @@ impl Fs {
         put32(sb, 0x160, 0x2); // unsigned directory hash
 
         // the root directory and lost+found
-        let root_block = fs.alloc_blocks(v, 1, 0)?;
-        let lf_block = fs.alloc_blocks(v, 1, 0)?;
-        let mut d = vec![0u8; BLOCK];
-        let mut at = 0;
-        at += dirent(&mut d[at..], ROOT, ".", FT_DIR, 12);
-        at += dirent(&mut d[at..], ROOT, "..", FT_DIR, 12);
-        dirent(&mut d[at..], LOST_FOUND, "lost+found", FT_DIR, BLOCK - at);
-        v.write(root_block.1, &d)?;
-        let mut d = vec![0u8; BLOCK];
-        let at = dirent(&mut d, LOST_FOUND, ".", FT_DIR, 12);
-        dirent(&mut d[at..], ROOT, "..", FT_DIR, BLOCK - at);
-        v.write(lf_block.1, &d)?;
-        for (ino, block, links) in [(ROOT, root_block.1, 3u16), (LOST_FOUND, lf_block.1, 2)] {
-            let mut i = Inode { ino, raw: vec![0u8; fs.inode_size] };
-            put16(&mut i.raw, 0, S_IFDIR | if ino == ROOT { 0o755 } else { 0o700 });
-            put32(&mut i.raw, 0x08, now);
-            i.touch(now);
-            i.set_links(links);
-            i.set_size(BLOCK as u64);
-            put32(&mut i.raw, 0x20, EXT4_EXTENTS_FL);
-            put16(&mut i.raw, 0x80, 32);
-            set_extents(&mut i, &[(0, block, 1)]);
-            i.set_blocks(1);
+        for (ino, parent, perm) in [(ROOT, ROOT, 0o755), (LOST_FOUND, ROOT, 0o700)] {
+            if ino != ROOT {
+                fs.mark_inode(v, ino, true, true)?;
+            }
+            let mut i = fs.blank_inode(ino, Kind::Dir, perm, 0, 0, now);
+            fs.init_dir(v, &mut i, parent)?;
             fs.write_inode(v, &i)?;
-            fs.mark_inode(v, ino, true, true)?;
         }
+        fs.dir_add(v, ROOT, LOST_FOUND, "lost+found", Kind::Dir, now)?;
+        fs.adjust_links(v, ROOT, 1, now)?;
         // the root's inode was in use already (reserved): count it as a directory here
         fs.groups[0].used_dirs += 1;
+        fs.sync(v)?;
         fs.write_meta(v, true)?;
         Ok(fs)
     }
@@ -413,7 +592,20 @@ impl Fs {
             .collect();
         // writable only with what this code keeps up, and with no journal to replay
         let writable = incompat & !INCOMPAT_WRITABLE == 0 && ro & !RO_WRITABLE == 0 && compat & COMPAT_HAS_JOURNAL == 0 && incompat & INCOMPAT_RECOVER == 0 && !bit64;
-        Ok(Fs { sb, groups, blocks, blocks_per_group: bpg, inodes_per_group: ipg, inode_size, desc_size, first_data_block, writable })
+        Ok(Fs {
+            sb,
+            groups,
+            blocks,
+            blocks_per_group: bpg,
+            inodes_per_group: ipg,
+            inode_size,
+            desc_size,
+            first_data_block,
+            writable,
+            auto_sync: true,
+            cache: cache::Cache::default(),
+            meta_dirty: false,
+        })
     }
 
     /// (total, free) bytes.
@@ -451,7 +643,16 @@ impl Fs {
             v.write(first, &b)?;
             v.write(first + 1, &gdt)?;
         }
+        self.meta_dirty = false;
         Ok(())
+    }
+
+    fn group_of_ino(&self, ino: u32) -> usize {
+        ((ino - 1) / self.inodes_per_group) as usize
+    }
+
+    fn group_first_block(&self, g: usize) -> u64 {
+        self.first_data_block + g as u64 * self.blocks_per_group as u64
     }
 
     fn inode_loc(&self, ino: u32) -> (u64, usize) {
@@ -462,20 +663,40 @@ impl Fs {
         (self.groups[g].inode_table + (byte / BLOCK) as u64, byte % BLOCK)
     }
 
-    fn read_inode(&self, v: &mut Vol, ino: u32) -> R<Inode> {
+    fn read_inode(&mut self, v: &mut Vol, ino: u32) -> R<Inode> {
         if ino == 0 || ino as usize > self.groups.len() * self.inodes_per_group as usize {
             return Err(Error::Corrupt("inode number out of range"));
         }
         let (b, off) = self.inode_loc(ino);
-        let blk = v.block(b)?;
-        Ok(Inode { ino, raw: blk[off..off + self.inode_size].to_vec() })
+        let size = self.inode_size;
+        let blk = self.mread(v, b)?;
+        Ok(Inode { ino, raw: blk[off..off + size].to_vec() })
     }
 
-    fn write_inode(&self, v: &mut Vol, i: &Inode) -> R<()> {
+    fn write_inode(&mut self, v: &mut Vol, i: &Inode) -> R<()> {
         let (b, off) = self.inode_loc(i.ino);
-        let mut blk = v.block(b)?;
-        blk[off..off + self.inode_size].copy_from_slice(&i.raw);
-        v.write(b, &blk)
+        let size = self.inode_size;
+        self.mmod(v, b)?[off..off + size].copy_from_slice(&i.raw);
+        Ok(())
+    }
+
+    /// A new inode's fields (not yet written): no links, no blocks.
+    fn blank_inode(&self, ino: u32, kind: Kind, perm: u16, uid: u32, gid: u32, now: u32) -> Inode {
+        let mut i = Inode { ino, raw: vec![0u8; self.inode_size] };
+        put16(&mut i.raw, 0, kind.ifmt() | (perm & 0o7777));
+        if self.inode_size > 128 {
+            put16(&mut i.raw, 0x80, 32);
+            put32(&mut i.raw, 0x90, now); // creation time
+        }
+        i.set_uid(uid);
+        i.set_gid(gid);
+        i.set_atime(now);
+        i.touch(now);
+        if matches!(kind, Kind::File | Kind::Dir) {
+            i.set_flags(EXT4_EXTENTS_FL);
+            extent::empty_root(&mut i);
+        }
+        i
     }
 
     /// Mark an inode used or free in its bitmap (and the group's counts).
@@ -483,14 +704,13 @@ impl Fs {
         let i = (ino - 1) as usize;
         let g = i / self.inodes_per_group as usize;
         let bit = i % self.inodes_per_group as usize;
-        let mut bm = v.block(self.groups[g].inode_bitmap)?;
+        let bm = self.mmod(v, self.groups[g].inode_bitmap)?;
         let was = bm[bit / 8] & (1 << (bit % 8)) != 0;
         if used {
             bm[bit / 8] |= 1 << (bit % 8);
         } else {
             bm[bit / 8] &= !(1 << (bit % 8));
         }
-        v.write(self.groups[g].inode_bitmap, &bm)?;
         let gr = &mut self.groups[g];
         match (was, used) {
             (false, true) => {
@@ -507,43 +727,60 @@ impl Fs {
             }
             _ => {}
         }
+        self.meta_dirty = true;
         Ok(())
     }
 
-    fn alloc_inode(&mut self, v: &mut Vol, dir: bool) -> R<u32> {
-        for g in 0..self.groups.len() {
+    /// A free inode, looking from group `near` on.
+    fn alloc_inode(&mut self, v: &mut Vol, dir: bool, near: usize) -> R<u32> {
+        let n = self.groups.len();
+        for k in 0..n {
+            let g = (near + k) % n;
             if self.groups[g].free_inodes == 0 {
                 continue;
             }
-            let bm = v.block(self.groups[g].inode_bitmap)?;
-            for bit in 0..self.inodes_per_group as usize {
-                if bm[bit / 8] & (1 << (bit % 8)) == 0 {
-                    let ino = (g * self.inodes_per_group as usize + bit + 1) as u32;
-                    if ino < FIRST_INO {
-                        continue;
-                    }
-                    self.mark_inode(v, ino, true, dir)?;
-                    return Ok(ino);
-                }
+            let ipg = self.inodes_per_group as usize;
+            let bm = self.mread(v, self.groups[g].inode_bitmap)?;
+            let found = (0..ipg).find(|&bit| bm[bit / 8] & (1 << (bit % 8)) == 0 && (g * ipg + bit + 1) as u32 >= FIRST_INO);
+            if let Some(bit) = found {
+                let ino = (g * ipg + bit + 1) as u32;
+                self.mark_inode(v, ino, true, dir)?;
+                return Ok(ino);
             }
         }
         Err(Error::Full)
     }
 
-    /// Up to `want` blocks in one run (fewer if no run is that long), from
-    /// group `near` on: (count, first block).
-    fn alloc_blocks(&mut self, v: &mut Vol, want: u32, near: usize) -> R<(u32, u64)> {
+    /// Up to `want` blocks in one run (fewer if no run is that long), looking
+    /// from block `goal` on: (count, first block).
+    fn alloc_blocks(&mut self, v: &mut Vol, want: u32, goal: u64) -> R<(u32, u64)> {
         let n = self.groups.len();
+        let bpg = self.blocks_per_group as usize;
+        let goal = if goal < self.first_data_block || goal >= self.blocks { self.first_data_block } else { goal };
+        let g0 = ((goal - self.first_data_block) / bpg as u64) as usize;
+        let b0 = ((goal - self.first_data_block) % bpg as u64) as usize;
         let mut best: Option<(usize, usize, u32)> = None; // (group, first bit, len)
-        for k in 0..n {
-            let g = (near + k) % n;
-            if self.groups[g].free_blocks == 0 {
+        // the goal's group from the goal, the others, then the goal's group before the goal
+        for k in 0..=n {
+            let g = (g0 + k) % n;
+            let (from, to) = match k {
+                0 => (b0, bpg),
+                _ if k == n => (0, b0),
+                _ => (0, bpg),
+            };
+            if self.groups[g].free_blocks == 0 || from >= to {
                 continue;
             }
-            let bm = v.block(self.groups[g].block_bitmap)?;
+            let bm = self.mread(v, self.groups[g].block_bitmap)?;
             let mut run_start = None;
-            for bit in 0..=self.blocks_per_group as usize {
-                let used = bit == self.blocks_per_group as usize || bm[bit / 8] & (1 << (bit % 8)) != 0;
+            let mut bit = from;
+            while bit <= to {
+                // whole bytes in use are skipped
+                if run_start.is_none() && bit % 8 == 0 && bit + 8 <= to && bm[bit / 8] == 0xFF {
+                    bit += 8;
+                    continue;
+                }
+                let used = bit == to || bm[bit / 8] & (1 << (bit % 8)) != 0;
                 match (used, run_start) {
                     (false, None) => run_start = Some(bit),
                     (true, Some(s)) => {
@@ -556,8 +793,10 @@ impl Fs {
                         }
                         run_start = None;
                     }
+                    (false, Some(s)) if (bit - s) as u32 >= want => return self.take(v, g, s, want),
                     _ => {}
                 }
+                bit += 1;
             }
         }
         match best {
@@ -567,453 +806,58 @@ impl Fs {
     }
 
     fn take(&mut self, v: &mut Vol, g: usize, first_bit: usize, len: u32) -> R<(u32, u64)> {
-        let bmb = self.groups[g].block_bitmap;
-        let mut bm = v.block(bmb)?;
+        let bm = self.mmod(v, self.groups[g].block_bitmap)?;
         for b in first_bit..first_bit + len as usize {
             bm[b / 8] |= 1 << (b % 8);
         }
-        v.write(bmb, &bm)?;
         self.groups[g].free_blocks -= len;
-        Ok((len, self.first_data_block + g as u64 * self.blocks_per_group as u64 + first_bit as u64))
+        self.meta_dirty = true;
+        Ok((len, self.group_first_block(g) + first_bit as u64))
     }
 
     fn free_blocks(&mut self, v: &mut Vol, first: u64, len: u64) -> R<()> {
+        self.forget(first, len);
         let mut b = first;
         while b < first + len {
             let rel = b - self.first_data_block;
             let g = (rel / self.blocks_per_group as u64) as usize;
             let bit = (rel % self.blocks_per_group as u64) as usize;
             let n = (first + len - b).min((self.blocks_per_group as usize - bit) as u64) as usize;
-            let bmb = self.groups[g].block_bitmap;
-            let mut bm = v.block(bmb)?;
+            let bm = self.mmod(v, self.groups[g].block_bitmap)?;
             for k in bit..bit + n {
                 bm[k / 8] &= !(1 << (k % 8));
             }
-            v.write(bmb, &bm)?;
             self.groups[g].free_blocks += n as u32;
             b += n as u64;
         }
+        self.meta_dirty = true;
         Ok(())
     }
 
-    // ------------------------------------------------------------ extents
-
-    /// The file's runs, in logical order (depth 0 or more).
-    fn runs(&self, v: &mut Vol, i: &Inode) -> R<Vec<Run>> {
-        if i.flags() & EXT4_EXTENTS_FL == 0 {
-            return Err(Error::Corrupt("a file without extents (old block maps are not supported)"));
-        }
-        let mut out = Vec::new();
-        self.walk(v, &i.raw[0x28..0x28 + 60], &mut out, 0)?;
-        Ok(out)
-    }
-
-    fn walk(&self, v: &mut Vol, node: &[u8], out: &mut Vec<Run>, level: u32) -> R<()> {
-        if le16(node, 0) != EXTENT_MAGIC || level > 5 {
-            return Err(Error::Corrupt("bad extent header"));
-        }
-        let entries = le16(node, 2) as usize;
-        let depth = le16(node, 6);
-        for k in 0..entries {
-            let e = &node[12 + k * 12..24 + k * 12];
-            if depth == 0 {
-                let mut len = le16(e, 4) as u32;
-                if len > EXTENT_MAX {
-                    len -= EXTENT_MAX; // unwritten extent: reads as zeros, but blocks are its
-                }
-                out.push((le32(e, 0), (le16(e, 6) as u64) << 32 | le32(e, 8) as u64, len));
-            } else {
-                let child = (le16(e, 8) as u64) << 32 | le32(e, 4) as u64;
-                let blk = v.block(child)?;
-                self.walk(v, &blk, out, level + 1)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Blocks of the extent tree itself (index and leaf blocks).
-    fn tree_blocks(&self, _v: &mut Vol, i: &Inode) -> R<Vec<u64>> {
-        let mut out = Vec::new();
-        let root = i.raw[0x28..0x28 + 60].to_vec();
-        if le16(&root, 6) > 0 {
-            for k in 0..le16(&root, 2) as usize {
-                let e = &root[12 + k * 12..24 + k * 12];
-                out.push((le16(e, 8) as u64) << 32 | le32(e, 4) as u64);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Map the inode to `runs`: up to 4 in the inode, else one level of leaf blocks.
-    fn map(&mut self, v: &mut Vol, i: &mut Inode, runs: &[Run]) -> R<u64> {
-        if runs.len() <= 4 {
-            set_extents(i, runs);
-            return Ok(0);
-        }
-        let per_leaf = (BLOCK - 12) / 12;
-        let leaves: Vec<&[Run]> = runs.chunks(per_leaf).collect();
-        if leaves.len() > 4 {
-            return Err(Error::TooBig);
-        }
-        let mut index = Vec::new();
-        for leaf in &leaves {
-            let (_, b) = self.alloc_blocks(v, 1, 0)?;
-            let mut blk = vec![0u8; BLOCK];
-            put16(&mut blk, 0, EXTENT_MAGIC);
-            put16(&mut blk, 2, leaf.len() as u16);
-            put16(&mut blk, 4, per_leaf as u16);
-            put16(&mut blk, 6, 0);
-            for (k, r) in leaf.iter().enumerate() {
-                extent(&mut blk[12 + k * 12..24 + k * 12], r);
-            }
-            v.write(b, &blk)?;
-            index.push((leaf[0].0, b));
-        }
-        let ib = &mut i.raw[0x28..0x28 + 60];
-        ib.fill(0);
-        put16(ib, 0, EXTENT_MAGIC);
-        put16(ib, 2, index.len() as u16);
-        put16(ib, 4, 4);
-        put16(ib, 6, 1);
-        for (k, (lblk, b)) in index.iter().enumerate() {
-            let e = &mut ib[12 + k * 12..24 + k * 12];
-            put32(e, 0, *lblk);
-            put32(e, 4, *b as u32);
-            put16(e, 8, (*b >> 32) as u16);
-        }
-        Ok(index.len() as u64)
-    }
-
-    // ------------------------------------------------------------ directories
-
-    /// (inode, file type, name) of a directory's entries.
-    fn entries(&self, v: &mut Vol, dir: &Inode) -> R<Vec<(u32, u8, String)>> {
-        let mut out = Vec::new();
-        for (lb, pb, n) in self.runs(v, dir)? {
-            for k in 0..n as u64 {
-                if (lb as u64 + k) * BLOCK as u64 >= dir.size() {
-                    break;
-                }
-                let blk = v.block(pb + k)?;
-                let mut at = 0;
-                while at + 8 <= BLOCK {
-                    let ino = le32(&blk, at);
-                    let rec = le16(&blk, at + 4) as usize;
-                    let nl = blk[at + 6] as usize;
-                    if rec < 8 || at + rec > BLOCK || 8 + nl > rec {
-                        return Err(Error::Corrupt("bad directory entry"));
-                    }
-                    if ino != 0 && nl > 0 {
-                        out.push((ino, blk[at + 7], String::from_utf8_lossy(&blk[at + 8..at + 8 + nl]).into_owned()));
-                    }
-                    at += rec;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn lookup(&self, v: &mut Vol, dir: &Inode, name: &str) -> R<Option<(u32, u8)>> {
-        Ok(self.entries(v, dir)?.into_iter().find(|e| e.2 == name).map(|e| (e.0, e.1)))
-    }
-
-    /// The inode of `path` ("" or "/" is the root).
-    fn resolve(&self, v: &mut Vol, path: &str) -> R<Inode> {
-        let mut cur = self.read_inode(v, ROOT)?;
-        for c in components(path)? {
-            if !cur.is_dir() {
-                return Err(Error::NotADirectory);
-            }
-            let (ino, _) = self.lookup(v, &cur, c)?.ok_or(Error::NotFound)?;
-            cur = self.read_inode(v, ino)?;
-        }
-        Ok(cur)
-    }
-
-    /// A directory about to change: an index it has would go stale, so it
-    /// becomes a plain one (its blocks read right as such).
-    fn unindex(dir: &mut Inode) {
-        let fl = dir.flags();
-        if fl & EXT4_INDEX_FL != 0 {
-            put32(&mut dir.raw, 0x20, fl & !EXT4_INDEX_FL);
-        }
-    }
-
-    /// Put an entry into a directory (a new block if no room).
-    fn add_entry(&mut self, v: &mut Vol, dir: &mut Inode, ino: u32, name: &str, ft: u8, now: u32) -> R<()> {
-        Self::unindex(dir);
-        let need = (8 + name.len()).next_multiple_of(4);
-        let runs = self.runs(v, dir)?;
-        for &(lb, pb, n) in &runs {
-            for k in 0..n as u64 {
-                if (lb as u64 + k) * BLOCK as u64 >= dir.size() {
-                    break;
-                }
-                let mut blk = v.block(pb + k)?;
-                let mut at = 0;
-                while at + 8 <= BLOCK {
-                    let e_ino = le32(&blk, at);
-                    let rec = le16(&blk, at + 4) as usize;
-                    let nl = blk[at + 6] as usize;
-                    if rec < 8 || at + rec > BLOCK {
-                        return Err(Error::Corrupt("bad directory entry"));
-                    }
-                    let used = if e_ino == 0 { 0 } else { (8 + nl).next_multiple_of(4) };
-                    if rec - used >= need {
-                        if e_ino == 0 {
-                            dirent(&mut blk[at..], ino, name, ft, rec);
-                        } else {
-                            put16(&mut blk, at + 4, used as u16);
-                            dirent(&mut blk[at + used..], ino, name, ft, rec - used);
-                        }
-                        v.write(pb + k, &blk)?;
-                        dir.touch(now);
-                        return self.write_inode(v, dir);
-                    }
-                    at += rec;
-                }
-            }
-        }
-        // a new block at the end
-        let (_, b) = self.alloc_blocks(v, 1, 0)?;
-        let mut blk = vec![0u8; BLOCK];
-        dirent(&mut blk, ino, name, ft, BLOCK);
-        v.write(b, &blk)?;
-        let next = (dir.size() / BLOCK as u64) as u32;
-        let mut runs = runs;
-        match runs.last_mut() {
-            Some(last) if last.0 + last.2 == next && last.1 + last.2 as u64 == b && last.2 < EXTENT_MAX => last.2 += 1,
-            _ => runs.push((next, b, 1)),
-        }
-        let old_tree = self.tree_blocks(v, dir)?;
-        let tree = self.map(v, dir, &runs)?;
-        for t in old_tree {
-            self.free_blocks(v, t, 1)?;
-        }
-        dir.set_size(dir.size() + BLOCK as u64);
-        dir.set_blocks(runs.iter().map(|r| r.2 as u64).sum::<u64>() + tree);
-        dir.touch(now);
-        self.write_inode(v, dir)
-    }
-
-    /// Take an entry out of a directory.
-    fn remove_entry(&mut self, v: &mut Vol, dir: &mut Inode, name: &str, now: u32) -> R<()> {
-        Self::unindex(dir);
-        for (lb, pb, n) in self.runs(v, dir)? {
-            for k in 0..n as u64 {
-                if (lb as u64 + k) * BLOCK as u64 >= dir.size() {
-                    break;
-                }
-                let mut blk = v.block(pb + k)?;
-                let mut at = 0;
-                let mut prev: Option<usize> = None;
-                while at + 8 <= BLOCK {
-                    let rec = le16(&blk, at + 4) as usize;
-                    let nl = blk[at + 6] as usize;
-                    if rec < 8 || at + rec > BLOCK {
-                        return Err(Error::Corrupt("bad directory entry"));
-                    }
-                    if le32(&blk, at) != 0 && &blk[at + 8..at + 8 + nl] == name.as_bytes() {
-                        match prev {
-                            Some(p) => {
-                                let prec = le16(&blk, p + 4) as usize;
-                                put16(&mut blk, p + 4, (prec + rec) as u16);
-                            }
-                            None => put32(&mut blk, at, 0), // first in its block: emptied, kept
-                        }
-                        v.write(pb + k, &blk)?;
-                        dir.touch(now);
-                        return self.write_inode(v, dir);
-                    }
-                    prev = Some(at);
-                    at += rec;
-                }
-            }
-        }
-        Err(Error::NotFound)
-    }
-
-    fn new_dir(&mut self, v: &mut Vol, parent: &mut Inode, name: &str, now: u32) -> R<Inode> {
-        let ino = self.alloc_inode(v, true)?;
-        let near = ((ino - 1) / self.inodes_per_group) as usize;
-        let (_, b) = self.alloc_blocks(v, 1, near)?;
-        let mut d = vec![0u8; BLOCK];
-        let at = dirent(&mut d, ino, ".", FT_DIR, 12);
-        dirent(&mut d[at..], parent.ino, "..", FT_DIR, BLOCK - at);
-        v.write(b, &d)?;
-        let mut i = Inode { ino, raw: vec![0u8; self.inode_size] };
-        put16(&mut i.raw, 0, S_IFDIR | 0o755);
-        put32(&mut i.raw, 0x08, now);
-        i.touch(now);
-        i.set_links(2);
-        i.set_size(BLOCK as u64);
-        put32(&mut i.raw, 0x20, EXT4_EXTENTS_FL);
-        if self.inode_size > 128 {
-            put16(&mut i.raw, 0x80, 32);
-        }
-        set_extents(&mut i, &[(0, b, 1)]);
-        i.set_blocks(1);
-        self.write_inode(v, &i)?;
-        self.add_entry(v, parent, ino, name, FT_DIR, now)?;
-        parent.set_links(parent.links() + 1);
-        self.write_inode(v, parent)?;
-        Ok(i)
-    }
-
-    // ------------------------------------------------------------ the API
-
-    pub fn stat(&self, v: &mut Vol, path: &str) -> R<Stat> {
-        let i = self.resolve(v, path)?;
-        Ok(Stat { ino: i.ino, size: i.size(), dir: i.is_dir(), mtime: i.mtime() })
-    }
-
-    /// Bytes of a file from `offset`: how many (0 at its end).
-    pub fn read(&self, v: &mut Vol, path: &str, offset: u64, buf: &mut [u8]) -> R<usize> {
-        let i = self.resolve(v, path)?;
-        if i.is_dir() {
-            return Err(Error::IsADirectory);
-        }
-        let size = i.size();
-        if offset >= size || buf.is_empty() {
-            return Ok(0);
-        }
-        let n = (buf.len() as u64).min(size - offset) as usize;
-        buf[..n].fill(0); // holes read as zeros
-        let runs = self.runs(v, &i)?;
-        let first = offset / BLOCK as u64;
-        let last = (offset + n as u64 - 1) / BLOCK as u64;
-        let mut blk = vec![0u8; BLOCK];
-        for lb in first..=last {
-            let Some(&(l0, p0, _)) = runs.iter().find(|r| lb >= r.0 as u64 && lb < r.0 as u64 + r.2 as u64) else { continue };
-            v.read(p0 + (lb - l0 as u64), &mut blk)?;
-            let bs = lb * BLOCK as u64;
-            let from = offset.max(bs);
-            let to = (offset + n as u64).min(bs + BLOCK as u64);
-            buf[(from - offset) as usize..(to - offset) as usize].copy_from_slice(&blk[(from - bs) as usize..(to - bs) as usize]);
-        }
-        Ok(n)
-    }
-
-    /// The entries of a directory: (name, stat), without "." and "..".
-    pub fn list(&self, v: &mut Vol, path: &str) -> R<Vec<(String, Stat)>> {
-        let d = self.resolve(v, path)?;
-        if !d.is_dir() {
-            return Err(Error::NotADirectory);
-        }
-        let mut out = Vec::new();
-        for (ino, _, name) in self.entries(v, &d)? {
-            if name == "." || name == ".." {
-                continue;
-            }
-            let i = self.read_inode(v, ino)?;
-            out.push((name, Stat { ino, size: i.size(), dir: i.is_dir(), mtime: i.mtime() }));
-        }
-        Ok(out)
-    }
-
-    /// Make a directory and those above it that are missing.
-    pub fn mkdir_p(&mut self, v: &mut Vol, path: &str, now: u32) -> R<()> {
-        if !self.writable {
-            return Err(Error::ReadOnly);
-        }
-        let mut cur = self.read_inode(v, ROOT)?;
-        for c in components(path)? {
-            match self.lookup(v, &cur, c)? {
-                Some((ino, _)) => {
-                    cur = self.read_inode(v, ino)?;
-                    if !cur.is_dir() {
-                        return Err(Error::NotADirectory);
-                    }
-                }
-                None => cur = self.new_dir(v, &mut cur, c, now)?,
-            }
-        }
-        self.write_meta(v, false)
-    }
-
-    /// Create or replace a file with `data` (the directories above are made).
-    pub fn write_file(&mut self, v: &mut Vol, path: &str, data: &[u8], now: u32) -> R<()> {
-        if !self.writable {
-            return Err(Error::ReadOnly);
-        }
-        let mut parts = components(path)?;
-        let name = parts.pop().ok_or(Error::BadName)?;
-        let dirpath = parts.join("/");
-        self.mkdir_p(v, &dirpath, now)?;
-        let mut dir = self.resolve(v, &dirpath)?;
-        let old = self.lookup(v, &dir, name)?;
-        if let Some((ino, _)) = old {
-            if self.read_inode(v, ino)?.is_dir() {
-                return Err(Error::IsADirectory);
-            }
-        }
-        // the data first, in as few runs as the free space allows
-        let total = data.len().div_ceil(BLOCK) as u64;
-        if total > (u32::MAX as u64) {
-            return Err(Error::TooBig);
-        }
-        let ino = self.alloc_inode(v, false)?;
-        let near = ((ino - 1) / self.inodes_per_group) as usize;
-        let mut runs: Vec<Run> = Vec::new();
-        let mut done = 0u64;
-        let result = (|| -> R<()> {
-            while done < total {
-                let want = (total - done).min(EXTENT_MAX as u64) as u32;
-                let (n, b) = self.alloc_blocks(v, want, near)?;
-                runs.push((done as u32, b, n));
-                let from = done as usize * BLOCK;
-                let to = (from + n as usize * BLOCK).min(data.len());
-                let mut chunk = data[from..to].to_vec();
-                chunk.resize(n as usize * BLOCK, 0);
-                v.write(b, &chunk)?;
-                done += n as u64;
-            }
-            Ok(())
-        })();
-        let mut i = Inode { ino, raw: vec![0u8; self.inode_size] };
-        let tree = match result.and_then(|_| self.map(v, &mut i, &runs)) {
-            Ok(t) => t,
-            Err(e) => {
-                for (_, b, n) in &runs {
-                    let _ = self.free_blocks(v, *b, *n as u64);
-                }
-                let _ = self.mark_inode(v, ino, false, false);
-                let _ = self.write_meta(v, false);
-                return Err(e);
-            }
-        };
-        put16(&mut i.raw, 0, S_IFREG | 0o644);
-        put32(&mut i.raw, 0x08, now);
-        i.touch(now);
-        i.set_links(1);
-        i.set_size(data.len() as u64);
-        let fl = EXT4_EXTENTS_FL | le32(&i.raw, 0x20);
-        put32(&mut i.raw, 0x20, fl);
-        if self.inode_size > 128 {
-            put16(&mut i.raw, 0x80, 32);
-        }
-        i.set_blocks(total + tree);
-        self.write_inode(v, &i)?;
-        // then the name: the new file replaces the old one
-        if old.is_some() {
-            self.remove_entry(v, &mut dir, name, now)?;
-        }
-        self.add_entry(v, &mut dir, ino, name, FT_REG, now)?;
-        if let Some((old_ino, _)) = old {
-            self.release(v, old_ino, now)?;
-        }
-        self.write_meta(v, false)
-    }
-
-    /// A file's blocks and inode back to the free space.
+    /// An inode's blocks and itself back to the free space (no links left).
     fn release(&mut self, v: &mut Vol, ino: u32, now: u32) -> R<()> {
         let mut i = self.read_inode(v, ino)?;
         let dir = i.is_dir();
-        for (_, b, n) in self.runs(v, &i)? {
-            self.free_blocks(v, b, n as u64)?;
+        if i.has_extents() {
+            for e in self.runs(v, &i)? {
+                self.free_blocks(v, e.p, e.n as u64)?;
+            }
+            for t in self.tree_blocks(v, &i)? {
+                self.free_blocks(v, t, 1)?;
+            }
+        } else if !i.fast_symlink() && i.blocks512() != 0 && !matches!(i.kind(), Some(Kind::CharDev | Kind::BlockDev | Kind::Fifo | Kind::Socket)) {
+            return Err(Error::Corrupt("a file without extents (old block maps are not supported)"));
         }
-        for t in self.tree_blocks(v, &i)? {
-            self.free_blocks(v, t, 1)?;
+        // an extended attribute block: shared by reference count
+        let xb = i.xattr_block();
+        if xb != 0 {
+            let blk = self.mmod(v, xb)?;
+            let refs = le32(blk, 4);
+            if refs <= 1 {
+                self.free_blocks(v, xb, 1)?;
+            } else {
+                put32(blk, 4, refs - 1);
+            }
         }
         i.set_links(0);
         put32(&mut i.raw, 0x14, now); // dtime
@@ -1021,64 +865,33 @@ impl Fs {
         self.mark_inode(v, ino, false, dir)
     }
 
-    /// Remove a file or an empty directory; false if there was none.
-    pub fn remove(&mut self, v: &mut Vol, path: &str, now: u32) -> R<bool> {
+    /// One more or one fewer link to an inode; with none left it is released.
+    fn adjust_links(&mut self, v: &mut Vol, ino: u32, delta: i32, now: u32) -> R<()> {
+        let mut i = self.read_inode(v, ino)?;
+        let n = i.links() as i32 + delta;
+        if n > MAX_LINKS as i32 {
+            return Err(Error::TooManyLinks);
+        }
+        i.set_links(n.max(0) as u16);
+        i.set_ctime(now);
+        self.write_inode(v, &i)?;
+        if n <= 0 {
+            self.release(v, ino, now)?;
+        }
+        Ok(())
+    }
+
+    /// Run a changing call: refused when read only, synced after (even when
+    /// it failed half way: what it did is kept consistent).
+    fn change<T>(&mut self, v: &mut Vol, f: impl FnOnce(&mut Fs, &mut Vol) -> R<T>) -> R<T> {
         if !self.writable {
             return Err(Error::ReadOnly);
         }
-        let mut parts = components(path)?;
-        let Some(name) = parts.pop() else { return Err(Error::BadName) };
-        let dirpath = parts.join("/");
-        let mut dir = match self.resolve(v, &dirpath) {
-            Ok(d) => d,
-            Err(Error::NotFound) => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        let Some((ino, _)) = self.lookup(v, &dir, name)? else { return Ok(false) };
-        let i = self.read_inode(v, ino)?;
-        if i.is_dir() {
-            if self.entries(v, &i)?.iter().any(|e| e.2 != "." && e.2 != "..") {
-                return Err(Error::NotEmpty);
-            }
-            dir.set_links(dir.links().saturating_sub(1));
-        }
-        self.remove_entry(v, &mut dir, name, now)?;
-        self.release(v, ino, now)?;
-        self.write_meta(v, false)?;
-        Ok(true)
-    }
-}
-
-/// Write a directory entry at the start of `b`; returns `rec_len`.
-fn dirent(b: &mut [u8], ino: u32, name: &str, ft: u8, rec_len: usize) -> usize {
-    put32(b, 0, ino);
-    put16(b, 4, rec_len as u16);
-    b[6] = name.len() as u8;
-    b[7] = ft;
-    b[8..8 + name.len()].copy_from_slice(name.as_bytes());
-    for x in &mut b[8 + name.len()..(8 + name.len()).next_multiple_of(4).min(rec_len)] {
-        *x = 0;
-    }
-    rec_len
-}
-
-fn extent(e: &mut [u8], r: &Run) {
-    put32(e, 0, r.0);
-    put16(e, 4, r.2 as u16);
-    put16(e, 6, (r.1 >> 32) as u16);
-    put32(e, 8, r.1 as u32);
-}
-
-/// Up to four runs right in the inode (depth 0).
-fn set_extents(i: &mut Inode, runs: &[Run]) {
-    let b = &mut i.raw[0x28..0x28 + 60];
-    b.fill(0);
-    put16(b, 0, EXTENT_MAGIC);
-    put16(b, 2, runs.len() as u16);
-    put16(b, 4, 4);
-    put16(b, 6, 0);
-    for (k, r) in runs.iter().enumerate() {
-        extent(&mut b[12 + k * 12..24 + k * 12], r);
+        let r = f(self, v);
+        let s = if self.auto_sync { self.sync(v) } else { Ok(()) };
+        let t = r?;
+        s?;
+        Ok(t)
     }
 }
 

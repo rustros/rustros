@@ -177,6 +177,27 @@ pub trait App {
 - TCP 应用可以用 `rustros_util::conn::Conn`，它帮你处理部分写入和关闭前刷完数据。
 - NAT、交换、隧道这类按包处理的应用，用 `on_frame` 直接处理原始帧，不经过 socket 层。
 
+## 长期目标
+
+**纯 Rust 极致转发流量 + Linux 兼容模块跑 Docker/Go/PostgreSQL 业务。**
+
+- **数据面（Data Plane）留在 RustROS 的内核里**：路由、NAT、VPN、代理这类网络流量，由纯 Rust 的高性能内核直接处理，追求极致转发性能。
+- **业务跑在容器里**：一个可选的 **Linux 兼容模块**（参考 Asterinas 的思路，在系统调用层兼容 Linux）运行标准的 Docker 守护进程，再由它运行任意 Linux 容器，包括 Go 写的平台和 PostgreSQL。
+- 不走虚拟化（VMX）这条路：云主机（例如阿里云 ECS）通常不提供嵌套虚拟化。也不靠 WebAssembly：PostgreSQL 这类软件搬不过去。
+
+为此要铺的路（大致按顺序）：
+
+1. **ext4**：做到 PostgreSQL 能放心使用的程度。
+   - 按偏移读写，truncate、fsync，原子 rename，硬链接和符号链接，权限、属主和时间；
+   - jbd2 日志，保证掉电安全，且和 Linux 互通；
+   - metadata_csum 和 64bit 特性，能写 Linux 格式化出来的盘。
+2. **内核演进**：进程和用户态（ring 3）、每个进程独立的地址空间、多核调度，以及 VFS 层。
+3. **Linux 兼容模块**：
+   - 系统调用：clone、futex、mmap、epoll、信号……
+   - 容器需要的内核机制：namespaces、cgroups、overlayfs、veth/bridge、netfilter；
+   - 目标是 dockerd、containerd、runc 原样运行。
+4. **业务和网络的衔接**：容器的网络接到 RustROS 的数据面上，转发路径不经过兼容层。
+
 ## 现状与限制
 
 - 单核，轮询驱动（网卡/磁盘不用中断，PIT 只用来唤醒 `hlt`）
