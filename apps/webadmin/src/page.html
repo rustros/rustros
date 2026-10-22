@@ -172,7 +172,7 @@ const hashMod=()=>decodeURIComponent(location.hash.slice(1).split("/")[1]||"");
 let cur=fromHash(),timer=null;
 function tab(t){cur=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
   ["status","net","mods","log","sys"].forEach(x=>$("t-"+x).hidden=x!==t);
-  clearInterval(timer);const f={status:loadStatus,net:loadNet,mods:loadMods,log:loadLog,sys:()=>{}}[t];
+  clearInterval(timer);const f={status:loadStatus,net:loadNet,mods:loadMods,log:loadLog,sys:async()=>{}}[t];
   f().catch(()=>{});if(t==="status"||t==="log"||t==="net")timer=setInterval(()=>f().catch(()=>{}),t==="net"?3000:2000)}
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{location.hash=b.dataset.t});
 window.addEventListener("hashchange",()=>{if($("app").hidden)return;if(fromHash()===cur&&cur==="mods")modPage(mods.find(m=>m.name===hashMod()));else tab(fromHash())});
