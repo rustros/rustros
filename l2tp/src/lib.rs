@@ -617,5 +617,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
+mod client;
+pub use client::{Client, ClientConfig, ClientEvent, md5};
+
 #[cfg(test)]
 mod tests;

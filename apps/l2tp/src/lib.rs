@@ -5,7 +5,8 @@
 //! Instances: one server per address clients connect to, each its own
 //! network (pool, NAT, egress). The same account on two addresses lands in
 //! two networks. The unprefixed settings are the default instance, which
-//! takes every address no named instance binds (`bind off`: none).
+//! takes every address no named instance binds (`bind off`: none; no
+//! setting at all: no default instance).
 //!
 //! Everything goes over the packet path: control messages are answered from
 //! the address they were sent to; data packets are handled in place (strip
@@ -27,6 +28,23 @@
 //! dns           8.8.8.8,1.1.1.1
 //! mtu           1400                tunnel MTU (TCP MSS clamped to it)
 //! ```
+//!
+//! Client tunnels (dialing out to an L2TP server, a WAN for some LAN hosts):
+//!
+//! ```text
+//! client.<name>.server    a.b.c.d[:port]      the server to dial
+//! client.<name>.user      name
+//! client.<name>.password  text                (PAP or CHAP-MD5)
+//! client.<name>.hosts     10.9.0.5,10.9.1.0/24     whose traffic beyond our own
+//!                                             networks goes through it
+//! client.<name>.nat       on | off            translate them to the tunnel's
+//!                                             address (default), or route them
+//!                                             in as they are (site to site)
+//! client.<name>.src       a.b.c.d             our address to dial from
+//! client.<name>.mtu       1400
+//! ```
+//!
+//! While a tunnel is down its hosts' traffic is not sent another way.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -38,12 +56,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustros_api::{Caps, Frame, Module, Offload, Packet, Sys, Verdict, say};
-use rustros_util::wire::{Ip, IpFmt, checksum, parse_ip};
-use l2tp_core::{Account, Config, DATA_HEADER, Data, Event, Peer, Server, data_header};
+use rustros_util::wire::{Ip, IpFmt, checksum, parse_cidr, parse_ip};
+use l2tp_core::{Account, Client, ClientConfig, ClientEvent, Config, DATA_HEADER, Data, Event, Peer, Server, data_header};
 use nat_core::{Inbound, Nat, icmp_error};
 
-/// Place on the packet path (with the other translators).
-const ORDER: i32 = 0;
+/// Place on the packet path: before NAT (0), so the hosts sent through a
+/// client tunnel go there first.
+const ORDER: i32 = -10;
 const PORT: u16 = 1701;
 const ETH: usize = 14;
 /// Ethernet + IPv4 + UDP + L2TP/PPP in front of a client's packet.
@@ -59,6 +78,31 @@ struct Nic {
     mac: [u8; 6],
     ip: Ip,
     mtu: usize,
+}
+
+/// A client tunnel: dialed out to an L2TP server, the way out for `hosts`.
+struct Dialer {
+    name: String,
+    server: Peer,
+    /// our address to dial from (0: the one towards the server)
+    src: Ip,
+    /// the address in use for the tunnel (set when dialing)
+    local: Ip,
+    /// LAN hosts and networks sent through it: (net, mask)
+    hosts: Vec<(Ip, Ip)>,
+    /// translate them to the tunnel's address (else route them in as they are)
+    nat_on: bool,
+    mtu: u16,
+    client: Client,
+    nat: Nat,
+    retry_at: u64,
+    backoff: u64,
+    /// what happened last (status)
+    last: String,
+    out_packets: u64,
+    in_packets: u64,
+    /// the settings it was made with (a change starts it over)
+    sig: String,
 }
 
 struct Instance {
@@ -93,6 +137,9 @@ pub struct L2tpModule {
     dropped: u64,
     /// what happened on the packet path, to report in `poll`: (instance, event)
     events: Vec<(usize, Event)>,
+    dialers: Vec<Dialer>,
+    /// what the client tunnels have to tell, for `poll`: (dialer, event)
+    client_events: Vec<(usize, ClientEvent)>,
 }
 
 fn be16(p: &[u8], o: usize) -> u16 {
@@ -107,6 +154,16 @@ fn ip_fix(h: &mut [u8]) {
     h[10..12].fill(0);
     let c = checksum(&h[..20], 0);
     h[10..12].copy_from_slice(&c.to_be_bytes());
+}
+
+/// TTL down by one (the header checksum follows); false if it ran out.
+fn dec_ttl(p: &mut [u8]) -> bool {
+    if p.len() < 20 || p[8] <= 1 {
+        return false;
+    }
+    p[8] -= 1;
+    ip_fix(p);
+    true
 }
 
 /// (instance name, key) of a setting: "pool" -> ("", "pool"),
@@ -175,17 +232,25 @@ impl L2tpModule {
         if text == self.applied {
             return;
         }
-        // settings by instance
+        // settings by instance (client tunnels apart)
         let mut by: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+        let mut clients: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
         by.entry("").or_default();
         for (k, v) in &settings {
+            if let Some((name, key)) = k.strip_prefix("client.").and_then(|r| r.split_once('.')) {
+                clients.entry(name).or_default().push((key, v.as_str()));
+                continue;
+            }
             match split_key(k) {
                 Some((name, key)) => by.entry(name).or_default().push((key, v.as_str())),
                 None => say!(sys, "l2tp: unknown setting '{}'\n", k),
             }
         }
         let shared = accounts(&by[""]);
-        let wanted: Vec<(&str, &Vec<(&str, &str)>)> = by.iter().map(|(n, s)| (*n, s)).filter(|(n, s)| !(n.is_empty() && get(s, "bind") == Some("off"))).collect();
+        // the default instance serves only once it has a setting (and not
+        // with bind off): a module used just to dial out runs no server
+        let wanted: Vec<(&str, &Vec<(&str, &str)>)> =
+            by.iter().map(|(n, s)| (*n, s)).filter(|(n, s)| !(n.is_empty() && (s.is_empty() || get(s, "bind") == Some("off")))).collect();
         let span = (PORTS.1 - PORTS.0 + 1) / wanted.len().max(1) as u16;
         let mut old = core::mem::take(&mut self.instances);
         let mut named = 0u32;
@@ -274,11 +339,96 @@ impl L2tpModule {
                 say!(sys, "l2tp: {} uses the pool of another instance: set {}.pool\n", a.label(), a.label());
             }
         }
-        if self.instances.is_empty() && !quiet {
-            say!(sys, "l2tp: no instance serves (bind off and no named ones)\n");
+        if self.instances.is_empty() && clients.is_empty() && !quiet {
+            say!(sys, "l2tp: nothing to serve (cfg l2tp user.<name> <password>) and no client tunnel\n");
         }
+        self.reload_clients(sys, &clients, quiet);
         self.shown = mine;
         self.applied = text;
+    }
+
+    /// The client tunnels from their settings; one whose settings changed
+    /// starts over.
+    fn reload_clients(&mut self, sys: &mut dyn Sys, clients: &BTreeMap<&str, Vec<(&str, &str)>>, quiet: bool) {
+        let mut old = core::mem::take(&mut self.dialers);
+        for (name, s) in clients {
+            let server = get(s, "server").and_then(|v| match v.split_once(':') {
+                Some((ip, port)) => Some((parse_ip(ip)?, port.parse().ok()?)),
+                None => Some((parse_ip(v)?, PORT)),
+            });
+            let Some(server) = server else {
+                say!(sys, "l2tp: client {}: needs a server (cfg l2tp client.{}.server a.b.c.d)\n", name, name);
+                continue;
+            };
+            let mut hosts = Vec::new();
+            for h in get(s, "hosts").unwrap_or("").split(',').map(str::trim).filter(|h| !h.is_empty()) {
+                match parse_cidr(h).or_else(|| parse_ip(h).map(|a| (a, !0))) {
+                    Some((n, m)) => hosts.push((n & m, m)),
+                    None => say!(sys, "l2tp: client {}: bad host '{}'\n", name, h),
+                }
+            }
+            let mtu = get(s, "mtu").and_then(|m| m.parse::<u16>().ok()).unwrap_or(1400).clamp(576, 1460);
+            let cc = ClientConfig {
+                user: String::from(get(s, "user").unwrap_or("")),
+                password: String::from(get(s, "password").unwrap_or("")),
+                host_name: String::from("rustros"),
+                mru: mtu,
+            };
+            let sig = format!("{}|{}|{}|{}|{}", IpFmt(server.0), server.1, cc.user, cc.password, mtu);
+            let src = get(s, "src").and_then(parse_ip).unwrap_or(0);
+            let nat_on = get(s, "nat") != Some("off");
+            let keep = old.iter().position(|d| d.name == *name && d.sig == sig && d.src == src);
+            let mut d = match keep {
+                Some(i) => old.swap_remove(i),
+                None => {
+                    if let Some(i) = old.iter().position(|d| d.name == *name) {
+                        // settings changed: hang up the old one
+                        let mut gone = old.swap_remove(i);
+                        let mut out = Vec::new();
+                        gone.client.stop(sys.now_ms(), &mut out);
+                        if let Some(pk) = sys.packet() {
+                            for m in out {
+                                Self::send_udp_to(pk, gone.local, gone.server, &m);
+                            }
+                        }
+                    }
+                    let r = sys.random();
+                    Dialer {
+                        name: String::from(*name),
+                        server,
+                        src,
+                        local: 0,
+                        hosts: Vec::new(),
+                        nat_on,
+                        mtu,
+                        client: Client::new(cc, r as u16, (r >> 16) as u16),
+                        nat: Nat::new(nat_core::Config { mss: Some(mtu - 40), ..nat_core::Config::default() }, r >> 32),
+                        retry_at: 0,
+                        backoff: 5000,
+                        last: String::from("dialing"),
+                        out_packets: 0,
+                        in_packets: 0,
+                        sig,
+                    }
+                }
+            };
+            d.hosts = hosts;
+            d.nat_on = nat_on;
+            if !quiet {
+                say!(sys, "l2tp: client {} to {}:{} as {:?}, for {} host networks{}\n", name, IpFmt(server.0), server.1, get(s, "user").unwrap_or(""), d.hosts.len(), if nat_on { "" } else { ", routed (no NAT)" });
+            }
+            self.dialers.push(d);
+        }
+        // removed ones hang up
+        for mut gone in old {
+            let mut out = Vec::new();
+            gone.client.stop(sys.now_ms(), &mut out);
+            if let Some(pk) = sys.packet() {
+                for m in out {
+                    Self::send_udp_to(pk, gone.local, gone.server, &m);
+                }
+            }
+        }
     }
 
     /// The instance serving local address `dst`.
@@ -309,6 +459,13 @@ impl L2tpModule {
                 Event::NoPap { peer } => say!(sys, "l2tp: {}: {}:{} refuses PAP (allow unencrypted passwords on the client)\n", label, IpFmt(peer.0), peer.1),
                 Event::PoolFull { peer } => say!(sys, "l2tp: {}: {}:{} turned away, address pool full\n", label, IpFmt(peer.0), peer.1),
             }
+        }
+    }
+
+    /// An L2TP packet to a server we dialed, from our port 1701.
+    fn send_udp_to(pk: &mut dyn Packet, src: Ip, server: Peer, payload: &[u8]) {
+        if src != 0 {
+            Self::send_udp(pk, src, server, payload);
         }
     }
 
@@ -387,6 +544,211 @@ impl L2tpModule {
             None => {
                 pk.send_packet(&f.data()[ETH..]);
                 f.verdict = Verdict::Consumed;
+            }
+        }
+    }
+
+    /// An L2TP packet from a server we dialed (`l2..end`: its L2TP part).
+    fn from_dialed(&mut self, pk: &mut dyn Packet, now: u64, f: &mut Frame, di: usize, l2: usize, end: usize) {
+        let x = &mut self.dialers[di];
+        let Some(off) = x.client.data(&f.data()[l2..end]) else {
+            // control or PPP negotiation
+            let (mut out, mut ev) = (Vec::new(), Vec::new());
+            x.client.handle(now, &f.data()[l2..end], &mut out, &mut ev);
+            for m in out {
+                Self::send_udp_to(pk, x.local, x.server, &m);
+            }
+            self.client_events.extend(ev.into_iter().map(|e| (di, e)));
+            f.verdict = Verdict::Consumed;
+            return;
+        };
+        let inner = l2 + off;
+        let d = f.data();
+        let len = if inner + 20 <= end { be16(d, inner + 2) as usize } else { 0 };
+        if len < 20 || inner + len > end {
+            f.verdict = Verdict::Drop;
+            return;
+        }
+        f.pull_front(inner);
+        f.set_len(len);
+        f.offload = Offload::default(); // that was the tunnel's (outer) packet
+        x.in_packets += 1;
+        // back to the LAN host it is for
+        let to = if x.nat_on {
+            match x.nat.inbound(now, f.data_mut(), false) {
+                Inbound::Forward { to, .. } => to,
+                _ => {
+                    f.verdict = Verdict::Drop;
+                    return;
+                }
+            }
+        } else {
+            let to = ip_at(f.data(), 16);
+            if !x.hosts.iter().any(|&(n, m)| to & m == n) || !dec_ttl(f.data_mut()) {
+                f.verdict = Verdict::Drop;
+                return;
+            }
+            to
+        };
+        self.forward_ip(pk, f, to);
+    }
+
+    /// A LAN host's packet into client tunnel `di` (the frame still has its
+    /// Ethernet header).
+    fn to_dialed(&mut self, pk: &mut dyn Packet, now: u64, f: &mut Frame, di: usize) {
+        // the tunnel takes plain packets (they come back here)
+        if !f.offload.is_none() && !pk.resolve(f, ORDER - 1) {
+            return;
+        }
+        let me = self.nics.get(f.nic as usize).map_or(0, |n| n.ip);
+        f.pull_front(ETH);
+        let x = &mut self.dialers[di];
+        let total = be16(f.data(), 2) as usize;
+        if total > x.mtu as usize {
+            // too big for the tunnel: tell the sender if it asked not to fragment
+            if f.data()[6] & 0x40 != 0 {
+                if let Some(e) = icmp_error(me, f.data(), 3, 4, x.mtu) {
+                    pk.send_packet(&e);
+                }
+            }
+            f.verdict = Verdict::Drop;
+            return;
+        }
+        if x.nat_on {
+            match x.nat.outbound(now, f.data_mut(), 0, false) {
+                Ok(_) => {}
+                Err(nat_core::Drop::TtlExceeded) => {
+                    if let Some(e) = icmp_error(me, f.data(), 11, 0, 0) {
+                        pk.send_packet(&e);
+                    }
+                    f.verdict = Verdict::Drop;
+                    return;
+                }
+                Err(_) => {
+                    self.dropped += 1;
+                    f.verdict = Verdict::Drop;
+                    return;
+                }
+            }
+        } else if !dec_ttl(f.data_mut()) {
+            if let Some(e) = icmp_error(me, f.data(), 11, 0, 0) {
+                pk.send_packet(&e);
+            }
+            f.verdict = Verdict::Drop;
+            return;
+        }
+        let inner = be16(f.data(), 2) as usize;
+        f.set_len(inner);
+        let Some((out, hop)) = pk.route_from(x.local, x.server.0) else {
+            f.verdict = Verdict::Drop;
+            return;
+        };
+        let Some(nic) = self.nics.get(out).copied() else { return };
+        let header = x.client.data_header();
+        let Some(h) = f.push_front(ENCAP) else {
+            f.verdict = Verdict::Drop;
+            return;
+        };
+        h[6..12].copy_from_slice(&nic.mac);
+        h[12..14].copy_from_slice(&[8, 0]);
+        let ip = &mut h[ETH..ETH + 20];
+        let tot = (20 + 8 + DATA_HEADER + inner) as u16;
+        ip.copy_from_slice(&[0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        ip[2..4].copy_from_slice(&tot.to_be_bytes());
+        ip[12..16].copy_from_slice(&x.local.to_be_bytes());
+        ip[16..20].copy_from_slice(&x.server.0.to_be_bytes());
+        ip_fix(ip);
+        let udp = &mut h[ETH + 20..ETH + 28];
+        udp[0..2].copy_from_slice(&PORT.to_be_bytes());
+        udp[2..4].copy_from_slice(&x.server.1.to_be_bytes());
+        udp[4..6].copy_from_slice(&(tot - 20).to_be_bytes());
+        udp[6..8].fill(0);
+        h[ETH + 28..ENCAP].copy_from_slice(&header);
+        x.out_packets += 1;
+        match pk.neighbor(out, hop) {
+            Some(mac) => {
+                f.data_mut()[..6].copy_from_slice(&mac);
+                f.nic = out as u8;
+                f.verdict = Verdict::Transmit;
+            }
+            None => {
+                pk.send_packet(&f.data()[ETH..]);
+                f.verdict = Verdict::Consumed;
+            }
+        }
+    }
+
+    /// Send an IP packet (the frame's data, from its IP header) on towards
+    /// `to` by the system's routes.
+    fn forward_ip(&mut self, pk: &mut dyn Packet, f: &mut Frame, to: Ip) {
+        let Some((out, hop)) = pk.route(to) else {
+            f.verdict = Verdict::Drop;
+            return;
+        };
+        let Some(nic) = self.nics.get(out).copied() else { return };
+        let total = be16(f.data(), 2) as usize;
+        match pk.neighbor(out, hop) {
+            Some(mac) => {
+                let Some(h) = f.push_front(ETH) else { return };
+                h[..6].copy_from_slice(&mac);
+                h[6..12].copy_from_slice(&nic.mac);
+                h[12..14].copy_from_slice(&[8, 0]);
+                f.set_len(ETH + total);
+                f.nic = out as u8;
+                f.verdict = Verdict::Transmit;
+            }
+            None => {
+                pk.send_packet(&f.data()[..total]);
+                f.verdict = Verdict::Consumed;
+            }
+        }
+    }
+
+    /// Dial what is down, keep the rest going.
+    fn run_dialers(&mut self, sys: &mut dyn Sys, now: u64) {
+        for di in 0..self.dialers.len() {
+            let (mut out, mut ev) = (Vec::new(), Vec::new());
+            let x = &mut self.dialers[di];
+            if x.client.is_down() {
+                if now < x.retry_at {
+                    continue;
+                }
+                // our address towards the server
+                let route = sys.packet().and_then(|p| p.route(x.server.0));
+                x.local = if x.src != 0 { x.src } else { route.and_then(|(i, _)| self.nics.get(i)).map_or(0, |n| n.ip) };
+                if x.local == 0 {
+                    x.retry_at = now + x.backoff;
+                    x.last = String::from("no address towards the server");
+                    continue;
+                }
+                x.client.start(now, &mut out);
+                x.last = String::from("dialing");
+            } else {
+                x.client.tick(now, &mut out, &mut ev);
+            }
+            if let Some(pk) = sys.packet() {
+                for m in out {
+                    Self::send_udp_to(pk, x.local, x.server, &m);
+                }
+            }
+            self.client_events.extend(ev.into_iter().map(|e| (di, e)));
+        }
+        for (di, e) in core::mem::take(&mut self.client_events) {
+            let Some(x) = self.dialers.get_mut(di) else { continue };
+            match e {
+                ClientEvent::Up { ip, peer, .. } => {
+                    x.nat.set_default_egress(ip);
+                    x.backoff = 5000;
+                    x.last = format!("up as {} (server side {})", IpFmt(ip), IpFmt(peer));
+                    say!(sys, "l2tp: client {}: {}\n", x.name, x.last);
+                }
+                ClientEvent::Down(why) => {
+                    x.retry_at = now + x.backoff;
+                    x.backoff = (x.backoff * 2).min(60_000);
+                    x.nat = Nat::new(nat_core::Config { mss: Some(x.mtu - 40), ..nat_core::Config::default() }, sys.random());
+                    x.last = format!("down: {why}");
+                    say!(sys, "l2tp: client {}: {}, again in {} s\n", x.name, why, (x.retry_at - now) / 1000);
+                }
             }
         }
     }
@@ -494,6 +856,22 @@ impl L2tpModule {
             return;
         }
         let dst = ip_at(d, ETH + 16);
+        let src = ip_at(d, ETH + 12);
+        // from a server we dialed (before the server side: same port)
+        if d[ETH + 9] == 17 && be16(d, ETH + ihl + 2) == PORT {
+            let peer = (src, be16(d, ETH + ihl));
+            if let Some(di) = self.dialers.iter().position(|x| x.server == peer && x.local == dst) {
+                return self.from_dialed(pk, now, f, di, ETH + ihl + 8, ETH + total);
+            }
+        }
+        // from a LAN host sent through a client tunnel, to somewhere beyond
+        // our own networks
+        if let Some(di) = self.dialers.iter().position(|x| x.client.is_up() && x.hosts.iter().any(|&(n, m)| src & m == n)) {
+            let beyond = self.local.binary_search(&dst).is_err() && dst < 0xE000_0000 && pk.route(dst).is_none_or(|(_, hop)| hop != dst);
+            if beyond {
+                return self.to_dialed(pk, now, f, di);
+            }
+        }
         // L2TP from a client: the address it was sent to names the instance
         if d[ETH + 9] == 17 && be16(d, ETH + ihl + 2) == PORT && self.local.binary_search(&dst).is_ok() && be16(d, ETH + 6) & 0x3FFF == 0 {
             let Some(ii) = self.instance_for(dst) else { return };
@@ -585,6 +963,9 @@ impl Module for L2tpModule {
             self.reload(sys);
             self.reload_at = now + RELOAD_MS;
         }
+        if now >= self.tick_at || !self.client_events.is_empty() {
+            self.run_dialers(sys, now);
+        }
         if now >= self.tick_at {
             self.tick_at = now + TICK_MS;
             for (ii, inst) in self.instances.iter_mut().enumerate() {
@@ -628,7 +1009,7 @@ impl Module for L2tpModule {
     }
 
     fn on_frames(&mut self, sys: &mut dyn Sys, frames: &mut [Frame]) {
-        if self.instances.is_empty() {
+        if self.instances.is_empty() && self.dialers.is_empty() {
             return;
         }
         let now = sys.now_ms();
@@ -650,6 +1031,10 @@ impl Module for L2tpModule {
                 format!("{} ({}): {} clients, {} NAT sessions, {} out / {} in packets", i.label(), on, clients, nat.sessions, nat.out_packets, nat.in_packets)
             })
             .collect();
+        let mut parts = parts;
+        for x in &self.dialers {
+            parts.push(format!("client {} ({}): {}, {} out / {} in packets", x.name, IpFmt(x.server.0), x.last, x.out_packets, x.in_packets));
+        }
         if parts.is_empty() { String::from("no instance (bind off)") } else { parts.join("; ") }
     }
 }

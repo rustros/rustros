@@ -138,12 +138,16 @@ async function login(){
 $("go").onclick=login;$("pw").onkeydown=e=>{if(e.key==="Enter")login()};
 $("out").onclick=async()=>{await api("/api/logout",{});showLogin()};
 
-let cur="status",timer=null;
+// each page has its own address (#net, #mods, ...): reload, back and forward work
+const TABS=["status","net","mods","log","sys"];
+const fromHash=()=>{const h=location.hash.slice(1);return TABS.includes(h)?h:"status"};
+let cur=fromHash(),timer=null;
 function tab(t){cur=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
   ["status","net","mods","log","sys"].forEach(x=>$("t-"+x).hidden=x!==t);
   clearInterval(timer);const f={status:loadStatus,net:loadNet,mods:loadMods,log:loadLog,sys:()=>{}}[t];
   f().catch(()=>{});if(t==="status"||t==="log"||t==="net")timer=setInterval(()=>f().catch(()=>{}),t==="net"?3000:2000)}
-document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>tab(b.dataset.t));
+document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{location.hash=b.dataset.t});
+window.addEventListener("hashchange",()=>{if(!$("app").hidden)tab(fromHash())});
 
 const fmtUp=s=>`${Math.floor(s/86400)}天 ${String(Math.floor(s/3600)%24).padStart(2,"0")}:${String(Math.floor(s/60)%60).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
 async function loadStatus(){
@@ -215,7 +219,7 @@ document.querySelectorAll("[data-a]").forEach(b=>b.onclick=async()=>{
   if(txt&&!confirm(`确定要${txt}吗？`))return;
   try{const r=await api("/api/system",{action:a});alert(r.out)}catch(e){alert(e.message)}});
 
-api("/api/status").then(()=>{$("app").hidden=false;tab("status")}).catch(e=>{if(e.message!=="login")showLogin()});
+api("/api/status").then(()=>{$("app").hidden=false;tab(cur)}).catch(e=>{if(e.message!=="login")showLogin()});
 </script>
 </body>
 </html>
