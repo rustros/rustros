@@ -15,6 +15,10 @@
 //! ports           10000-49151       external port range
 //! srcnat.<a.b.c.d> e.f.g.h          static NAT: source a.b.c.d becomes e.f.g.h
 //! dstnat.<e.f.g.h> a.b.c.d          static NAT: destination e.f.g.h becomes a.b.c.d
+//! dstnat.tcp.<e.f.g.h>:<port>[-<port>] a.b.c.d[:<port>]
+//!                                   port forward (tcp or udp): only those ports
+//!                                   (a range keeps its offset; other ports and
+//!                                   protocols to e.f.g.h are left alone)
 //! ```
 //!
 //! Egress addresses must be ours: NIC 0's address or an extra address
@@ -38,7 +42,7 @@ use alloc::vec::Vec;
 
 use rustros_api::{Caps, Frame, Module, Packet, Sys, Verdict, say};
 use rustros_util::wire::{Ip, IpFmt, parse_ip};
-use nat_core::{Config, Drop, Inbound, Nat, StaticNat, icmp_error};
+use nat_core::{Config, Drop, Inbound, Nat, PortForward, StaticNat, icmp_error};
 
 const ETH: usize = 14;
 const RELOAD_MS: u64 = 2000;
@@ -71,6 +75,23 @@ pub struct NatModule {
     dropped: u64,
     /// static NAT (srcnat / dstnat rules)
     fixed: Option<StaticNat>,
+}
+
+/// A port forward from `public:port[-port]` (`from`) to `host[:port]` (`to`).
+fn parse_forward(proto: u8, from: &str, to: &str) -> Option<PortForward> {
+    let (public, ports) = from.split_once(':')?;
+    let (a, b) = match ports.split_once('-') {
+        Some((a, b)) => (a.parse::<u16>().ok()?, b.parse::<u16>().ok()?),
+        None => {
+            let p = ports.parse::<u16>().ok()?;
+            (p, p)
+        }
+    };
+    let (host, hport) = match to.split_once(':') {
+        Some((h, p)) => (parse_ip(h)?, p.parse::<u16>().ok()?),
+        None => (parse_ip(to)?, a),
+    };
+    (a > 0 && a <= b && hport > 0 && hport as u32 + (b - a) as u32 <= 65535).then_some(PortForward { proto, public: parse_ip(public)?, ports: (a, b), host, hport })
 }
 
 fn be16(p: &[u8], o: usize) -> u16 {
@@ -179,6 +200,9 @@ impl NatModule {
             let mut r: Vec<(Ip, Ip)> = Vec::new();
             for (k, v) in &settings {
                 let Some(from) = k.strip_prefix(prefix) else { continue };
+                if from.starts_with("tcp.") || from.starts_with("udp.") {
+                    continue; // a port forward
+                }
                 match (parse_ip(from), parse_ip(v)) {
                     (Some(a), Some(b)) => r.push((a, b)),
                     _ => say!(sys, "nat: {}: bad rule '{}' (srcnat.10.0.0.5 203.0.113.5)\n", k, v),
@@ -188,9 +212,24 @@ impl NatModule {
             r
         };
         let (snat, dnat) = (rules("srcnat."), rules("dstnat."));
+        // port forwards: dstnat.tcp.<public>:<port>[-<port>] = <host>[:<port>]
+        let mut fwd = Vec::new();
+        for (k, v) in &settings {
+            let Some(rest) = k.strip_prefix("dstnat.") else { continue };
+            let (proto, rest) = match rest.split_once('.') {
+                Some(("tcp", r)) => (6u8, r),
+                Some(("udp", r)) => (17u8, r),
+                _ => continue,
+            };
+            match parse_forward(proto, rest, v) {
+                Some(f) => fwd.push(f),
+                None => say!(sys, "nat: {}: bad port forward '{}' (dstnat.tcp.203.0.113.5:8080 10.0.0.5[:80])\n", k, v),
+            }
+        }
         let fixed = self.fixed.get_or_insert_with(|| StaticNat::new(sys.random()));
-        fixed.set_rules(snat, dnat);
+        fixed.set_all(snat, dnat, fwd);
         let (snat, dnat) = fixed.rules();
+        let fwd = fixed.forwards();
         let ins: Vec<String> = (1..32).filter(|&i| inside & (1 << i) != 0).filter_map(|i| names.get(i).cloned()).collect();
         let mine: String = settings.iter().map(|(k, v)| format!("{k}={v};")).collect();
         let quiet = mine == self.shown && !rebuild;
@@ -198,12 +237,13 @@ impl NatModule {
         if !quiet {
         say!(
             sys,
-            "nat: inside {}, egress {}, {} host egress rules, static {} srcnat {} dstnat{}\n",
+            "nat: inside {}, egress {}, {} host egress rules, static {} srcnat {} dstnat {} port forwards{}\n",
             if ins.is_empty() { String::from("none") } else { ins.join(",") },
             IpFmt(nat.egress_of(0)),
             self.hosts.len(),
             snat.len(),
             dnat.len(),
+            fwd.len(),
             if rebuild { ", table reset" } else { "" }
         );
         for (a, b) in snat {
@@ -211,6 +251,10 @@ impl NatModule {
         }
         for (a, b) in dnat {
             say!(sys, "nat: dstnat {} -> {}\n", IpFmt(*a), IpFmt(*b));
+        }
+        for f in fwd {
+            let range = if f.ports.0 == f.ports.1 { format!("{}", f.ports.0) } else { format!("{}-{}", f.ports.0, f.ports.1) };
+            say!(sys, "nat: forward {} {}:{} -> {}:{}\n", if f.proto == 6 { "tcp" } else { "udp" }, IpFmt(f.public), range, IpFmt(f.host), f.hport);
         }
         }
         self.applied = text;
@@ -397,7 +441,7 @@ impl Module for NatModule {
         };
         if let Some(x) = self.fixed.as_ref().filter(|x| !x.is_empty()) {
             let (sn, dn) = x.rules();
-            s += &format!("; static {} srcnat {} dstnat, {} connections, {} packets", sn.len(), dn.len(), x.stats.conns, x.stats.packets);
+            s += &format!("; static {} srcnat {} dstnat {} forwards, {} connections, {} packets", sn.len(), dn.len(), x.forwards().len(), x.stats.conns, x.stats.packets);
         }
         s
     }

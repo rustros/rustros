@@ -30,7 +30,10 @@ struct Conn {
     proto: u8,
     host: Ip,
     public: Ip,
+    /// the host's port, and the public one (they differ for a port
+    /// forward that changes the port)
     hport: u16,
+    pport: u16,
     remote: Ip,
     rport: u16,
     expires: u64,
@@ -43,7 +46,7 @@ impl Conn {
         key(self.proto, self.host, self.hport, self.remote, self.rport)
     }
     fn pub_key(&self) -> u128 {
-        key(self.proto, self.public, self.hport, self.remote, self.rport)
+        key(self.proto, self.public, self.pport, self.remote, self.rport)
     }
     fn timeout(&self) -> u64 {
         match self.proto {
@@ -67,10 +70,23 @@ pub struct StaticStats {
     pub untracked: u64,
 }
 
+/// A port forward: `proto` to `public` ports `ports.0..=ports.1` goes to
+/// `host`, from port `hport` on (the same offset into the range).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub struct PortForward {
+    pub proto: u8,
+    pub public: Ip,
+    pub ports: (u16, u16),
+    pub host: Ip,
+    pub hport: u16,
+}
+
 pub struct StaticNat {
     /// (host, public) and (public, host), sorted by the first
     snat: Vec<(Ip, Ip)>,
     dnat: Vec<(Ip, Ip)>,
+    /// port forwards (before `dnat`)
+    fwd: Vec<PortForward>,
     conns: Vec<Conn>,
     free: Vec<u32>,
     by_in: Map<u128, u32>,
@@ -79,6 +95,29 @@ pub struct StaticNat {
     frags: Map<u128, (Ip, bool, u64)>,
     sweep: usize,
     pub stats: StaticStats,
+}
+
+/// Rewrite the destination (`src` false) or source address and port of a
+/// TCP/UDP packet.
+fn translate(p: &mut [u8], h: &V4, src: bool, addr: Ip, port: u16, partial: bool) {
+    let (ao, po) = if src { (12, 0) } else { (16, 2) };
+    let old = get32(p, ao);
+    if get16(p, h.ihl + po) == port || h.offset != 0 || !matches!(h.proto, TCP | UDP) {
+        rewrite(p, src, addr, partial);
+        return;
+    }
+    set_addr(p, ao, addr);
+    set_port(&mut p[..h.total], h.ihl, h.proto, po, port, Some((old, addr)), partial);
+}
+
+/// In an ICMP error at `h` (quoted packet at `q`), the quoted packet's
+/// source (`src_side`) or destination port becomes `port`.
+fn quoted_port(p: &mut [u8], h: &V4, q: usize, src_side: bool, port: u16) {
+    let Some(qh) = parse_quoted(&p[q..h.total]) else { return };
+    if matches!(qh.proto, TCP | UDP) {
+        set_port(&mut p[q..h.total], qh.ihl, qh.proto, if src_side { 0 } else { 2 }, port, None, false);
+        fix_icmp(p, h.ihl, h.total);
+    }
 }
 
 fn find(rules: &[(Ip, Ip)], a: Ip) -> Option<Ip> {
@@ -102,6 +141,7 @@ impl StaticNat {
         StaticNat {
             snat: Vec::new(),
             dnat: Vec::new(),
+            fwd: Vec::new(),
             conns: Vec::new(),
             free: Vec::new(),
             by_in: Map::with_hasher(s),
@@ -113,13 +153,20 @@ impl StaticNat {
     }
 
     /// New rules; connections start over if they changed.
-    pub fn set_rules(&mut self, mut snat: Vec<(Ip, Ip)>, mut dnat: Vec<(Ip, Ip)>) {
+    pub fn set_rules(&mut self, snat: Vec<(Ip, Ip)>, dnat: Vec<(Ip, Ip)>) {
+        let fwd = self.fwd.clone();
+        self.set_all(snat, dnat, fwd);
+    }
+
+    /// New rules, port forwards too; connections start over if they changed.
+    pub fn set_all(&mut self, mut snat: Vec<(Ip, Ip)>, mut dnat: Vec<(Ip, Ip)>, mut fwd: Vec<PortForward>) {
         snat.sort_unstable();
         dnat.sort_unstable();
-        if snat == self.snat && dnat == self.dnat {
+        fwd.sort_unstable();
+        if snat == self.snat && dnat == self.dnat && fwd == self.fwd {
             return;
         }
-        (self.snat, self.dnat) = (snat, dnat);
+        (self.snat, self.dnat, self.fwd) = (snat, dnat, fwd);
         self.conns.clear();
         self.free.clear();
         self.by_in.clear();
@@ -129,7 +176,11 @@ impl StaticNat {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.snat.is_empty() && self.dnat.is_empty()
+        self.snat.is_empty() && self.dnat.is_empty() && self.fwd.is_empty()
+    }
+
+    pub fn forwards(&self) -> &[PortForward] {
+        &self.fwd
     }
 
     pub fn rules(&self) -> (&[(Ip, Ip)], &[(Ip, Ip)]) {
@@ -228,10 +279,34 @@ impl StaticNat {
     fn packet(&mut self, now: u64, p: &mut [u8], h: &V4, local: &dyn Fn(Ip) -> bool, partial: bool) -> bool {
         let Some((sp, dp)) = ports(p, h) else { return false };
         let (src, dst) = (h.src, h.dst);
+        // a port forward
+        if let Some(f) = self.fwd.iter().find(|f| f.proto == h.proto && f.public == dst && (f.ports.0..=f.ports.1).contains(&dp)).copied() {
+            let hp = f.hport.wrapping_add(dp - f.ports.0);
+            let c = Conn { proto: h.proto, host: f.host, public: dst, hport: hp, pport: dp, remote: src, rport: sp, ..Conn::default() };
+            match self.lookup(true, c.pub_key(), now) {
+                Some(i) if self.conns[i as usize].host == f.host => self.touch(i, now, p, h),
+                _ => {
+                    if let Some(i) = self.track(now, c) {
+                        self.touch(i, now, p, h);
+                    }
+                }
+            }
+            translate(p, h, false, f.host, hp, partial);
+            self.remember_fragment(now, h, f.host, false);
+            return true;
+        }
+        // a reply on a forwarded connection that changed the port
+        if let Some(i) = self.lookup(false, key(h.proto, src, sp, dst, dp), now).filter(|&i| self.conns[i as usize].pport != sp) {
+            self.touch(i, now, p, h);
+            let c = self.conns[i as usize];
+            translate(p, h, true, c.public, c.pport, partial);
+            self.remember_fragment(now, h, c.public, true);
+            return true;
+        }
         // towards a public address: a dstnat rule, or a reply to a srcnat connection
         let to = match find(&self.dnat, dst) {
             Some(host) => {
-                let c = Conn { proto: h.proto, host, public: dst, hport: dp, remote: src, rport: sp, ..Conn::default() };
+                let c = Conn { proto: h.proto, host, public: dst, hport: dp, pport: dp, remote: src, rport: sp, ..Conn::default() };
                 // a known connection keeps its timer and state
                 match self.lookup(true, c.pub_key(), now) {
                     Some(i) if self.conns[i as usize].host == host => self.touch(i, now, p, h),
@@ -260,7 +335,7 @@ impl StaticNat {
         // a dstnat): the replies must come from that address, so remember
         // the connection as one not to translate
         if find(&self.snat, dst).is_some() {
-            let c = Conn { proto: h.proto, host: dst, public: dst, hport: dp, remote: src, rport: sp, ..Conn::default() };
+            let c = Conn { proto: h.proto, host: dst, public: dst, hport: dp, pport: dp, remote: src, rport: sp, ..Conn::default() };
             if let Some(i) = self.track(now, c) {
                 self.touch(i, now, p, h);
             }
@@ -273,7 +348,7 @@ impl StaticNat {
                 Some(self.conns[i as usize].public)
             }
             None => find(&self.snat, src).filter(|_| !local(dst)).inspect(|&public| {
-                let c = Conn { proto: h.proto, host: src, public, hport: sp, remote: dst, rport: dp, ..Conn::default() };
+                let c = Conn { proto: h.proto, host: src, public, hport: sp, pport: sp, remote: dst, rport: dp, ..Conn::default() };
                 if let Some(i) = self.track(now, c) {
                     self.touch(i, now, p, h);
                 }
@@ -297,12 +372,20 @@ impl StaticNat {
         if let Some((qh, (qsp, qdp))) = quoted {
             // about a packet that left from a public address: back to its host
             if let Some(i) = self.lookup(true, key(qh.proto, qh.src, qsp, qh.dst, qdp), now).filter(|_| h.dst == qh.src) {
-                rewrite(p, false, self.conns[i as usize].host, false);
+                let c = self.conns[i as usize];
+                rewrite(p, false, c.host, false);
+                if c.hport != c.pport {
+                    quoted_port(p, h, q, true, c.hport);
+                }
                 return true;
             }
             // a host's error about a packet it got: from the public address
             if let Some(i) = self.lookup(false, key(qh.proto, qh.dst, qdp, qh.src, qsp), now).filter(|_| h.src == qh.dst) {
-                rewrite(p, true, self.conns[i as usize].public, false);
+                let c = self.conns[i as usize];
+                rewrite(p, true, c.public, false);
+                if c.hport != c.pport {
+                    quoted_port(p, h, q, false, c.pport);
+                }
                 return true;
             }
         }

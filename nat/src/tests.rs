@@ -543,6 +543,59 @@ fn static_srcnat_tracks_replies() {
 }
 
 #[test]
+fn port_forwards() {
+    let mut s = StaticNat::new(5);
+    let fw = |proto, ports, hport| PortForward { proto, public: WAN2, ports, host: HOST, hport };
+    s.set_all(vec![], vec![], vec![fw(TCP, (28820, 28820), 28820), fw(TCP, (2222, 2222), 22), fw(UDP, (5000, 5010), 6000)]);
+    // the same port
+    let mut syn = tcp(REMOTE, 40000, WAN2, 28820, SYN, &[], b"");
+    assert!(s.process(0, &mut syn, &no_local, false));
+    assert_valid(&syn);
+    assert_eq!(dst_of(&syn), (HOST, 28820));
+    let mut back = tcp(HOST, 28820, REMOTE, 40000, SYN | ACK, &[], b"");
+    assert!(s.process(1, &mut back, &no_local, false));
+    assert_valid(&back);
+    assert_eq!(src_of(&back), (WAN2, 28820));
+    // another port: as the host's 22
+    let mut ssh = tcp(REMOTE, 40001, WAN2, 2222, SYN, &[], b"x");
+    assert!(s.process(2, &mut ssh, &no_local, false));
+    assert_valid(&ssh);
+    assert_eq!(dst_of(&ssh), (HOST, 22));
+    let mut ssh_back = tcp(HOST, 22, REMOTE, 40001, SYN | ACK, &[], b"y");
+    assert!(s.process(3, &mut ssh_back, &no_local, false));
+    assert_valid(&ssh_back);
+    assert_eq!(src_of(&ssh_back), (WAN2, 2222));
+    // ... with partial checksums too
+    let mut part = tcp(REMOTE, 40001, WAN2, 2222, ACK, &[], &[3u8; 2000]);
+    make_partial(&mut part);
+    assert!(s.process(4, &mut part, &no_local, true));
+    complete(&mut part);
+    assert_valid(&part);
+    // a UDP range keeps the offset
+    let mut u = udp(REMOTE, 1, WAN2, 5007, b"q");
+    assert!(s.process(5, &mut u, &no_local, false));
+    assert_valid(&u);
+    assert_eq!(dst_of(&u), (HOST, 6007));
+    // other ports and protocols are not ours
+    let mut other = tcp(REMOTE, 1, WAN2, 80, SYN, &[], b"");
+    assert!(!s.process(6, &mut other, &no_local, false));
+    let mut wrong_proto = udp(REMOTE, 1, WAN2, 28820, b"q");
+    assert!(!s.process(6, &mut wrong_proto, &no_local, false));
+    // a router's ICMP error about the host's (changed-port) reply reaches it
+    let mut err = icmp_error(ROUTER, &ssh_back, 3, 4, 1280).unwrap();
+    assert!(s.process(7, &mut err, &no_local, false));
+    assert_valid(&err);
+    let inner = &err[28..];
+    assert_eq!((get32(&err, 16), get32(inner, 12), get16(inner, 20)), (HOST, HOST, 22));
+    // the host's ICMP error about a forwarded packet leaves from the public side
+    let mut err = icmp_error(HOST, &ssh, 3, 3, 0).unwrap();
+    assert!(s.process(8, &mut err, &no_local, false));
+    assert_valid(&err);
+    let inner = &err[28..];
+    assert_eq!((get32(&err, 12), get32(inner, 16), get16(inner, 22)), (WAN2, WAN2, 2222));
+}
+
+#[test]
 fn srcnat_leaves_replies_to_the_hosts_own_address() {
     let mut s = StaticNat::new(7);
     s.set_rules(vec![(HOST, PUB)], vec![]);

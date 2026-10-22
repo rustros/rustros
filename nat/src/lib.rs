@@ -961,7 +961,7 @@ fn fix_icmp(p: &mut [u8], l4: usize, end: usize) {
 }
 
 mod static_nat;
-pub use static_nat::{StaticNat, StaticStats};
+pub use static_nat::{PortForward, StaticNat, StaticStats};
 
 #[cfg(test)]
 mod tests;
