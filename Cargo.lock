@@ -835,6 +835,7 @@ dependencies = [
  "devices",
  "dhcp",
  "echo",
+ "ext4",
  "httpd",
  "kvstore",
  "netstack",

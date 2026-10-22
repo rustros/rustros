@@ -177,9 +177,6 @@ impl Inode {
         put32(&mut self.raw, 0x1C, s as u32);
         put16(&mut self.raw, 0x74, (s >> 32) as u16);
     }
-    fn blocks(&self) -> u64 {
-        (le32(&self.raw, 0x1C) as u64 | (le16(&self.raw, 0x74) as u64) << 32) / SECTORS_PER_BLOCK
-    }
     fn mtime(&self) -> u32 {
         le32(&self.raw, 0x10)
     }

@@ -280,12 +280,34 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 }
                 None => kprintln!("log: no cache partition, the console log is not kept"),
             }
-            let files = store.as_ref().and_then(|(st, part)| {
-                let (start, n) = part.files?;
-                let f = storage::files::Files::open(st, start, n);
-                let (total, used) = f.usage();
-                kprintln!("storage: files partition {} MiB at 1 GiB{}, {} MiB used", total >> 20, if part.files_created { " (created)" } else { "" }, used >> 20);
-                Some(f)
+            // the files partition: its ext4, made on first use
+            let files = store.as_ref().and_then(|(_, part)| part.files).and_then(|(start, n)| {
+                let mut v = ext4::Vol { dev: &mut disk, start };
+                let fs = match ext4::Fs::mount(&mut v) {
+                    Ok(fs) => fs,
+                    Err(ext4::Error::NotExt4) => {
+                        let mut uuid = [0u8; 16];
+                        uuid[..8].copy_from_slice(&arch::rdtsc().to_le_bytes());
+                        uuid[8..].copy_from_slice(&arch::rdtsc().rotate_left(29).to_le_bytes());
+                        match ext4::Fs::format(&mut v, n, uuid, "rustros-files", arch::unix_time() as u32) {
+                            Ok(fs) => {
+                                kprintln!("storage: files partition formatted (ext4)");
+                                fs
+                            }
+                            Err(e) => {
+                                kprintln!("storage: files partition: cannot format: {:?}", e);
+                                return None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        kprintln!("storage: files partition: {:?}", e);
+                        return None;
+                    }
+                };
+                let (total, free) = fs.usage();
+                kprintln!("storage: files partition {} MiB (ext4{}), {} MiB used", total >> 20, if fs.writable { "" } else { ", read only" }, (total - free) >> 20);
+                Some((fs, start))
             });
             Some(sys::Boot { disk: Box::new(disk), upd, store, log, files })
         }

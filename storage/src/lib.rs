@@ -7,8 +7,8 @@
 //!                   (log ring, temporary files)
 //! 512 MiB - 1 GiB   system data partition: key-value store (configuration,
 //!                   modules, each module's data)
-//! 1 GiB - end       files partition: files of the apps (a site, a package
-//!                   repository, later a NAS), see `files`
+//! 1 GiB - end       files partition: an ext4 with the apps' files (a site, a
+//!                   package repository, later a NAS)
 //! ```
 //!
 //! Both partitions are created on first boot. On a disk too small for this
@@ -22,7 +22,6 @@
 
 extern crate alloc;
 
-pub mod files;
 pub mod gpt;
 
 use devices::BlockDevice;
@@ -114,7 +113,7 @@ fn partition(disk: &mut dyn BlockDevice, seed: u64) -> Result<Info, &'static str
 /// The files partition (1 GiB to the end of the disk), made where there is
 /// room and nothing else.
 fn files_partition(disk: &mut dyn BlockDevice, gpt: &mut Gpt, last: u64, seed: u64) -> Result<(Option<(u64, u64)>, bool), &'static str> {
-    if let Some(p) = gpt.find(&FILES_TYPE) {
+    if let Some(p) = gpt.find(&FILES_TYPE).filter(|p| p.first == DATA_END) {
         return Ok((Some((p.first, p.last - p.first + 1)), false));
     }
     let end = gpt.last_usable();

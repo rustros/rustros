@@ -32,8 +32,8 @@ pub struct Boot {
     pub store: Option<(Store, storage::Info)>,
     /// this boot's console log (cache partition)
     pub log: Option<crate::klog::DiskLog>,
-    /// the files partition
-    pub files: Option<storage::files::Files>,
+    /// the files partition: (its ext4, first sector)
+    pub files: Option<(ext4::Fs, u64)>,
 }
 
 /// A logical interface: a NIC, or a VLAN on one. The NICs come first, so
@@ -508,9 +508,18 @@ impl Net for Ctx<'_> {
     }
 }
 
+/// One file in the files partition is at most this.
+const MAX_FILE: usize = 64 << 20;
+
 impl Ctx<'_> {
     fn app_name(&self) -> &'static str {
         self.k.names.get(self.id).copied().unwrap_or("?")
+    }
+
+    /// An app's file name as a path on the files partition: its own directory.
+    fn file_path(&self, name: &str) -> Option<String> {
+        let ok = !name.is_empty() && name.split('/').all(|p| !p.is_empty() && p != "." && p != ".." && !p.contains('\0'));
+        ok.then(|| format!("/{}/{name}", self.app_name()))
     }
 }
 
@@ -553,43 +562,67 @@ impl Kv for Ctx<'_> {
         })
     }
     fn file_put(&mut self, name: &str, data: &[u8]) -> Result<(), KvError> {
-        let owner = self.app_name();
-        let sha = rustros_util::sha256::Sha256::digest(data);
+        let path = self.file_path(name).ok_or(KvError::TooLarge)?;
+        if data.len() > MAX_FILE {
+            return Err(KvError::TooLarge);
+        }
+        let now = arch::unix_time() as u32;
         let b = self.k.boot.as_mut().ok_or(KvError::NoStorage)?;
-        let (Some(files), Some((store, _))) = (b.files.as_mut(), b.store.as_mut()) else { return Err(KvError::NoStorage) };
-        files.put(&mut *b.disk, store, owner, name, data, sha).map_err(|e| match e {
-            storage::files::Error::Full => KvError::Full,
-            storage::files::Error::Io => KvError::Io,
+        let (fs, start) = b.files.as_mut().ok_or(KvError::NoStorage)?;
+        let mut v = ext4::Vol { dev: &mut *b.disk, start: *start };
+        fs.write_file(&mut v, &path, data, now).map_err(|e| match e {
+            ext4::Error::Full => KvError::Full,
+            ext4::Error::Io => KvError::Io,
             _ => KvError::TooLarge,
         })
     }
     fn file_read(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Option<usize> {
-        let owner = self.app_name();
+        let path = self.file_path(name)?;
         let b = self.k.boot.as_mut()?;
-        let (files, (store, _)) = (b.files.as_ref()?, b.store.as_ref()?);
-        files.read(&mut *b.disk, store, owner, name, offset, buf)
+        let (fs, start) = b.files.as_ref()?;
+        fs.read(&mut ext4::Vol { dev: &mut *b.disk, start: *start }, &path, offset, buf).ok()
     }
-    fn file_stat(&self, name: &str) -> Option<(u64, [u8; 32])> {
-        let b = self.k.boot.as_ref()?;
-        b.files.as_ref()?.stat(&b.store.as_ref()?.0, self.app_name(), name).map(|e| (e.bytes, e.sha256))
+    fn file_stat(&mut self, name: &str) -> Option<(u64, u64)> {
+        let path = self.file_path(name)?;
+        let b = self.k.boot.as_mut()?;
+        let (fs, start) = b.files.as_ref()?;
+        let st = fs.stat(&mut ext4::Vol { dev: &mut *b.disk, start: *start }, &path).ok()?;
+        (!st.dir).then_some((st.size, st.mtime as u64))
     }
-    fn file_list(&self, prefix: &str) -> Vec<(String, u64)> {
-        let Some(b) = self.k.boot.as_ref() else { return Vec::new() };
-        match (b.files.as_ref(), b.store.as_ref()) {
-            (Some(f), Some((store, _))) => f.list(store, self.app_name(), prefix),
-            _ => Vec::new(),
+    fn file_list(&mut self, prefix: &str) -> Vec<(String, u64)> {
+        let owner = format!("/{}", self.app_name());
+        let Some(b) = self.k.boot.as_mut() else { return Vec::new() };
+        let Some((fs, start)) = b.files.as_ref() else { return Vec::new() };
+        let mut v = ext4::Vol { dev: &mut *b.disk, start: *start };
+        let mut out = Vec::new();
+        let mut dirs = alloc::vec![String::new()];
+        while let Some(rel) = dirs.pop() {
+            let Ok(list) = fs.list(&mut v, &format!("{owner}/{rel}")) else { continue };
+            for (name, st) in list {
+                let p = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                if st.dir {
+                    // only directories that can hold something under the prefix
+                    if prefix.starts_with(&p) || p.starts_with(prefix.trim_end_matches('/')) || prefix.is_empty() {
+                        dirs.push(p);
+                    }
+                } else if p.starts_with(prefix) {
+                    out.push((p, st.size));
+                }
+            }
         }
+        out.sort();
+        out
     }
     fn file_delete(&mut self, name: &str) -> bool {
-        let owner = self.app_name();
+        let Some(path) = self.file_path(name) else { return false };
+        let now = arch::unix_time() as u32;
         let Some(b) = self.k.boot.as_mut() else { return false };
-        match (b.files.as_mut(), b.store.as_mut()) {
-            (Some(f), Some((store, _))) => f.delete(&mut *b.disk, store, owner, name),
-            _ => false,
-        }
+        let Some((fs, start)) = b.files.as_mut() else { return false };
+        fs.remove(&mut ext4::Vol { dev: &mut *b.disk, start: *start }, &path, now).unwrap_or(false)
     }
     fn files_usage(&self) -> Option<(u64, u64)> {
-        Some(self.k.boot.as_ref()?.files.as_ref()?.usage())
+        let (total, free) = self.k.boot.as_ref()?.files.as_ref()?.0.usage();
+        Some((total, total - free))
     }
 }
 

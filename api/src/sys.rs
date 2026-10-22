@@ -419,9 +419,10 @@ pub trait Kv: Base {
     fn keys(&self, prefix: &str) -> Vec<String>;
     fn storage_info(&self) -> Option<StorageInfo>;
 
-    // Files (the files partition, 1 GiB to the end of the disk): what is
-    // too big for the store, up to 64 MiB each — a site, packages. Names
-    // are paths ("site/index.html"); each app sees only its own.
+    // Files (the files partition, 1 GiB to the end of the disk, an ext4):
+    // what is too big for the store, up to 64 MiB each — a site, packages.
+    // Names are paths ("site/index.html"); each app sees only its own
+    // directory (/<app>/ on the ext4).
     fn file_put(&mut self, _name: &str, _data: &[u8]) -> Result<(), KvError> {
         Err(KvError::NoStorage)
     }
@@ -429,12 +430,12 @@ pub trait Kv: Base {
     fn file_read(&mut self, _name: &str, _offset: u64, _buf: &mut [u8]) -> Option<usize> {
         None
     }
-    /// (bytes, SHA-256)
-    fn file_stat(&self, _name: &str) -> Option<(u64, [u8; 32])> {
+    /// (bytes, modified: unix seconds)
+    fn file_stat(&mut self, _name: &str) -> Option<(u64, u64)> {
         None
     }
-    /// (name, bytes) under `prefix`.
-    fn file_list(&self, _prefix: &str) -> Vec<(String, u64)> {
+    /// (name, bytes) of the files under `prefix` (all levels below).
+    fn file_list(&mut self, _prefix: &str) -> Vec<(String, u64)> {
         Vec::new()
     }
     fn file_delete(&mut self, _name: &str) -> bool {
