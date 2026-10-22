@@ -138,6 +138,8 @@ pub struct ModuleInfo {
     pub native_off: Option<String>,
     /// The settings the running module takes (empty if it does not say).
     pub params: Vec<ParamInfo>,
+    /// The release the running module was built for ("" if not running).
+    pub version: String,
 }
 
 pub struct NetInfo {
@@ -317,6 +319,10 @@ pub trait Base {
 pub trait Sys: Base {
     /// Kernel command line (from grub.cfg).
     fn cmdline(&self) -> &str;
+    /// The running kernel's release (see `BUILD`).
+    fn kernel_version(&self) -> &str {
+        ""
+    }
     /// Capabilities granted to this app.
     fn caps(&self) -> Caps;
     /// Names of all running applications.
@@ -647,6 +653,10 @@ pub trait Module {
     }
     fn restarts(&self) -> u32 {
         0
+    }
+    /// The release this module was built for (see `BUILD`).
+    fn version(&self) -> &'static str {
+        crate::BUILD
     }
 }
 

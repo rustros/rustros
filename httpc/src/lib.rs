@@ -26,6 +26,14 @@ pub struct Url {
 }
 
 impl Url {
+    /// "https://host[:port]/path?q" → (where, "/path?q").
+    pub fn parse_full(s: &str) -> Option<(Url, String)> {
+        let u = Url::parse(s)?;
+        let rest = s.trim().strip_prefix("https://")?;
+        let path = rest.find('/').map_or("/", |i| &rest[i..]);
+        Some((u, String::from(path)))
+    }
+
     pub fn parse(s: &str) -> Option<Url> {
         let rest = s.trim().strip_prefix("https://")?;
         let hostport = rest.split('/').next()?;

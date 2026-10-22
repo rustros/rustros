@@ -190,7 +190,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     mem::HEAP.init();
     let bi = multiboot::parse(magic, info);
     console::init(bi.fb, bi.efi);
-    kprintln!("RustROS {} ({} boot, {})", env!("CARGO_PKG_VERSION"), if bi.efi { "UEFI" } else { "BIOS" }, console::describe());
+    kprintln!("RustROS {} ({} boot, {})", rustros_api::BUILD, if bi.efi { "UEFI" } else { "BIOS" }, console::describe());
     if magic != multiboot::MAGIC {
         kprintln!("warning: not booted by a multiboot2 loader");
     }

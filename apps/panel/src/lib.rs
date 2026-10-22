@@ -23,6 +23,7 @@
 //! ca     PEM                          also trust this CA (a private panel)
 //! name   rustros-a1b2c3               the name asked for (default from the MAC)
 //! dns    1.1.1.1                      resolver for the panel's name
+//! downloads https://rustros.com/      what update/module-install may fetch
 //! ```
 #![no_std]
 #![forbid(unsafe_code)]
@@ -40,10 +41,7 @@ use rustros_util::wire::{Ip, IpFmt, parse_cidr, parse_ip};
 
 use httpc::{Call, Done, Request, Url};
 
-pub const BUILD: &str = match option_env!("RUSTROS_BUILD") {
-    Some(b) => b,
-    None => env!("CARGO_PKG_VERSION"),
-};
+use rustros_api::BUILD;
 const ARCH: &str = "x86_64";
 const DNS_DEFAULT: Ip = 0x0101_0101;
 const RELOAD_MS: u64 = 5000;
@@ -58,6 +56,8 @@ const MAX_KERNEL: usize = 256 * 1024;
 /// A network change from the panel is reverted unless the panel is reached
 /// again within this.
 const NET_CONFIRM_S: u32 = 120;
+/// Where kernels and modules may be fetched from, unless `cfg panel downloads` says otherwise.
+const DOWNLOADS: &str = "https://rustros.com/";
 
 /// What the node keeps (its own store, not `cfg/`).
 #[derive(Default, Clone)]
@@ -99,6 +99,7 @@ pub struct Panel {
     url: Option<Url>,
     ca: String,
     dns: Ip,
+    downloads: String,
     name: String,
     machine_id: String,
     node: Option<Node>,
@@ -130,6 +131,7 @@ impl Default for Panel {
             url: None,
             ca: String::new(),
             dns: DNS_DEFAULT,
+            downloads: String::from(DOWNLOADS),
             name: String::new(),
             machine_id: String::new(),
             node: None,
@@ -229,6 +231,7 @@ impl Panel {
         }
         self.ca = cfg(sys, "ca").map(|v| rustros_util::pem::normalize(&v)).unwrap_or_default();
         self.dns = cfg(sys, "dns").and_then(|v| parse_ip(&v)).unwrap_or(DNS_DEFAULT);
+        self.downloads = cfg(sys, "downloads").unwrap_or_else(|| String::from(DOWNLOADS));
         let mac = sys.net().map(|n| n.net_info().mac).unwrap_or_default();
         self.name = cfg(sys, "name").unwrap_or_else(|| format!("rustros-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5]));
     }
@@ -282,6 +285,12 @@ impl Panel {
     fn start_call(&mut self, sys: &mut dyn Sys, method: &'static str, path: String, body: String, purpose: Purpose, wait_ms: u64) {
         let Some(url) = self.url.clone() else { return };
         let bearer = self.node.as_ref().map(|n| format!("{}.{}", n.server, n.token));
+        self.start_call_to(sys, url, bearer, method, path, body, purpose, wait_ms);
+    }
+
+    /// A call to anywhere (a download goes to the release site, without our token).
+    #[allow(clippy::too_many_arguments)]
+    fn start_call_to(&mut self, sys: &mut dyn Sys, url: Url, bearer: Option<String>, method: &'static str, path: String, body: String, purpose: Purpose, wait_ms: u64) {
         let now = sys.now_ms();
         let Some(net) = sys.net() else { return };
         let req = Request { method, content_type: "", path, bearer, body: body.into_bytes(), deadline: now + wait_ms };
@@ -416,7 +425,7 @@ impl Panel {
             Purpose::File(job) => {
                 if status != 200 {
                     let id = job.id;
-                    self.answer(sys, id, 1, "", &format!("fetching the file: the panel said {status}"));
+                    self.answer(sys, id, 1, "", &format!("downloading: the server said {status}"));
                     return;
                 }
                 self.reached(sys);
@@ -510,12 +519,18 @@ impl Panel {
         }
         kv_put(sys, "node/last_job", &format!("{}", job.id));
         say!(sys, "panel: job {} {}\n", job.id, job.op);
-        // a file first, for those that need one
+        // a download first, for those that need one
         if matches!(job.op.as_str(), "module-install" | "update") {
-            let Some(file) = arg(&job, "file").and_then(|f| f.u64().map(|n| format!("{n}")).or_else(|| f.str().map(String::from))) else {
-                return self.answer(sys, job.id, 1, "", "no file given");
+            let Some(url) = arg_str(&job, "url").map(String::from) else {
+                return self.answer(sys, job.id, 1, "", "no url given");
             };
-            self.start_call(sys, "GET", format!("/api/node/files/{file}"), String::new(), Purpose::File(job), CALL_MS * 2);
+            if !url.starts_with(&self.downloads) {
+                return self.answer(sys, job.id, 1, "", &format!("download not allowed: {url}"));
+            }
+            let Some((to, path)) = Url::parse_full(&url) else {
+                return self.answer(sys, job.id, 1, "", &format!("not an https URL: {url}"));
+            };
+            self.start_call_to(sys, to, None, "GET", path, String::new(), Purpose::File(job), CALL_MS * 2);
             return;
         }
         let (code, out, err) = self.run(sys, &job);
@@ -692,7 +707,12 @@ impl Panel {
 
 /// `info`: what the panel shows of this machine.
 fn info(sys: &mut dyn Sys) -> String {
-    let mut o = format!("{{\"build\":{},\"arch\":\"{ARCH}\",\"uptime\":{}", quote(BUILD), sys.now_ms() / 1000);
+    let mut o = format!(
+        "{{\"build\":{},\"arch\":\"{ARCH}\",\"kernel\":{{\"version\":{},\"arch\":\"{ARCH}\"}},\"uptime\":{}",
+        quote(BUILD),
+        quote(sys.kernel_version()),
+        sys.now_ms() / 1000
+    );
     if let Some(u) = sys.update_info() {
         o += &format!(",\"slot\":\"{}\",\"trial\":{},\"unstable_boots\":{}", u.slot, u.trial, u.unstable_boots);
     }
@@ -726,8 +746,9 @@ fn info(sys: &mut dyn Sys) -> String {
             .iter()
             .map(|m| {
                 format!(
-                    "{{\"name\":{},\"running\":{},\"preferred\":\"{}\",\"native\":{},\"wasm\":{},\"native_off\":{},\"state\":{}}}",
+                    "{{\"name\":{},\"version\":{},\"running\":{},\"preferred\":\"{}\",\"native\":{},\"wasm\":{},\"native_off\":{},\"state\":{}}}",
                     quote(&m.name),
+                    quote(&m.version),
                     m.running.map_or(String::from("null"), |k| format!("\"{}\"", k.as_str())),
                     m.preferred.as_str(),
                     m.native_bytes.is_some(),
@@ -749,7 +770,8 @@ const PARAMS: &[Param] = &[
     Param { key: "url", kind: "text", default: "", help: "the panel, https://host[:port] (default: rustros.panel= on the kernel command line)" },
     Param { key: "ca", kind: "text", default: "", help: "also trust this CA certificate, PEM (a private panel)" },
     Param { key: "name", kind: "text", default: "rustros-<MAC>", help: "the name this machine asks for" },
-    Param { key: "dns", kind: "address", default: "1.1.1.1", help: "resolver for the panel's name" },
+    Param { key: "dns", kind: "address", default: "1.1.1.1", help: "resolver for the panel's and the downloads' names" },
+    Param { key: "downloads", kind: "text", default: "https://rustros.com/", help: "what update and module-install may download (a URL prefix)" },
 ];
 
 impl Module for Panel {

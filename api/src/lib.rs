@@ -18,3 +18,11 @@ pub use frame::{Frame, HEADROOM, Offload, Verdict};
 // the same rustros-api (see build.rs).
 include!(concat!(env!("OUT_DIR"), "/fingerprint.rs"));
 pub use sys::*;
+
+/// The release this was built for: `RUSTROS_BUILD` at build time (a release's
+/// calendar version, "2026.10.22.1"), else the crate version. Each module
+/// compiles its own copy, so it says the module's release.
+pub const BUILD: &str = match option_env!("RUSTROS_BUILD") {
+    Some(b) => b,
+    None => env!("CARGO_PKG_VERSION"),
+};

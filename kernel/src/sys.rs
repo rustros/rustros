@@ -365,6 +365,9 @@ impl Base for Ctx<'_> {
 }
 
 impl Sys for Ctx<'_> {
+    fn kernel_version(&self) -> &str {
+        rustros_api::BUILD
+    }
     fn cmdline(&self) -> &str {
         &self.k.cmdline
     }
