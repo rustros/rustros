@@ -420,6 +420,22 @@ impl L2tpModule {
             // client to client (of this instance), straight through the switch
             return self.encap(pk, f, ii, dst);
         }
+        if self.local.binary_search(&dst).is_ok() {
+            // for this machine (its management, its services): to the
+            // system's stack, on the interface that has the address; the
+            // answers come back through `on_egress`
+            let i = self.nics.iter().position(|n| n.ip == dst).unwrap_or(0);
+            let Some(mac) = self.nics.get(i).map(|n| n.mac) else { return };
+            let Some(h) = f.push_front(ETH) else {
+                f.verdict = Verdict::Drop;
+                return;
+            };
+            h[..6].copy_from_slice(&mac);
+            h[6..12].copy_from_slice(&mac);
+            h[12..14].copy_from_slice(&[8, 0]);
+            f.nic = i as u8;
+            return; // still Pass: on to the stack
+        }
         let nat = &mut self.instances[ii].nat;
         let Some((mut out, mut hop)) = pk.route(dst) else {
             f.verdict = Verdict::Drop;
@@ -583,6 +599,31 @@ impl Module for L2tpModule {
         }
         if !self.events.is_empty() {
             self.report(sys);
+        }
+    }
+
+    /// What the system's stack sends to a client (answers to what a client
+    /// sent to this machine): into its tunnel.
+    fn on_egress(&mut self, sys: &mut dyn Sys, frames: &mut [Frame]) {
+        if self.instances.is_empty() {
+            return;
+        }
+        let Some(pk) = sys.packet() else { return };
+        for f in frames.iter_mut() {
+            let d = f.data();
+            if f.verdict != Verdict::Transmit || d.len() < ETH + 20 || d[12..14] != [8, 0] {
+                continue;
+            }
+            let dst = ip_at(d, ETH + 16);
+            let Some(ii) = self.instances.iter().position(|i| dst & 0xFFFF_FF00 == i.pool && dst != i.pool | 1) else { continue };
+            if self.instances[ii].server.route(dst).is_none() {
+                continue;
+            }
+            if !f.offload.is_none() && !pk.resolve(f, i32::MAX) {
+                continue;
+            }
+            f.pull_front(ETH);
+            self.encap(pk, f, ii, dst);
         }
     }
 
