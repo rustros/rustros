@@ -944,6 +944,8 @@ dependencies = [
 name = "sites"
 version = "0.1.0"
 dependencies = [
+ "httpc",
+ "p256",
  "rustros-api",
  "rustros-util",
  "tls",

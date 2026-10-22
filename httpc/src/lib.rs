@@ -71,6 +71,8 @@ pub struct Call {
     req: Request,
     phase: Option<Phase>,
     answer: Vec<u8>,
+    /// the answer's headers, once it is complete
+    headers: Vec<(String, String)>,
 }
 
 /// How a call ended: (status, body), or why it failed.
@@ -78,7 +80,7 @@ pub type Done = Result<(u16, Vec<u8>), String>;
 
 impl Call {
     pub fn start(net: &mut dyn Net, url: &Url, ca: &str, agent: &str, dns: Ip, req: Request) -> Call {
-        let mut c = Call { url: url.clone(), ca: String::from(ca), agent: String::from(agent), req, phase: None, answer: Vec::new() };
+        let mut c = Call { url: url.clone(), ca: String::from(ca), agent: String::from(agent), req, phase: None, answer: Vec::new(), headers: Vec::new() };
         c.phase = match parse_ip(&c.url.host) {
             Some(ip) => c.connect(net, ip).ok(),
             None => Lookup::start(net, &c.url.host, dns).map(Phase::Resolve),
@@ -106,6 +108,18 @@ impl Call {
         .into_bytes();
         r.extend_from_slice(&self.req.body);
         r
+    }
+
+    /// A header of the answer (after `poll` gave it), by name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    fn keep_headers(&mut self) {
+        if let Some(end) = self.answer.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&self.answer[..end]).into_owned();
+            self.headers = head.split("\r\n").skip(1).filter_map(|l| l.split_once(':')).map(|(k, v)| (String::from(k.trim()), String::from(v.trim()))).collect();
+        }
     }
 
     /// Where it is, for status lines.
@@ -189,10 +203,12 @@ impl Call {
                 if let Some(done) = parse(&self.answer, false) {
                     c.close();
                     c.pump(net, 0);
+                    self.keep_headers();
                     return Some(done);
                 }
                 if !alive || c.eof || t.closed {
                     let end = parse(&self.answer, true);
+                    self.keep_headers();
                     c.abort(net);
                     return Some(end.unwrap_or_else(|| Err(String::from("the connection ended without an answer"))));
                 }

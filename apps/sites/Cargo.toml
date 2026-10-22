@@ -11,3 +11,5 @@ bench = false
 rustros-api = { path = "../../api" }
 rustros-util = { path = "../../util" }
 tls = { path = "../tls" }
+httpc = { path = "../../httpc" }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }

@@ -21,12 +21,24 @@
 //! site.<name>.cert     PEM         its certificate and chain (one line)
 //! site.<name>.key      PEM         its private key (secret)
 //! site.<name>.redirect on          plain HTTP to HTTPS when it has a certificate
+//! acme                 on          certificates from an ACME CA for sites without one
+//! acme.directory       URL         the CA (default Let's Encrypt)
+//! acme.email           address     the account's contact
+//! acme.ca              PEM         also trust this CA (a test CA's directory)
+//! acme.dns             1.1.1.1     resolver for the CA's name
 //! ```
-#![no_std]
+//!
+//! ACME uses HTTP-01: the site's names must reach this machine on port 80.
+//! A certificate is renewed after 60 days; a failed order is tried again
+//! after an hour, then less often (up to a day).
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+pub mod acme;
+
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -56,6 +68,8 @@ struct Site {
     root: String,
     proxy: Option<SocketAddr>,
     cert: bool,
+    /// its certificate is set by hand (no ACME for it)
+    manual: bool,
     redirect: bool,
 }
 
@@ -97,6 +111,15 @@ pub struct Sites {
     applied: String,
     reload_at: u64,
     served: u64,
+    acme_on: bool,
+    acme_dir: String,
+    acme_email: String,
+    acme_ca: String,
+    acme_dns: rustros_util::wire::Ip,
+    order: Option<acme::Order>,
+    /// per site: (next try, failures in a row)
+    acme_backoff: BTreeMap<String, (u64, u32)>,
+    acme_check_at: u64,
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -244,12 +267,17 @@ impl Sites {
         self.applied = text;
         let s: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (k.as_str(), v.trim())).collect();
         self.http = get(&s, "http").and_then(|p| p.parse().ok()).unwrap_or(80);
+        self.acme_on = get(&s, "acme") != Some("off");
+        self.acme_dir = String::from(get(&s, "acme.directory").unwrap_or(acme::LETS_ENCRYPT));
+        self.acme_email = String::from(get(&s, "acme.email").unwrap_or(""));
+        self.acme_ca = get(&s, "acme.ca").map(rustros_util::pem::normalize).unwrap_or_default();
+        self.acme_dns = get(&s, "acme.dns").and_then(parse_ip).unwrap_or(0x0101_0101);
         self.https = get(&s, "https").and_then(|p| p.parse().ok()).unwrap_or(443);
         self.token = get(&s, "token").filter(|t| t.len() >= 16).map(String::from);
         if get(&s, "token").is_some_and(|t| t.len() < 16) {
             say!(sys, "sites: the upload token is too short (16 characters at least): uploads are off\n");
         }
-        let mut names: Vec<&str> = s.iter().filter_map(|(k, _)| k.strip_prefix("site.")?.split_once('.').map(|(n, _)| n)).collect();
+            let mut names: Vec<&str> = s.iter().filter_map(|(k, _)| k.strip_prefix("site.")?.split_once('.').map(|(n, _)| n)).collect();
         names.dedup();
         let mut sites = Vec::new();
         let mut certs = Vec::new();
@@ -278,7 +306,8 @@ impl Sites {
                 certs.push((hosts.clone(), c, k));
                 cert = true;
             }
-            sites.push(Site { name: String::from(n), root: String::from(sv("root").unwrap_or(n)), hosts, proxy, cert, redirect: sv("redirect") != Some("off") });
+            let manual = sv("cert").is_some();
+            sites.push(Site { name: String::from(n), root: String::from(sv("root").unwrap_or(n)), hosts, proxy, cert, manual, redirect: sv("redirect") != Some("off") });
         }
         self.tls = if certs.is_empty() {
             None
@@ -614,6 +643,80 @@ impl Sites {
     }
 }
 
+impl Sites {
+    /// Certificates: one order at a time, for a site that has none or an old one.
+    fn acme(&mut self, sys: &mut dyn Sys, now: u64) {
+        if let Some(mut o) = self.order.take() {
+            match o.poll(sys, now) {
+                None => self.order = Some(o),
+                Some(r) => {
+                    if let Some(kv) = sys.kv() {
+                        for t in &o.tokens {
+                            let _ = kv.delete(&format!("acme/challenge/{t}"));
+                        }
+                        if let Some(kid) = o.kid() {
+                            let _ = kv.put("acme/kid", format!("{} {kid}", self.acme_dir).as_bytes());
+                        }
+                    }
+                    match r {
+                        Ok((cert, key)) => {
+                            let unix = sys.unix_time();
+                            let ok = sys.kv().is_some_and(|kv| {
+                                kv.put(&format!("acme/{}/cert", o.site), cert.as_bytes()).is_ok()
+                                    && kv.put(&format!("acme/{}/key", o.site), key.as_bytes()).is_ok()
+                                    && kv.put(&format!("acme/{}/issued", o.site), format!("{unix}").as_bytes()).is_ok()
+                            });
+                            say!(sys, "sites: {}: certificate issued{}\n", o.site, if ok { "" } else { " (but not stored!)" });
+                            self.acme_backoff.remove(&o.site);
+                            self.applied.clear(); // reload: HTTPS with it
+                        }
+                        Err(e) => {
+                            let b = self.acme_backoff.entry(o.site.clone()).or_insert((0, 0));
+                            b.1 += 1;
+                            let wait = (3_600_000u64 << (b.1 - 1).min(5)).min(86_400_000);
+                            b.0 = now + wait;
+                            say!(sys, "sites: {}: no certificate: {} (again in {} min)\n", o.site, e, wait / 60_000);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if !self.acme_on || now < self.acme_check_at {
+            return;
+        }
+        self.acme_check_at = now + 10_000;
+        let unix = sys.unix_time();
+        let due = self.sites.iter().find(|st| {
+            if st.manual || st.hosts.is_empty() || self.acme_backoff.get(&st.name).is_some_and(|b| now < b.0) {
+                return false;
+            }
+            let issued = kv_str(sys, &format!("acme/{}/issued", st.name)).and_then(|v| v.parse::<u64>().ok());
+            issued.is_none_or(|t| unix.saturating_sub(t) > 60 * 86_400)
+        });
+        let Some(st) = due.cloned() else { return };
+        // the account: its key and URL kept
+        let account = match kv_str(sys, "acme/account").and_then(|h| (0..32).map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Option<Vec<u8>>>()) {
+            Some(b) => p256::ecdsa::SigningKey::from_slice(&b).ok(),
+            None => None,
+        };
+        let account = match account {
+            Some(k) => k,
+            None => {
+                let Some(k) = acme::new_key() else { return };
+                let hex: String = k.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+                if sys.kv().is_none_or(|kv| kv.put("acme/account", hex.as_bytes()).is_err()) {
+                    return;
+                }
+                k
+            }
+        };
+        let kid = kv_str(sys, "acme/kid").and_then(|v| v.split_once(' ').filter(|(d, _)| *d == self.acme_dir).map(|(_, k)| String::from(k)));
+        say!(sys, "sites: {}: asking {} for a certificate ({})\n", st.name, self.acme_dir, st.hosts.join(", "));
+        self.order = acme::Order::new(&st.name, st.hosts.clone(), &self.acme_dir, &self.acme_ca, self.acme_dns, &self.acme_email, account, kid);
+    }
+}
+
 fn kv_str(sys: &mut dyn Sys, k: &str) -> Option<String> {
     sys.kv()?.get(k).and_then(|v| String::from_utf8(v).ok())
 }
@@ -628,6 +731,11 @@ const PARAMS: &[Param] = &[
     Param { key: "site.<name>.cert", kind: "text", default: "", help: "its certificate and chain, PEM" },
     Param { key: "site.<name>.key", kind: "secret", default: "", help: "its private key, PEM" },
     Param { key: "site.<name>.redirect", kind: "switch", default: "on", help: "plain HTTP to HTTPS when it has a certificate" },
+    Param { key: "acme", kind: "switch", default: "on", help: "certificates from an ACME CA for sites without one (HTTP-01: port 80 must reach here)" },
+    Param { key: "acme.directory", kind: "text", default: "https://acme-v02.api.letsencrypt.org/directory", help: "the ACME CA" },
+    Param { key: "acme.email", kind: "text", default: "", help: "the account's contact address" },
+    Param { key: "acme.ca", kind: "text", default: "", help: "also trust this CA, PEM (a test CA)" },
+    Param { key: "acme.dns", kind: "address", default: "1.1.1.1", help: "resolver for the CA's name" },
 ];
 
 impl Module for Sites {
@@ -671,6 +779,7 @@ impl Module for Sites {
                 c.pump(net, 0)
             });
         }
+        self.acme(sys, now);
         let clients = core::mem::take(&mut self.clients);
         for cl in clients {
             if let Some(cl) = self.step(sys, cl, now) {
@@ -681,11 +790,12 @@ impl Module for Sites {
 
     fn status(&self) -> String {
         format!(
-            "{} sites, {} connections, {} files served{}",
+            "{} sites, {} connections, {} files served{}{}",
             self.sites.len(),
             self.clients.len(),
             self.served,
-            if self.tls.is_some() { ", HTTPS on" } else { "" }
+            if self.tls.is_some() { ", HTTPS on" } else { "" },
+            self.order.as_ref().map(|o| format!(", getting a certificate for {}", o.site)).unwrap_or_default()
         )
     }
 }

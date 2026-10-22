@@ -60,3 +60,28 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.wg-core]
 opt-level = 3
+
+# Logic that is not on the data path, and handshake-only crypto: for size
+# (apps carrying TLS come close to the 1 MiB a module may be)
+[profile.release.package.sites]
+opt-level = "z"
+[profile.release.package.panel]
+opt-level = "z"
+[profile.release.package.httpc]
+opt-level = "z"
+[profile.release.package.shell]
+opt-level = "z"
+[profile.release.package.curve25519-dalek]
+opt-level = "z"
+[profile.release.package.ed25519-dalek]
+opt-level = "z"
+[profile.release.package.x25519-dalek]
+opt-level = "z"
+[profile.release.package.crypto-bigint]
+opt-level = "z"
+[profile.release.package.signature]
+opt-level = "z"
+[profile.release.package.base16ct]
+opt-level = "z"
+[profile.release.package.rustros-util]
+opt-level = "s"
