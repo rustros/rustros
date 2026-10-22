@@ -2,6 +2,7 @@ use super::*;
 use std::collections::BTreeMap;
 
 /// A sparse disk: sectors never written read as zeros.
+#[derive(Clone)]
 pub struct Sparse {
     pub sectors: BTreeMap<u64, [u8; 512]>,
     pub size: u64,
@@ -205,6 +206,7 @@ fn image_for_e2fsck() {
         let mut v = Vol { dev: &mut d, start: 0 };
         let mut fs = Fs::format(&mut v, 1100 * 2048, [9; 16], "rustros", NOW).unwrap();
         populate(&mut fs, &mut v);
+        fs.close(&mut v).unwrap();
     }
     d.save(&out);
 }
@@ -253,6 +255,7 @@ fn read_linux_made() {
         let deep = fs.resolve(v, "a/deep").unwrap();
         fs.rename(v, a, "deep", ROOT, "deep-moved", NOW).unwrap();
         assert_eq!(fs.lookup(v, deep, "..").unwrap(), Some(ROOT));
+        fs.close(v).unwrap();
         d.save(&path);
     }
 }
@@ -464,4 +467,369 @@ fn names_links_and_renames() {
     assert_eq!(fs.readdir(v, ROOT).unwrap().len(), 3);
     assert_eq!((fs.usage().1, fs.groups[0].free_inodes, fs.groups[0].used_dirs), free0);
     assert_eq!(fs.getattr(v, ROOT).unwrap().links, 3);
+}
+
+/// A disk losing power at its `left`-th write: that one lands half, none after.
+struct Cut<'a> {
+    disk: &'a mut Sparse,
+    left: usize,
+    writes: usize,
+}
+
+impl BlockDevice for Cut<'_> {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        self.disk.read(lba, buf)
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> bool {
+        self.writes += 1;
+        if self.left == 0 {
+            return false;
+        }
+        self.left -= 1;
+        if self.left == 0 {
+            let half = (buf.len() / 512 / 2 * 512).max(512).min(buf.len());
+            self.disk.write(lba, &buf[..half]);
+            return false;
+        }
+        self.disk.write(lba, buf)
+    }
+    fn sectors(&self) -> u64 {
+        self.disk.size
+    }
+}
+
+/// A small fsck: the tree from the root against the bitmaps and counts.
+pub fn check(fs: &mut Fs, v: &mut Vol) -> Result<(), String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut refs: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut subdirs: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut todo = vec![(ROOT, ROOT)];
+    let mut seen_dirs = BTreeSet::new();
+    while let Some((dir, parent)) = todo.pop() {
+        if !seen_dirs.insert(dir) {
+            return Err(format!("directory {dir} reached twice"));
+        }
+        let es = fs.readdir(v, dir).map_err(|e| format!("readdir {dir}: {e:?}"))?;
+        let dot = es.iter().find(|e| e.0 == ".").map(|e| e.1);
+        let dotdot = es.iter().find(|e| e.0 == "..").map(|e| e.1);
+        if dot != Some(dir) || dotdot != Some(parent) {
+            return Err(format!("directory {dir}: . {dot:?} .. {dotdot:?} (parent {parent})"));
+        }
+        for (name, ino, kind) in es {
+            if name == "." || name == ".." {
+                continue;
+            }
+            let st = fs.getattr(v, ino).map_err(|e| format!("{name}: {e:?}"))?;
+            if kind != Some(st.kind) {
+                return Err(format!("{name}: entry says {kind:?}, inode {:?}", st.kind));
+            }
+            *refs.entry(ino).or_default() += 1;
+            if st.kind == Kind::Dir {
+                *subdirs.entry(dir).or_default() += 1;
+                todo.push((ino, dir));
+            }
+        }
+    }
+    let mut used_blocks: BTreeSet<u64> = BTreeSet::new();
+    let mut claim = |b: u64, what: &str| -> Result<(), String> { if used_blocks.insert(b) { Ok(()) } else { Err(format!("block {b} used twice ({what})")) } };
+    // the file system's own blocks
+    let gdt_blocks = (fs.groups.len() * fs.desc_size).div_ceil(BLOCK) as u64;
+    for g in 0..fs.groups.len() {
+        let first = fs.group_first_block(g);
+        if has_super(g as u32) {
+            for b in first..first + 1 + gdt_blocks {
+                claim(b, "superblock")?;
+            }
+        }
+        let gr = fs.groups[g];
+        claim(gr.block_bitmap, "bitmap")?;
+        claim(gr.inode_bitmap, "bitmap")?;
+        for b in gr.inode_table..gr.inode_table + (fs.inodes_per_group as u64 * fs.inode_size as u64).div_ceil(BLOCK as u64) {
+            claim(b, "inode table")?;
+        }
+    }
+    let mut inodes: Vec<u32> = refs.keys().copied().collect();
+    inodes.push(ROOT);
+    if fs.journal.is_some() {
+        inodes.push(8);
+    }
+    for &ino in &inodes {
+        let i = fs.read_inode(v, ino).unwrap();
+        let st = i.stat();
+        let want = if st.kind == Kind::Dir { 2 + subdirs.get(&ino).copied().unwrap_or(0) } else if ino == 8 { 1 } else { refs[&ino] };
+        if st.links as u32 != want {
+            return Err(format!("inode {ino}: {} links, {want} found", st.links));
+        }
+        let runs = fs.runs(v, &i).map_err(|e| format!("inode {ino}: {e:?}"))?;
+        let tree = fs.tree_blocks(v, &i).unwrap();
+        let n: u64 = runs.iter().map(|e| e.n as u64).sum::<u64>() + tree.len() as u64;
+        if n * 8 != st.blocks {
+            return Err(format!("inode {ino}: i_blocks {} for {n} blocks", st.blocks));
+        }
+        for e in runs {
+            for b in e.p..e.p + e.n as u64 {
+                claim(b, "data")?;
+            }
+        }
+        for b in tree {
+            claim(b, "tree")?;
+        }
+    }
+    let mut dirs_per_group = vec![0u32; fs.groups.len()];
+    for &ino in &inodes {
+        if fs.read_inode(v, ino).unwrap().is_dir() {
+            dirs_per_group[fs.group_of_ino(ino)] += 1;
+        }
+    }
+    let inode_set: BTreeSet<u32> = inodes.iter().copied().chain(1..=10).chain([11]).collect();
+    for g in 0..fs.groups.len() {
+        let gr = fs.groups[g];
+        let first = fs.group_first_block(g);
+        let len = (fs.blocks - first).min(fs.blocks_per_group as u64);
+        let bm = fs.mread(v, gr.block_bitmap).unwrap().to_vec();
+        let mut free = 0;
+        for k in 0..len {
+            let set = bm[k as usize / 8] & (1 << (k % 8)) != 0;
+            if set != used_blocks.contains(&(first + k)) {
+                return Err(format!("block {}: bitmap says {set}", first + k));
+            }
+            free += !set as u32;
+        }
+        if free != gr.free_blocks {
+            return Err(format!("group {g}: {} free blocks counted, {free} in the bitmap", gr.free_blocks));
+        }
+        let ib = fs.mread(v, gr.inode_bitmap).unwrap().to_vec();
+        let mut ifree = 0;
+        for k in 0..fs.inodes_per_group {
+            let ino = g as u32 * fs.inodes_per_group + k + 1;
+            let set = ib[k as usize / 8] & (1 << (k % 8)) != 0;
+            if set != inode_set.contains(&ino) {
+                return Err(format!("inode {ino}: bitmap says {set}"));
+            }
+            ifree += !set as u32;
+        }
+        if ifree != gr.free_inodes || dirs_per_group[g] != gr.used_dirs {
+            return Err(format!("group {g}: inodes free {} (bitmap {ifree}), dirs {} (found {})", gr.free_inodes, gr.used_dirs, dirs_per_group[g]));
+        }
+    }
+    Ok(())
+}
+
+fn file_bytes(fs: &mut Fs, v: &mut Vol, path: &str) -> Option<Vec<u8>> {
+    let ino = fs.resolve(v, path).ok()?;
+    Some(whole(fs, v, ino))
+}
+
+/// The changes the crash test makes, one sync each.
+fn crash_ops(fs: &mut Fs, v: &mut Vol) -> Result<(), Error> {
+    fs.write_file(v, "replace", &pattern(20_000, 2), NOW)?;
+    let d = fs.resolve(v, "d")?;
+    fs.rename(v, ROOT, "keep", d, "kept", NOW)?;
+    fs.mkdir_p(v, "d/e/f", NOW)?;
+    let g = fs.resolve(v, "grow")?;
+    for k in 0..6 {
+        fs.pwrite(v, g, k * 9000, &pattern(9000, k as u8), NOW)?;
+    }
+    fs.unlink(v, ROOT, "gone", NOW)?;
+    for k in 0..40 {
+        fs.write_file(v, &format!("d/many/{k}"), b"x", NOW)?;
+    }
+    fs.close(v)
+}
+
+/// What Linux looks at before it replays: (the log holds something, needs_recovery set).
+fn log_state(d: &mut Sparse) -> (bool, bool) {
+    let mut v = Vol { dev: d, start: 0 };
+    let mut fs = Fs::parse(&mut v, None).unwrap();
+    let i = fs.read_inode(&mut v, 8).unwrap();
+    let p = fs.runs(&mut v, &i).unwrap()[0].p;
+    let jsb = v.block(p).unwrap();
+    (u32::from_be_bytes(jsb[0x1C..0x20].try_into().unwrap()) != 0, le32(&fs.sb, 0x60) & INCOMPAT_RECOVER != 0)
+}
+
+#[test]
+fn power_cut_at_every_write() {
+    let mut base = Sparse::new(64);
+    {
+        let mut v = Vol { dev: &mut base, start: 0 };
+        let mut fs = Fs::format(&mut v, 64 * 2048, [11; 16], "crash", NOW).unwrap();
+        assert!(fs.journal.is_some());
+        fs.write_file(&mut v, "replace", &pattern(50_000, 1), NOW).unwrap();
+        fs.write_file(&mut v, "keep", b"kept", NOW).unwrap();
+        fs.write_file(&mut v, "gone", &pattern(10_000, 3), NOW).unwrap();
+        fs.write_file(&mut v, "grow", b"", NOW).unwrap();
+        fs.mkdir_p(&mut v, "d", NOW).unwrap();
+        fs.close(&mut v).unwrap();
+    }
+    // how many writes the changes take
+    let total = {
+        let mut d = base.clone();
+        let mut cut = Cut { disk: &mut d, left: usize::MAX, writes: 0 };
+        let mut v = Vol { dev: &mut cut, start: 0 };
+        let mut fs = Fs::mount(&mut v).unwrap();
+        crash_ops(&mut fs, &mut v).unwrap();
+        cut.writes
+    };
+    println!("{total} writes");
+    let mut outcomes = std::collections::BTreeSet::new();
+    for n in 1..=total {
+        let mut d = base.clone();
+        {
+            let mut cut = Cut { disk: &mut d, left: n, writes: 0 };
+            let mut v = Vol { dev: &mut cut, start: 0 };
+            // (the cut may come while mounting: it writes too)
+            if let Ok(mut fs) = Fs::mount(&mut v) {
+                assert!(crash_ops(&mut fs, &mut v).is_err() || n == total, "cut at {n}");
+            }
+        }
+        let (pending, flagged) = log_state(&mut d);
+        assert!(!pending || flagged, "cut at {n}: the log holds a transaction Linux would not replay");
+        let mut v = Vol { dev: &mut d, start: 0 };
+        let mut fs = Fs::mount(&mut v).unwrap_or_else(|e| panic!("cut at {n}: mount {e:?}"));
+        check(&mut fs, &mut v).unwrap_or_else(|e| panic!("cut at {n}: {e}"));
+        let r = file_bytes(&mut fs, &mut v, "replace").unwrap_or_else(|| panic!("cut at {n}: replace gone"));
+        assert!(r == pattern(50_000, 1) || r == pattern(20_000, 2), "cut at {n}: replace is neither");
+        let (old, new) = (file_bytes(&mut fs, &mut v, "keep"), file_bytes(&mut fs, &mut v, "d/kept"));
+        assert!(old.is_some() != new.is_some(), "cut at {n}: keep in {} places", old.is_some() as u8 + new.is_some() as u8);
+        let grow = file_bytes(&mut fs, &mut v, "grow").unwrap();
+        let k = grow.len() / 9000;
+        assert_eq!(grow.len() % 9000, 0, "cut at {n}: grow is {} long", grow.len());
+        for j in 0..k {
+            assert!(grow[j * 9000..(j + 1) * 9000] == pattern(9000, j as u8)[..], "cut at {n}: grow part {j}");
+        }
+        // and it goes on working
+        fs.write_file(&mut v, "after", b"fine", NOW).unwrap();
+        check(&mut fs, &mut v).unwrap_or_else(|e| panic!("cut at {n}, then a write: {e}"));
+        outcomes.insert((r.len(), old.is_some(), k, file_bytes(&mut fs, &mut v, "gone").is_some(), fs.list(&mut v, "d/many").map(|l| l.len()).unwrap_or(0)));
+    }
+    println!("{} different states after the cuts", outcomes.len());
+}
+
+/// EXT4_CRASH_OUT=<dir>: images cut while a committed transaction was being
+/// put in place (for e2fsck to replay).
+#[test]
+fn images_cut_after_commit() {
+    let Ok(dir) = std::env::var("EXT4_CRASH_OUT") else { return };
+    let mut base = Sparse::new(64);
+    {
+        let mut v = Vol { dev: &mut base, start: 0 };
+        let mut fs = Fs::format(&mut v, 64 * 2048, [12; 16], "crash", NOW).unwrap();
+        fs.write_file(&mut v, "replace", &pattern(50_000, 1), NOW).unwrap();
+        fs.write_file(&mut v, "keep", b"kept", NOW).unwrap();
+        fs.write_file(&mut v, "gone", &pattern(10_000, 3), NOW).unwrap();
+        fs.write_file(&mut v, "grow", b"", NOW).unwrap();
+        fs.mkdir_p(&mut v, "d", NOW).unwrap();
+        fs.close(&mut v).unwrap();
+    }
+    let mut saved = 0;
+    for n in 1..400 {
+        let mut d = base.clone();
+        {
+            let mut cut = Cut { disk: &mut d, left: n, writes: 0 };
+            let mut v = Vol { dev: &mut cut, start: 0 };
+            if let Ok(mut fs) = Fs::mount(&mut v) {
+                let _ = crash_ops(&mut fs, &mut v);
+            }
+        }
+        // the journal's superblock says the log holds something
+        let mut v = Vol { dev: &mut d, start: 0 };
+        let fs = Fs::parse(&mut v, None).unwrap();
+        let mut fs = fs;
+        let i = fs.read_inode(&mut v, 8).unwrap();
+        let p = fs.runs(&mut v, &i).unwrap()[0].p;
+        let jsb = v.block(p).unwrap();
+        if u32::from_be_bytes(jsb[0x1C..0x20].try_into().unwrap()) != 0 && n % 3 == 0 {
+            d.save(&format!("{dir}/cut-{n}.img"));
+            // what our own replay makes of it
+            let mut v = Vol { dev: &mut d, start: 0 };
+            let mut fs = Fs::mount(&mut v).unwrap();
+            check(&mut fs, &mut v).unwrap();
+            let mut names: Vec<String> = fs.list(&mut v, "/").unwrap().into_iter().map(|x| x.0).collect();
+            names.extend(fs.list(&mut v, "d").unwrap().into_iter().map(|x| format!("d/{}", x.0)));
+            names.sort();
+            std::fs::write(format!("{dir}/cut-{n}.ours"), names.join("\n") + "\n").unwrap();
+            saved += 1;
+            if saved == 6 {
+                break;
+            }
+        }
+    }
+    assert!(saved > 0);
+}
+
+/// EXT4_JIN=<dir>: l1.img (writable features) and l2.img (Linux's defaults),
+/// each with a log debugfs wrote: blocks 7000-7001 "A", 7001-7002 "B",
+/// 7002 revoked, 7003 "C" never committed.
+#[test]
+fn replay_linux_written_log() {
+    let Ok(dir) = std::env::var("EXT4_JIN") else { return };
+    let want = |b: u64| -> Vec<u8> {
+        match b {
+            7000 => vec![b'A'; 4096],
+            7001 => vec![b'B'; 4096],
+            _ => vec![0; 4096],
+        }
+    };
+    // writable: replayed onto the disk, the log emptied
+    let path = format!("{dir}/l1.img");
+    let mut d = Sparse::load(&path);
+    {
+        let mut v = Vol { dev: &mut d, start: 0 };
+        let mut fs = Fs::mount(&mut v).unwrap();
+        assert!(fs.writable);
+        for b in 7000..7004 {
+            assert_eq!(v.block(b).unwrap(), want(b), "l1 block {b}");
+        }
+        fs.write_file(&mut v, "after-replay", b"ours\n", NOW).unwrap();
+        fs.close(&mut v).unwrap();
+    }
+    assert_eq!(log_state(&mut d), (false, false));
+    d.save(&path);
+    // not ours to write: replayed in memory only, the disk untouched
+    let path = format!("{dir}/l2.img");
+    let mut d = Sparse::load(&path);
+    let before = d.clone();
+    let mut v = Vol { dev: &mut d, start: 0 };
+    let mut fs = Fs::mount(&mut v).unwrap();
+    assert!(!fs.writable);
+    for b in 7000..7004 {
+        assert_eq!(fs.mread(&mut v, b).unwrap(), &want(b)[..], "l2 block {b} as read");
+    }
+    assert!(fs.list(&mut v, "/").unwrap().iter().any(|e| e.0 == "lost+found"));
+    assert_eq!(fs.write_file(&mut v, "x", b"x", NOW), Err(Error::ReadOnly));
+    assert!(d.sectors == before.sectors, "l2 left as it was");
+}
+
+#[test]
+fn journal_added_to_a_file_system_without_one() {
+    let mut d = Sparse::new(64);
+    let mut v = Vol { dev: &mut d, start: 0 };
+    Fs::format(&mut v, 64 * 2048, [13; 16], "old", NOW).unwrap();
+    // as the files partitions made before journals were: the journal taken out again
+    let mut fs = Fs::mount(&mut v).unwrap();
+    let i8 = fs.read_inode(&mut v, 8).unwrap();
+    for e in fs.runs(&mut v, &i8).unwrap() {
+        fs.free_blocks(&mut v, e.p, e.n as u64).unwrap();
+    }
+    fs.write_inode(&mut v, &Inode { ino: 8, raw: vec![0; 256] }).unwrap();
+    fs.journal = None;
+    let f = le32(&fs.sb, 0x5C) & !COMPAT_HAS_JOURNAL;
+    put32(&mut fs.sb, 0x5C, f);
+    let f = le32(&fs.sb, 0x60) & !INCOMPAT_RECOVER;
+    put32(&mut fs.sb, 0x60, f);
+    fs.meta_dirty = true;
+    fs.sync(&mut v).unwrap();
+    fs.write_file(&mut v, "before", b"no journal yet", NOW).unwrap();
+    let mut fs = Fs::mount(&mut v).unwrap();
+    assert!(!fs.has_journal());
+    check(&mut fs, &mut v).unwrap();
+    assert!(fs.add_journal(&mut v, NOW).unwrap());
+    assert!(!fs.add_journal(&mut v, NOW).unwrap());
+    fs.write_file(&mut v, "after", b"journaled", NOW).unwrap();
+    fs.close(&mut v).unwrap();
+    let mut fs = Fs::mount(&mut v).unwrap();
+    assert!(fs.has_journal());
+    check(&mut fs, &mut v).unwrap();
+    assert_eq!(file_bytes(&mut fs, &mut v, "before").unwrap(), b"no journal yet");
+    assert_eq!(file_bytes(&mut fs, &mut v, "after").unwrap(), b"journaled");
 }

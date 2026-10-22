@@ -22,12 +22,18 @@ pub(crate) struct Cache {
 struct Entry {
     data: Vec<u8>,
     dirty: bool,
+    /// replayed from a journal that cannot be written back: kept, never dropped
+    pinned: bool,
 }
 
 impl Cache {
+    pub(crate) fn dirty_count(&self) -> usize {
+        self.dirty
+    }
+
     fn make_room(&mut self) {
         if self.map.len() >= MAX_BLOCKS {
-            self.map.retain(|_, e| e.dirty);
+            self.map.retain(|_, e| e.dirty || e.pinned);
         }
     }
 }
@@ -55,7 +61,7 @@ impl Fs {
     pub(crate) fn mzero(&mut self, b: u64) -> &mut [u8] {
         self.cache.make_room();
         let c = &mut self.cache;
-        let e = c.map.entry(b).or_insert_with(|| Entry { data: vec![0u8; BLOCK], dirty: false });
+        let e = c.map.entry(b).or_insert_with(|| Entry { data: vec![0u8; BLOCK], dirty: false, pinned: false });
         if !e.dirty {
             e.dirty = true;
             c.dirty += 1;
@@ -91,7 +97,7 @@ impl Fs {
             }
             self.cache.make_room();
             let data = v.block(b)?;
-            self.cache.map.insert(b, Entry { data, dirty: false });
+            self.cache.map.insert(b, Entry { data, dirty: false, pinned: false });
         }
         Ok(())
     }
@@ -101,30 +107,52 @@ impl Fs {
         self.cache.dirty
     }
 
-    /// Everything changed to the disk.
+    /// A cached block's contents.
+    pub(crate) fn cached(&self, b: u64) -> &[u8] {
+        &self.cache.map[&b].data
+    }
+
+    /// A block as a replayed journal has it (the disk is not written).
+    pub(crate) fn pin(&mut self, b: u64, data: Vec<u8>) {
+        self.cache.map.insert(b, Entry { data, dirty: false, pinned: true });
+    }
+
+    /// Everything changed to the disk: through the journal if there is one.
     pub fn sync(&mut self, v: &mut Vol) -> R<()> {
-        if self.cache.dirty > 0 {
-            let dirty: Vec<u64> = self.cache.map.iter().filter(|(_, e)| e.dirty).map(|(b, _)| *b).collect();
-            let mut k = 0;
-            while k < dirty.len() {
-                let mut n = 1;
-                while k + n < dirty.len() && n < MAX_RUN && dirty[k + n] == dirty[k] + n as u64 {
-                    n += 1;
-                }
-                let mut buf = Vec::with_capacity(n * BLOCK);
-                for b in &dirty[k..k + n] {
-                    buf.extend_from_slice(&self.cache.map[b].data);
-                }
-                v.write(dirty[k], &buf)?;
-                for b in &dirty[k..k + n] {
-                    self.cache.map.get_mut(b).expect("cached").dirty = false;
-                }
-                self.cache.dirty -= n;
-                k += n;
-            }
-        }
         if self.meta_dirty {
-            self.write_meta(v, false)?;
+            self.render_meta(v)?;
+        }
+        if self.cache.dirty == 0 {
+            return Ok(());
+        }
+        let dirty: Vec<u64> = self.cache.map.iter().filter(|(_, e)| e.dirty).map(|(b, _)| *b).collect();
+        if !self.commit(v, &dirty)? {
+            self.write_home(v, &dirty)?;
+        }
+        Ok(())
+    }
+
+    /// Cached blocks (sorted) to their places; clean after.
+    pub(crate) fn write_home(&mut self, v: &mut Vol, blocks: &[u64]) -> R<()> {
+        let mut k = 0;
+        while k < blocks.len() {
+            let mut n = 1;
+            while k + n < blocks.len() && n < MAX_RUN && blocks[k + n] == blocks[k] + n as u64 {
+                n += 1;
+            }
+            let mut buf = Vec::with_capacity(n * BLOCK);
+            for b in &blocks[k..k + n] {
+                buf.extend_from_slice(&self.cache.map[b].data);
+            }
+            v.write(blocks[k], &buf)?;
+            for b in &blocks[k..k + n] {
+                let e = self.cache.map.get_mut(b).expect("cached");
+                if e.dirty {
+                    e.dirty = false;
+                    self.cache.dirty -= 1;
+                }
+            }
+            k += n;
         }
         Ok(())
     }

@@ -305,8 +305,19 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                         return None;
                     }
                 };
+                let mut fs = fs;
+                match fs.add_journal(&mut v, arch::unix_time() as u32) {
+                    Ok(true) => kprintln!("storage: files partition: journal added"),
+                    Ok(false) => {}
+                    Err(e) => kprintln!("storage: files partition: no journal: {:?}", e),
+                }
                 let (total, free) = fs.usage();
-                kprintln!("storage: files partition {} MiB (ext4{}), {} MiB used", total >> 20, if fs.writable { "" } else { ", read only" }, (total - free) >> 20);
+                let how = match (fs.writable, fs.has_journal()) {
+                    (false, _) => ", read only",
+                    (true, true) => ", journaled",
+                    (true, false) => "",
+                };
+                kprintln!("storage: files partition {} MiB (ext4{}), {} MiB used", total >> 20, how, (total - free) >> 20);
                 Some((fs, start))
             });
             Some(sys::Boot { disk: Box::new(disk), upd, store, log, files })

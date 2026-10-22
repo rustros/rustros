@@ -247,6 +247,10 @@ impl Kernel {
             if let Some(l) = b.log.as_mut() {
                 l.flush(&mut *b.disk);
             }
+            // the files partition marked clean (else the next mount just finds an empty log)
+            if let Some((fs, start)) = b.files.as_mut() {
+                let _ = fs.close(&mut ext4::Vol { dev: &mut *b.disk, start: *start });
+            }
         }
     }
 

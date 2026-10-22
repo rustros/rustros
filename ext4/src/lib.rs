@@ -9,17 +9,22 @@
 //! Metadata (bitmaps, inode tables, directories, extent trees) goes through
 //! a block cache and reaches the disk at `sync`, which every changing call
 //! does when it ends unless `auto_sync` is off; file data is written
-//! straight away.
+//! straight away. With a journal (see `journal`) a sync is one transaction:
+//! after a crash the file system is as it was at one of the syncs.
 //!
 //! What it makes: 4 KiB blocks, 128 MiB block groups, 256-byte inodes,
 //! files and directories mapped by extents (trees of any depth), linear
-//! directories; features `extents`, `filetype`, `sparse_super`,
-//! `large_file`, `extra_isize`; no journal and no checksums yet (so after a
-//! crash run e2fsck).
+//! directories, a journal sized as mke2fs sizes it; features `extents`,
+//! `filetype`, `sparse_super`, `large_file`, `extra_isize`, `has_journal`;
+//! no checksums yet.
 //!
 //! What it reads: also file systems Linux made (flex_bg, 64-bit, checksums
-//! and journals are ignored when reading). It writes only to those whose
-//! features it keeps up (it refuses the rest instead of damaging them).
+//! are ignored when reading; their journal is replayed, in memory if the
+//! disk is not ours to write). It writes only to those whose features it
+//! keeps up (it refuses the rest instead of damaging them).
+//!
+//! Mounted writable with a journal, the file system is marked as needing
+//! recovery until `close` (as Linux does while it has one mounted).
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
@@ -29,6 +34,7 @@ mod cache;
 mod dir;
 mod extent;
 mod file;
+mod journal;
 mod ns;
 
 use alloc::vec;
@@ -235,6 +241,7 @@ pub struct Fs {
     cache: cache::Cache,
     /// the superblock or group descriptors changed since the last sync
     meta_dirty: bool,
+    journal: Option<journal::Journal>,
 }
 
 /// An inode as read from its table.
@@ -454,6 +461,7 @@ impl Fs {
             auto_sync: true,
             cache: cache::Cache::default(),
             meta_dirty: true,
+            journal: None,
         };
         // bitmaps and empty inode tables (straight to the disk: nothing is cached yet)
         let zero = vec![0u8; BLOCK * 16];
@@ -543,6 +551,7 @@ impl Fs {
         fs.adjust_links(v, ROOT, 1, now)?;
         // the root's inode was in use already (reserved): count it as a directory here
         fs.groups[0].used_dirs += 1;
+        fs.make_journal(v, &uuid, now)?;
         fs.sync(v)?;
         fs.write_meta(v, true)?;
         Ok(fs)
@@ -551,8 +560,39 @@ impl Fs {
     // ------------------------------------------------------------ mount
 
     pub fn mount(v: &mut Vol) -> R<Fs> {
+        let mut fs = Self::parse(v, None)?;
+        if le32(&fs.sb, 0x5C) & COMPAT_HAS_JOURNAL != 0 {
+            let replayed = le32(&fs.sb, 0x60) & INCOMPAT_RECOVER != 0;
+            fs.open_journal(v, true)?;
+            if replayed {
+                // the superblock and descriptors as the log left them
+                let again = Self::parse(v, Some(&mut fs))?;
+                fs.sb = again.sb;
+                fs.groups = again.groups;
+            }
+            if fs.writable {
+                // until close: what is on the disk may need the log
+                fs.set_recover(v, true)?;
+            }
+        }
+        Ok(fs)
+    }
+
+    /// The superblock and group descriptors (through `cached`'s cache when given).
+    fn parse(v: &mut Vol, mut cached: Option<&mut Fs>) -> R<Fs> {
+        let mut read = |b: u64, out: &mut [u8]| -> R<()> {
+            match cached.as_deref_mut() {
+                Some(fs) => {
+                    for (k, c) in out.chunks_mut(BLOCK).enumerate() {
+                        c.copy_from_slice(fs.mread(v, b + k as u64)?);
+                    }
+                    Ok(())
+                }
+                None => v.read(b, out),
+            }
+        };
         let mut first = vec![0u8; BLOCK];
-        v.read(0, &mut first)?;
+        read(0, &mut first)?;
         let sb = first[1024..2048].to_vec();
         if le16(&sb, 0x38) != MAGIC {
             return Err(Error::NotExt4);
@@ -563,7 +603,6 @@ impl Fs {
         }
         let incompat = le32(&sb, 0x60);
         let ro = le32(&sb, 0x64);
-        let compat = le32(&sb, 0x5C);
         let bit64 = incompat & INCOMPAT_64BIT != 0;
         let desc_size = if bit64 { (le16(&sb, 0xFE) as usize).max(32) } else { 32 };
         let blocks = le32(&sb, 0x04) as u64 | if bit64 { (le32(&sb, 0x150) as u64) << 32 } else { 0 };
@@ -571,10 +610,13 @@ impl Fs {
         let ipg = le32(&sb, 0x28);
         let first_data_block = le32(&sb, 0x14) as u64;
         let inode_size = if le32(&sb, 0x4C) >= 1 { le16(&sb, 0x58) as usize } else { 128 };
+        if bpg == 0 || ipg == 0 || blocks <= first_data_block {
+            return Err(Error::Corrupt("bad superblock"));
+        }
         let ngroups = (blocks - first_data_block).div_ceil(bpg as u64) as usize;
         let gdt_blocks = (ngroups * desc_size).div_ceil(BLOCK);
         let mut gdt = vec![0u8; gdt_blocks * BLOCK];
-        v.read(first_data_block + 1, &mut gdt)?;
+        read(first_data_block + 1, &mut gdt)?;
         let hi = |d: &[u8], o: usize| if bit64 && desc_size >= 64 { le32(d, o) as u64 } else { 0 };
         let hi16 = |d: &[u8], o: usize| if bit64 && desc_size >= 64 { le16(d, o) as u32 } else { 0 };
         let groups = (0..ngroups)
@@ -590,8 +632,8 @@ impl Fs {
                 }
             })
             .collect();
-        // writable only with what this code keeps up, and with no journal to replay
-        let writable = incompat & !INCOMPAT_WRITABLE == 0 && ro & !RO_WRITABLE == 0 && compat & COMPAT_HAS_JOURNAL == 0 && incompat & INCOMPAT_RECOVER == 0 && !bit64;
+        // writable only with what this code keeps up (the journal may say otherwise)
+        let writable = (incompat & !INCOMPAT_RECOVER) & !INCOMPAT_WRITABLE == 0 && ro & !RO_WRITABLE == 0 && !bit64;
         Ok(Fs {
             sb,
             groups,
@@ -605,7 +647,34 @@ impl Fs {
             auto_sync: true,
             cache: cache::Cache::default(),
             meta_dirty: false,
+            journal: None,
         })
+    }
+
+    /// Everything to the disk, and the file system marked clean (it is
+    /// still usable; the next change marks it again).
+    pub fn close(&mut self, v: &mut Vol) -> R<()> {
+        // first everything else, then the flag on its own: Linux replays a
+        // log only with the flag set, so it must not go before the rest is home
+        self.sync(v)?;
+        if self.writable && self.journal.is_some() {
+            self.set_recover(v, false)?;
+        }
+        Ok(())
+    }
+
+    /// The needs_recovery flag, straight into the superblock (the log is
+    /// empty when it changes; the superblock is in the first sectors of
+    /// block 0, so it lands whole or not at all).
+    fn set_recover(&mut self, v: &mut Vol, on: bool) -> R<()> {
+        let f = le32(&self.sb, 0x60);
+        let f = if on { f | INCOMPAT_RECOVER } else { f & !INCOMPAT_RECOVER };
+        put32(&mut self.sb, 0x60, f);
+        let mut b0 = v.block(0)?;
+        put32(&mut b0, 1024 + 0x60, f);
+        v.write(0, &b0)?;
+        self.forget(0, 1);
+        Ok(())
     }
 
     /// (total, free) bytes.
@@ -615,12 +684,29 @@ impl Fs {
 
     // ------------------------------------------------------------ metadata
 
-    /// Group descriptors and the superblock to disk (`backups`: also the copies).
-    fn write_meta(&mut self, v: &mut Vol, backups: bool) -> R<()> {
+    /// The superblock (in block 0) and the group descriptors into the cache,
+    /// to go out with the rest at sync.
+    fn render_meta(&mut self, v: &mut Vol) -> R<()> {
         let free_blocks: u64 = self.groups.iter().map(|g| g.free_blocks as u64).sum();
         let free_inodes: u32 = self.groups.iter().map(|g| g.free_inodes).sum();
         put32(&mut self.sb, 0x0C, free_blocks as u32);
         put32(&mut self.sb, 0x10, free_inodes);
+        let gdt = self.gdt();
+        let mut sb = self.sb.clone();
+        put16(&mut sb, 0x5A, 0);
+        let off = if self.first_data_block == 0 { 1024 } else { 0 };
+        let b0 = self.mread(v, self.first_data_block)?;
+        if b0[off..off + 1024] != sb[..] {
+            self.mmod(v, self.first_data_block)?[off..off + 1024].copy_from_slice(&sb);
+        }
+        for (k, blk) in gdt.chunks(BLOCK).enumerate() {
+            self.mset(v, self.first_data_block + 1 + k as u64, blk)?;
+        }
+        self.meta_dirty = false;
+        Ok(())
+    }
+
+    fn gdt(&self) -> Vec<u8> {
         let gdt_blocks = (self.groups.len() * self.desc_size).div_ceil(BLOCK);
         let mut gdt = vec![0u8; gdt_blocks * BLOCK];
         for (i, g) in self.groups.iter().enumerate() {
@@ -632,6 +718,16 @@ impl Fs {
             put16(d, 0xE, g.free_inodes as u16);
             put16(d, 0x10, g.used_dirs as u16);
         }
+        gdt
+    }
+
+    /// Group descriptors and the superblock to disk (`backups`: also the copies).
+    fn write_meta(&mut self, v: &mut Vol, backups: bool) -> R<()> {
+        let free_blocks: u64 = self.groups.iter().map(|g| g.free_blocks as u64).sum();
+        let free_inodes: u32 = self.groups.iter().map(|g| g.free_inodes).sum();
+        put32(&mut self.sb, 0x0C, free_blocks as u32);
+        put32(&mut self.sb, 0x10, free_inodes);
+        let gdt = self.gdt();
         let ngroups = if backups { self.groups.len() as u32 } else { 1 };
         for g in (0..ngroups).filter(|&g| has_super(g)) {
             let first = self.first_data_block + g as u64 * self.blocks_per_group as u64;
@@ -888,7 +984,9 @@ impl Fs {
             return Err(Error::ReadOnly);
         }
         let r = f(self, v);
-        let s = if self.auto_sync { self.sync(v) } else { Ok(()) };
+        // without auto_sync, still before the changes outgrow the log
+        let big = self.journal.as_ref().is_some_and(|j| self.cache.dirty_count() * 4 > j.len() as usize);
+        let s = if self.auto_sync || big { self.sync(v) } else { Ok(()) };
         let t = r?;
         s?;
         Ok(t)
