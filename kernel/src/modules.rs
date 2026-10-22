@@ -286,6 +286,57 @@ pub fn boot(k: &mut Kernel) {
     for name in names {
         k.app_ops.push(ModuleOp::Start(name));
     }
+    install_bundled(k);
+}
+
+/// The modules the boot image carries (`rustros.bundle=<lba>`, written by
+/// mkimg after the image): each installed once, at the first boot that
+/// finds it neither installed nor installed from the bundle before (so one
+/// the owner removed stays removed).
+fn install_bundled(k: &mut Kernel) {
+    const MAGIC: &[u8; 8] = b"RRSBNDL1";
+    const HEAD: usize = 4096;
+    const ENTRY: usize = 80;
+    let Some(lba) = rustros_util::wire::cmdline_get(&k.cmdline, "rustros.bundle").and_then(|v| v.parse::<u64>().ok()) else { return };
+    let mut head = alloc::vec![0u8; HEAD];
+    if !k.boot.as_mut().is_some_and(|b| b.disk.read(lba, &mut head)) || &head[..8] != MAGIC {
+        kprintln!("modules: no bundle at LBA {}", lba);
+        return;
+    }
+    let count = (u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize).min((HEAD - 16) / ENTRY);
+    let have = installed(k);
+    for i in 0..count {
+        let e = &head[16 + i * ENTRY..16 + (i + 1) * ENTRY];
+        let name = String::from(String::from_utf8_lossy(&e[..32]).trim_end_matches('\0'));
+        let at = u32::from_le_bytes([e[32], e[33], e[34], e[35]]) as u64;
+        let len = u32::from_le_bytes([e[36], e[37], e[38], e[39]]) as usize;
+        let sha: [u8; 32] = e[40..72].try_into().unwrap_or([0; 32]);
+        let marker = format!("sys/bundle/{name}");
+        if name.is_empty() || get(k, &marker).is_some() {
+            continue;
+        }
+        if have.contains(&name) {
+            let _ = put(k, &marker, &sha);
+            continue;
+        }
+        let mut data = alloc::vec![0u8; len.div_ceil(512) * 512];
+        if !k.boot.as_mut().is_some_and(|b| b.disk.read(lba + at, &mut data)) {
+            kprintln!("modules: bundled {}: unreadable", name);
+            continue;
+        }
+        data.truncate(len);
+        if rustros_util::sha256::Sha256::digest(&data) != sha {
+            kprintln!("modules: bundled {}: damaged (SHA-256), not installed", name);
+            continue;
+        }
+        match install(k, &name, &data) {
+            Ok(kind) => {
+                let _ = put(k, &marker, &sha);
+                kprintln!("modules: installed {} from the boot image ({}, {} KiB)", name, kind.as_str(), len / 1024);
+            }
+            Err(e) => kprintln!("modules: bundled {}: {}", name, e),
+        }
+    }
 }
 
 /// Stop every hosted (WebAssembly) instance; they run on the runtime's code.

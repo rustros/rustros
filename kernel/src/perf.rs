@@ -146,6 +146,11 @@ impl Perf {
         s
     }
 
+    /// CPU use over the last second, percent.
+    pub fn cpu(&self) -> u32 {
+        self.cpu.min(100) as u32
+    }
+
     pub fn report(&self) -> String {
         self.summary(&self.last)
     }

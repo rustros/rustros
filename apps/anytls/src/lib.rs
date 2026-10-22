@@ -171,31 +171,6 @@ fn addr_of(ifs: &[(String, Ip, Ip, Ip)], v: &str) -> Option<Ip> {
     parse_ip(v).or_else(|| ifs.iter().find(|f| f.0 == v).map(|f| f.1).filter(|&a| a != 0))
 }
 
-/// A PEM value as typed on one line (newlines as spaces or `\n`), made
-/// PEM again: each BEGIN … END block with its base64 rewrapped.
-fn pem(v: &str) -> String {
-    let v = v.replace("\\n", "\n");
-    let mut out = String::new();
-    let mut rest = v.as_str();
-    while let Some(b) = rest.find("-----BEGIN ") {
-        let after = &rest[b + 11..];
-        let Some(e) = after.find("-----") else { break };
-        let label = &after[..e];
-        let body_start = b + 11 + e + 5;
-        let end_mark = format!("-----END {label}-----");
-        let Some(end) = rest[body_start..].find(&end_mark) else { break };
-        let body: String = rest[body_start..body_start + end].chars().filter(|c| !c.is_whitespace()).collect();
-        out += &format!("-----BEGIN {label}-----\n");
-        for line in body.as_bytes().chunks(64) {
-            out += core::str::from_utf8(line).unwrap_or("");
-            out.push('\n');
-        }
-        out += &format!("{end_mark}\n");
-        rest = &rest[body_start + end + end_mark.len()..];
-    }
-    out
-}
-
 fn frame(out: &mut Vec<u8>, cmd: u8, sid: u32, data: &[u8]) {
     out.push(cmd);
     out.extend_from_slice(&sid.to_be_bytes());
@@ -329,7 +304,7 @@ impl AnyTls {
         let (Some(cert), Some(key)) = (get(s, "cert"), get(s, "key")) else {
             return Err(format!("needs a certificate and its key (cfg anytls {name}.cert / {name}.key, PEM)"));
         };
-        let config = tls::server_config(&pem(cert), &pem(key))?;
+        let config = tls::server_config(&rustros_util::pem::normalize(cert), &rustros_util::pem::normalize(key))?;
         let users: Vec<(String, [u8; 32])> = s
             .iter()
             .filter_map(|(k, v)| {
@@ -939,14 +914,6 @@ impl Module for AnyTls {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pem_from_one_line() {
-        let one = "-----BEGIN PRIVATE KEY----- MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg -----END PRIVATE KEY-----";
-        assert_eq!(pem(one), "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg\n-----END PRIVATE KEY-----\n");
-        let esc = "-----BEGIN CERTIFICATE-----\\nAAAA\\nBBBB\\n-----END CERTIFICATE-----\\n-----BEGIN CERTIFICATE-----\\nCCCC\\n-----END CERTIFICATE-----";
-        assert_eq!(pem(esc), "-----BEGIN CERTIFICATE-----\nAAAABBBB\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----\n");
-    }
 
     #[test]
     fn addresses() {

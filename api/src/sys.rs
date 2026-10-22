@@ -488,6 +488,16 @@ pub trait Admin: Base {
     fn perf_report(&self) -> String;
     /// Start the peaks over.
     fn perf_reset(&mut self);
+    /// CPU use over the last second, in percent (from the time the main
+    /// loop waits in `hlt`).
+    fn cpu_pct(&self) -> u32 {
+        0
+    }
+    /// Bytes each NIC received and sent since boot (all traffic, forwarded
+    /// too), in NIC order.
+    fn nic_bytes(&self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
 
     /// Console logs kept on disk: (boot number, bytes), oldest first.
     fn log_list(&mut self) -> Vec<(u64, u64)>;

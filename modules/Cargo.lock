@@ -607,6 +607,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "panel"
+version = "0.1.0"
+dependencies = [
+ "rustros-api",
+ "rustros-util",
+ "tls",
+]
+
+[[package]]
+name = "panel-mod"
+version = "0.1.0"
+dependencies = [
+ "panel",
+ "rustros-module",
+]
+
+[[package]]
 name = "pkcs1"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

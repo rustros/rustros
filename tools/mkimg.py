@@ -24,6 +24,7 @@ sector write.
 import argparse
 import os
 import secrets
+import hashlib
 import struct
 import subprocess
 import sys
@@ -173,6 +174,30 @@ def gpt_header(my, alt, entries_lba, entries, disk_guid, last):
 
 # ---------------------------------------------------------------- main
 
+BUNDLE_MAGIC = b"RRSBNDL1"
+BUNDLE_HEAD = 4096   # header bytes: magic, count, then 80-byte entries
+BUNDLE_ENTRY = 80    # name (32, zero padded), offset in sectors from the bundle (4), bytes (4), SHA-256 (32), pad (8)
+
+
+def make_bundle(specs):
+    """The bundle area: a header listing the modules, then each module
+    (sector aligned). Empty when there are none."""
+    if not specs:
+        return b""
+    entries, blobs, at = [], [], BUNDLE_HEAD // SECTOR
+    for spec in specs:
+        name, path = spec.split("=", 1)
+        assert 0 < len(name) <= 32 and name.replace("-", "").replace("_", "").isalnum(), f"bad module name {name!r}"
+        data = open(path, "rb").read()
+        entries.append(name.encode().ljust(32, b"\0") + struct.pack("<II", at, len(data)) + hashlib.sha256(data).digest() + bytes(8))
+        padded = data + bytes(-len(data) % SECTOR)
+        blobs.append(padded)
+        at += len(padded) // SECTOR
+    assert 16 + len(entries) * BUNDLE_ENTRY <= BUNDLE_HEAD, "too many bundled modules"
+    head = (BUNDLE_MAGIC + struct.pack("<II", len(entries), 0) + b"".join(entries)).ljust(BUNDLE_HEAD, b"\0")
+    return head + b"".join(blobs)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("kernel", help="kernel ELF")
@@ -184,8 +209,13 @@ def main():
     ap.add_argument("--key-file", help="read/store the update key in this file")
     ap.add_argument("--slot-kb", type=int, default=256, help="size of each kernel slot in KiB")
     ap.add_argument("--timeout", type=int, default=2, help="GRUB menu timeout in seconds")
+    ap.add_argument("--bundle", action="append", default=[], metavar="NAME=FILE",
+                    help="a module the image carries (installed at first boot), e.g. panel=build/modules/panel.mod")
+    ap.add_argument("--panel", default="", help="the panel this image's machines connect to (rustros.panel=)")
     a = ap.parse_args()
     assert IMAGE_SECTORS <= BOOT_AREA_SECTORS, "the image must stay inside the 64 MiB boot area"
+    bundle = make_bundle(a.bundle)
+    assert IMAGE_SECTORS + len(bundle) // SECTOR <= BOOT_AREA_SECTORS, "the bundle must fit in the 64 MiB boot area"
 
     key = a.key
     if not key and a.key_file and os.path.exists(a.key_file):
@@ -244,6 +274,10 @@ def main():
         slot_sectors = slot_bytes // SECTOR
 
         disk = f"rustros.slots={a_lba},{b_lba},{slot_sectors} rustros.env={env_lba}"
+        if bundle:
+            disk += f" rustros.bundle={IMAGE_SECTORS}"
+        if a.panel:
+            disk += f" rustros.panel={a.panel}"
         net = f"$netargs key={key}"
         defaults = "".join(
             f'if [ -z "$net_{k}" ]; then set net_{k}={v}; fi\n'
@@ -337,8 +371,15 @@ menuentry "RustROS (slot $boot_slot, fallback)" {{
             out.seek((last - 32) * SECTOR)
             out.write(entries)
             out.write(gpt_header(last, 1, last - 32, entries, disk_guid, last))
+            # the modules it carries, right after the image (in the boot area)
+            out.seek(IMAGE_SECTORS * SECTOR)
+            out.write(bundle)
 
-    print(f"{a.output}: {IMAGE_SECTORS * SECTOR >> 20} MiB raw disk (GPT), BIOS + UEFI")
+    print(f"{a.output}: {(IMAGE_SECTORS * SECTOR + len(bundle)) / 1048576:.1f} MiB raw disk (GPT), BIOS + UEFI")
+    for name, _ in a.bundle and [b.split("=", 1) for b in a.bundle] or []:
+        print(f"  carries module {name} (installed at first boot)")
+    if a.panel:
+        print(f"  panel: {a.panel}")
     print(f"  kernel {len(kernel)} bytes in {a.slot_kb} KiB slots: A @ LBA {a_lba}, B @ LBA {b_lba}; grubenv @ LBA {env_lba}")
     print(f"  first boot creates cache 64-512 MiB and data 512 MiB-1 GiB; beyond 1 GiB is free (NAS)")
     print(f"  network: {a.ip or 'DHCP (or set ip/save on the console)'}" + (f" gw {a.gw}" if a.gw else "") + (f" mtu {a.mtu}" if a.mtu else ""))

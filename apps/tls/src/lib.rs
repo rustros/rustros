@@ -26,6 +26,12 @@ use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, Insufficien
 pub use provider::{random, seed, set_time, x25519_public};
 pub use rustls::server::ServerConfig as RustlsServerConfig;
 
+/// Whether `sig` is `public`'s Ed25519 signature of `msg`.
+pub fn ed25519_verify(public: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
+    let (Ok(k), Ok(s)) = (ed25519_dalek::VerifyingKey::from_bytes(public), ed25519_dalek::Signature::from_slice(sig)) else { return false };
+    k.verify_strict(msg, &s).is_ok()
+}
+
 /// One TLS connection, either side: the application moves ciphertext
 /// between it and a TCP connection (`feed`, `take_outgoing`) and reads and
 /// writes plaintext (`take_received`, `write`).
@@ -76,8 +82,18 @@ impl Tls {
     }
 
     pub fn client(host: &str) -> Result<Tls, String> {
+        Tls::client_trusting(host, "")
+    }
+
+    /// A client that also trusts the CA certificates in `extra_roots` (PEM):
+    /// a private CA, a test server's.
+    pub fn client_trusting(host: &str, extra_roots: &str) -> Result<Tls, String> {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for c in CertificateDer::pem_slice_iter(extra_roots.as_bytes()) {
+            let c = c.map_err(|e| format!("CA certificate: {e:?}"))?;
+            roots.add(c).map_err(|e| format!("CA certificate: {e}"))?;
+        }
         let config = rustls::ClientConfig::builder_with_details(Arc::new(provider::provider()), provider::time_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| format!("{e}"))?

@@ -646,6 +646,12 @@ impl Admin for Ctx<'_> {
     fn perf_reset(&mut self) {
         self.k.perf.reset();
     }
+    fn cpu_pct(&self) -> u32 {
+        self.k.perf.cpu()
+    }
+    fn nic_bytes(&self) -> Vec<(u64, u64)> {
+        self.k.nics.iter().map(|n| n.stats()).map(|s| (s.rx_bytes, s.tx_bytes)).collect()
+    }
     fn log_this_boot(&self) -> Option<u64> {
         self.k.boot.as_ref()?.log.as_ref().map(|l| l.seq)
     }
