@@ -123,7 +123,27 @@ pub fn parse_cidr(s: &str) -> Option<(Ip, Ip)> {
     Some((parse_ip(ip)?, mask))
 }
 
+/// A network for a list of who or what (allow, hosts, allowed IPs):
+/// "a.b.c.d/n", or "a.b.c.d" alone for that one address (not a /24, as
+/// `parse_cidr` assumes for an interface's address).
+pub fn parse_net(s: &str) -> Option<(Ip, Ip)> {
+    if s.contains('/') { parse_cidr(s) } else { parse_ip(s).map(|a| (a, !0)) }
+}
+
 /// Look up `key=value` in a whitespace-separated command line.
 pub fn cmdline_get<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
     cmdline.split_ascii_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+
+    #[test]
+    fn one_address_is_one_address() {
+        assert_eq!(parse_net("10.0.0.7"), Some((0x0A00_0007, !0)));
+        assert_eq!(parse_net("10.0.0.0/8"), Some((0x0A00_0000, 0xFF00_0000)));
+        assert_eq!(parse_net("0.0.0.0/0"), Some((0, 0)));
+        assert_eq!(parse_net("nic0"), None);
+    }
 }

@@ -3,12 +3,14 @@
 //! can only be used by the application that created it.
 
 use alloc::collections::VecDeque;
+
+use rustros_util::wire::{be16, be32, checksum};
 use alloc::vec::Vec;
 
 use rustros_api::{ConnInfo, Ip, NetError, NetInfo, RawSocket, SocketAddr, TcpListener, TcpStream, UdpSocket};
 
 use crate::Link;
-use crate::iface::{Iface, Ifaces, PROTO_TCP, PROTO_UDP, parse_udp};
+use crate::iface::{Iface, Ifaces, IpPkt, PROTO_ICMP, PROTO_TCP, PROTO_UDP, parse_udp};
 use crate::tcp::{Handle, State, Tcp};
 
 /// Datagrams queued per socket before new ones are dropped.
@@ -45,6 +47,9 @@ pub struct Stack {
     next_id: u32,
     /// Application names by owner index, for connection listings.
     pub owner_names: Vec<&'static str>,
+    /// A pass of `loopback` used its whole budget: the last packet, for
+    /// the log (a storm between two of our own sockets).
+    pub loop_storm: Option<alloc::string::String>,
 }
 
 type R<T> = Result<T, NetError>;
@@ -60,13 +65,14 @@ fn handle(s: TcpStream) -> Handle {
 impl Stack {
     pub fn new(mac: [u8; 6], ip: Ip, mask: Ip, gw: Ip) -> Stack {
         Stack {
-            ifs: Ifaces(alloc::vec![Iface::new(0, mac, ip, mask, gw)], Vec::new()),
+            ifs: Ifaces(alloc::vec![Iface::new(0, mac, ip, mask, gw)], Vec::new(), VecDeque::new()),
             tcp: Tcp::new(256),
             listeners: Vec::new(),
             udp: Vec::new(),
             raw: Vec::new(),
             next_id: 1,
             owner_names: Vec::new(),
+            loop_storm: None,
         }
     }
 
@@ -105,14 +111,59 @@ impl Stack {
         let (f, after) = rest.split_first_mut().unwrap();
         let elsewhere = |ip: Ip| before.iter().chain(after.iter()).any(|o| o.is_local(ip));
         let Some(pkt) = f.handle(link, frame, &elsewhere) else { return };
+        // an extra address only serves connections made from it
+        let open = pkt.dst == self.ifs.0[nic].ip;
+        self.deliver(link, nic, &pkt, open);
+    }
+
+    /// Packets we sent to ourselves (`Ifaces::is_ours`), received: a
+    /// bounded number per call (`poll`, once a main-loop pass).
+    pub fn loopback(&mut self, link: &mut dyn Link) {
+        // replies queue more: a bound keeps a ping-pong from running away
+        for n in 0..256 {
+            let Some(p) = self.ifs.2.pop_front() else { return };
+            if n == 255 && p[9] == PROTO_TCP {
+                let ihl = (p[0] & 0xF) as usize * 4;
+                if let Some(t) = p.get(ihl..ihl + 14) {
+                    let ip = |o: usize| rustros_util::wire::IpFmt(be32(&p, o));
+                    self.loop_storm = Some(alloc::format!(
+                        "{}:{} -> {}:{} flags {:#04x} seq {} ack {} len {}, {} queued",
+                        ip(12),
+                        be16(t, 0),
+                        ip(16),
+                        be16(t, 2),
+                        t[13],
+                        be32(t, 4),
+                        be32(t, 8),
+                        p.len() - ihl - (t[12] >> 4) as usize * 4,
+                        self.ifs.2.len()
+                    ));
+                }
+            }
+            let ihl = (p[0] & 0xF) as usize * 4;
+            let total = (be16(&p, 2) as usize).min(p.len());
+            let pkt = IpPkt { src: be32(&p, 12), dst: be32(&p, 16), proto: p[9], ttl: p[8], payload: &p[ihl..total] };
+            let m = pkt.payload;
+            if pkt.proto == PROTO_ICMP && m.len() >= 8 && m[0] == 8 {
+                let mut r = m.to_vec();
+                r[0] = 0;
+                r[2..4].fill(0);
+                let c = checksum(&r, 0);
+                r[2..4].copy_from_slice(&c.to_be_bytes());
+                self.ifs.send_ip_from(link, pkt.dst, pkt.src, PROTO_ICMP, &r);
+            } else {
+                self.deliver(link, 0, &pkt, true);
+            }
+        }
+    }
+
+    fn deliver(&mut self, link: &mut dyn Link, nic: usize, pkt: &IpPkt, open: bool) {
         match pkt.proto {
             PROTO_TCP => {
-                // an extra address only serves connections made from it
-                let open = pkt.dst == self.ifs.0[nic].ip;
-                self.tcp.input(&mut self.ifs, link, &pkt, open);
+                self.tcp.input(&mut self.ifs, link, pkt, open);
             }
             PROTO_UDP => {
-                let Some((sport, dport, data)) = parse_udp(&pkt) else { return };
+                let Some((sport, dport, data)) = parse_udp(pkt) else { return };
                 // the address it was sent to (an interface's or an extra one)
                 let local = pkt.dst;
                 let ours = self.ifs.0.iter().any(|f| f.is_local(local));
@@ -146,6 +197,7 @@ impl Stack {
             f.poll(link);
         }
         self.tcp.poll(&mut self.ifs, link);
+        self.loopback(link);
     }
 
     // ---------------------------------------------------------------- info
@@ -449,5 +501,105 @@ impl Stack {
 
     pub fn raw_close(&mut self, owner: usize, s: RawSocket) {
         self.raw.retain(|r| !(r.id as u64 == s.to_raw() && r.owner == owner));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Wire {
+        now: u64,
+        sent: usize,
+    }
+    impl Link for Wire {
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn send(&mut self, _nic: usize, _frame: &[u8]) -> bool {
+            self.sent += 1;
+            true
+        }
+        fn random(&mut self) -> u64 {
+            0x1234_5678
+        }
+    }
+
+    const fn ip(a: u8, b: u8, c: u8, d: u8) -> Ip {
+        u32::from_be_bytes([a, b, c, d])
+    }
+
+    fn talk(st: &mut Stack, w: &mut Wire, to: Ip, port: u16) -> SocketAddr {
+        let l = st.tcp_listen(1, port).unwrap();
+        let c = st.tcp_connect(2, w, SocketAddr { ip: to, port }).unwrap();
+        for _ in 0..10 {
+            w.now += 1;
+            st.poll(w);
+        }
+        let (s, peer) = st.tcp_accept(1, l).expect("accepted");
+        assert_eq!(st.tcp_is_connected(2, c), Ok(true));
+        st.tcp_write(2, w, c, b"hello").unwrap();
+        st.poll(w);
+        let mut b = [0u8; 16];
+        assert_eq!(st.tcp_read(1, w, s, &mut b), Ok(5));
+        assert_eq!(&b[..5], b"hello");
+        st.tcp_write(1, w, s, b"back").unwrap();
+        st.poll(w);
+        assert_eq!(st.tcp_read(2, w, c, &mut b), Ok(4));
+        st.tcp_close(2, w, c);
+        st.tcp_close(1, w, s);
+        st.tcp_unlisten(1, w, l);
+        peer
+    }
+
+    /// Both ends close: the FINs are acknowledged once, and then nothing
+    /// more goes back and forth (it once bounced FINs forever).
+    #[test]
+    fn close_to_ourselves_settles() {
+        let mut st = Stack::new([2; 6], ip(10, 0, 0, 1), 0xFFFF_FF00, ip(10, 0, 0, 254));
+        let mut w = Wire { now: 1, sent: 0 };
+        let l = st.tcp_listen(1, 80).unwrap();
+        let c = st.tcp_connect(2, &mut w, SocketAddr { ip: ip(10, 0, 0, 1), port: 80 }).unwrap();
+        st.poll(&mut w);
+        let (s, _) = st.tcp_accept(1, l).unwrap();
+        st.tcp_write(2, &mut w, c, b"GET").unwrap();
+        st.poll(&mut w);
+        st.tcp_write(1, &mut w, s, b"answer").unwrap();
+        st.tcp_close(1, &mut w, s); // the server ends first
+        st.poll(&mut w);
+        st.tcp_close(2, &mut w, c);
+        for _ in 0..5 {
+            w.now += 1;
+            st.poll(&mut w);
+        }
+        assert!(st.ifs.2.is_empty(), "{} packets still bouncing", st.ifs.2.len());
+        assert!(st.loop_storm.is_none());
+    }
+
+    #[test]
+    fn to_ourselves() {
+        let mut st = Stack::new([2; 6], ip(10, 0, 0, 1), 0xFFFF_FF00, ip(10, 0, 0, 254));
+        st.ifs.0[0].extra = alloc::vec![ip(203, 0, 113, 7)];
+        let mut w = Wire { now: 1, sent: 0 };
+        // our address, loopback, an extra address (a cloud's public one)
+        assert_eq!(talk(&mut st, &mut w, ip(10, 0, 0, 1), 8888).ip, ip(10, 0, 0, 1));
+        assert_eq!(talk(&mut st, &mut w, ip(127, 0, 0, 1), 8889).ip, ip(127, 0, 0, 1));
+        assert_eq!(talk(&mut st, &mut w, ip(203, 0, 113, 7), 8890).ip, ip(203, 0, 113, 7));
+        // ping ourselves
+        let r = st.raw_open(3, PROTO_ICMP).unwrap();
+        let mut echo = alloc::vec![8u8, 0, 0, 0, 0, 1, 0, 1];
+        let c = checksum(&echo, 0);
+        echo[2..4].copy_from_slice(&c.to_be_bytes());
+        st.raw_send(3, &mut w, r, ip(10, 0, 0, 1), &echo).unwrap();
+        st.poll(&mut w);
+        let mut b = [0u8; 64];
+        let mut got = None;
+        while let Ok((n, from, _)) = st.raw_recv(3, r, &mut b) {
+            if b[0] == 0 {
+                got = Some((n, from));
+            }
+        }
+        assert_eq!(got, Some((8, ip(10, 0, 0, 1))));
+        assert_eq!(w.sent, 0, "nothing to ourselves went on the wire");
     }
 }

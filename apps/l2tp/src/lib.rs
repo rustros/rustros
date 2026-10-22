@@ -56,7 +56,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustros_api::{Caps, Frame, Module, Offload, Packet, Param, Sys, Verdict, say};
-use rustros_util::wire::{Ip, IpFmt, checksum, parse_cidr, parse_ip};
+use rustros_util::wire::{Ip, IpFmt, checksum, parse_ip, parse_net};
 use l2tp_core::{Account, Client, ClientConfig, ClientEvent, Config, DATA_HEADER, Data, Event, Peer, Server, data_header};
 use nat_core::{Inbound, Nat, icmp_error};
 
@@ -362,7 +362,7 @@ impl L2tpModule {
             };
             let mut hosts = Vec::new();
             for h in get(s, "hosts").unwrap_or("").split(',').map(str::trim).filter(|h| !h.is_empty()) {
-                match parse_cidr(h).or_else(|| parse_ip(h).map(|a| (a, !0))) {
+                match parse_net(h) {
                     Some((n, m)) => hosts.push((n & m, m)),
                     None => say!(sys, "l2tp: client {}: bad host '{}'\n", name, h),
                 }

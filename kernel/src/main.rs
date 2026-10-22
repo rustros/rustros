@@ -148,11 +148,11 @@ fn console_owner(k: &Kernel, slots: &[Slot], force_rescue: bool) -> Option<usize
 /// stuck. If it is stuck in a native module, pin it on the module so it is
 /// switched off at the next boot; that needs a disk write, done only when the
 /// disk is idle.
-pub fn watchdog_expired() -> ! {
+pub fn watchdog_expired(samples: [u64; 8], rip: u64) -> ! {
     match modules::current_native() {
         Some(name) if !virtio_blk::busy() => crash(format_args!("watchdog: main loop stuck in native app {}", name)),
         _ => {
-            kprintln!("\n*** watchdog: main loop stuck for {} s, rebooting", arch::WATCHDOG_MS / 1000);
+            kprintln!("\n*** watchdog: main loop stuck for {} s (at {:#x}; also {:x?}), rebooting", arch::WATCHDOG_MS / 1000, rip, samples);
             arch::reboot()
         }
     }
@@ -401,13 +401,26 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             w.pet();
         }
         let mut busy = false;
-        while receive_batch(&mut k, &mut slots, &mut pool) {
+        // bounded: the rest of the loop (timers, apps, the watchdog's
+        // heartbeat) must come round even under a flood
+        let mut batches = 0;
+        while batches < 64 && receive_batch(&mut k, &mut slots, &mut pool) {
             busy = true;
+            batches += 1;
             while stack_tx_batch(&mut k, &mut slots, &mut pool) {}
         }
         {
             let (st, mut link) = k.net();
             st.poll(&mut link);
+            if let Some(m) = st.loop_storm.take() {
+                // at most one a second
+                static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                let now = arch::now_ms();
+                if now - LAST.load(core::sync::atomic::Ordering::Relaxed) >= 1000 {
+                    LAST.store(now, core::sync::atomic::Ordering::Relaxed);
+                    kprintln!("net: loopback busy: {}", m);
+                }
+            }
         }
         for id in 0..slots.len() {
             modules::call(&mut k, &mut slots, id, |app, ctx| app.poll(ctx));

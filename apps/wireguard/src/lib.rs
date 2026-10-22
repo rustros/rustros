@@ -42,7 +42,7 @@ use alloc::vec::Vec;
 
 use nat_core::{Inbound, Nat};
 use rustros_api::{Caps, Frame, Module, Offload, Packet, Param, Sys, Verdict, say};
-use rustros_util::wire::{Ip, IpFmt, checksum, parse_cidr, parse_ip};
+use rustros_util::wire::{Ip, IpFmt, checksum, parse_cidr, parse_ip, parse_net};
 use wg_core::{Device, Endpoint, Out, PeerConfig, Received, key_from_base64, key_to_base64, public_key};
 
 /// Before NAT (0): hosts sent into a tunnel go there first.
@@ -139,7 +139,7 @@ fn get<'a>(s: &[(&str, &'a str)], k: &str) -> Option<&'a str> {
 }
 
 fn nets(v: &str) -> Vec<(Ip, Ip)> {
-    v.split(',').map(str::trim).filter_map(|h| parse_cidr(h).or_else(|| parse_ip(h).map(|a| (a, !0)))).map(|(n, m)| (n & m, m)).collect()
+    v.split(',').map(str::trim).filter_map(|h| parse_net(h)).map(|(n, m)| (n & m, m)).collect()
 }
 
 /// A UDP datagram from `src:sport` to `to`, as an IPv4 packet.

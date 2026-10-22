@@ -2,6 +2,7 @@
 //! with a primary address and optional extra addresses (for NAT egress), and
 //! the routing between them.
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use rustros_util::wire::{BROADCAST, Ip, be16, be32, checksum, pseudo};
@@ -340,7 +341,10 @@ pub struct Route {
 ///    interface, if it has a gateway (replies go back the WAN they came in
 ///    on) — as a source route for that address alone to anywhere;
 /// 4. the first interface with a gateway.
-pub struct Ifaces(pub Vec<Iface>, pub Vec<Route>);
+pub struct Ifaces(pub Vec<Iface>, pub Vec<Route>, pub VecDeque<Vec<u8>>);
+
+/// IP packets to ourselves waiting for `Stack::loopback`, at most.
+const LOOPBACK: usize = 1024;
 
 impl Ifaces {
     fn connected(&self, dst: Ip) -> Option<usize> {
@@ -375,8 +379,17 @@ impl Ifaces {
         self.0.iter().position(|f| f.gw != 0 && f.ip != 0).map(|i| (i, self.0[i].gw))
     }
 
-    /// Our address on the interface that leads to `dst`.
+    /// One of our addresses (an interface's, an extra one, or 127.0.0.0/8).
+    pub fn is_ours(&self, ip: Ip) -> bool {
+        ip >> 24 == 127 || self.0.iter().any(|f| f.is_local(ip))
+    }
+
+    /// Our address on the interface that leads to `dst` (to ourselves: `dst`
+    /// itself, as on Linux).
     pub fn src_for(&self, dst: Ip) -> Ip {
+        if self.is_ours(dst) {
+            return dst;
+        }
         self.route(dst).map_or(self.0[0].ip, |(i, _)| self.0[i].ip)
     }
 
@@ -395,6 +408,15 @@ impl Ifaces {
     pub fn send_ip_from(&mut self, link: &mut dyn Link, src: Ip, dst: Ip, proto: u8, payload: &[u8]) -> bool {
         if dst == BROADCAST {
             return self.0[0].send_ip(link, dst, proto, payload);
+        }
+        if self.is_ours(dst) {
+            // to ourselves: never on the wire, back in through `Stack::loopback`
+            if self.2.len() >= LOOPBACK {
+                return false;
+            }
+            let p = self.0[0].ip_packet(if src != 0 { src } else { dst }, dst, proto, payload);
+            self.2.push_back(p);
+            return true;
         }
         let Some((i, hop)) = self.route_from(src, dst) else {
             self.0[0].stats.tx_dropped += 1;
@@ -455,7 +477,7 @@ mod tests {
         b.extra = alloc::vec![ip(198, 51, 100, 240)];
         let c = Iface::new(2, [4; 6], ip(10, 20, 0, 254), M24, 0);
         a.mtu = 1500;
-        Ifaces(alloc::vec![a, b, c], Vec::new())
+        Ifaces(alloc::vec![a, b, c], Vec::new(), VecDeque::new())
     }
 
     #[test]

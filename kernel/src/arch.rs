@@ -142,6 +142,8 @@ pub struct Frame {
 }
 
 static IRQS: AtomicU64 = AtomicU64::new(0);
+/// Instruction addresses the timer interrupted while the main loop was stuck.
+static STUCK_AT: Global<[u64; 8]> = Global::new([0; 8]);
 
 /// Software watchdog: the main loop must check in this often.
 pub const WATCHDOG_MS: u64 = 30_000;
@@ -168,10 +170,19 @@ extern "C" fn isr_handler(f: &mut Frame) {
             if v == 32 {
                 IRQS.fetch_add(1, Ordering::Relaxed);
                 let beat = HEARTBEAT.load(Ordering::Relaxed);
-                if beat != 0 && now_ms().saturating_sub(beat) > WATCHDOG_MS {
+                let stuck = if beat != 0 { now_ms().saturating_sub(beat) } else { 0 };
+                if stuck > WATCHDOG_MS - 5000 {
+                    // where it is stuck: a few distinct addresses, for the message
+                    // Safety: the timer interrupt is the only user.
+                    let s = unsafe { STUCK_AT.get() };
+                    if !s.contains(&f.rip) {
+                        s[(IRQS.load(Ordering::Relaxed) % 8) as usize] = f.rip;
+                    }
+                }
+                if stuck > WATCHDOG_MS {
                     // The main loop is stuck (an app looping forever?).
                     HEARTBEAT.store(0, Ordering::Relaxed);
-                    crate::watchdog_expired();
+                    crate::watchdog_expired(unsafe { *STUCK_AT.get() }, f.rip);
                 }
             }
             if (33..48).contains(&v) {

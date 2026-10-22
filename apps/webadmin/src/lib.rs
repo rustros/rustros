@@ -30,7 +30,7 @@ use core::fmt::Write;
 use rustros_api::{Caps, Module, ModuleKind, Param, Sys, TcpListener, say};
 use rustros_util::conn::Conn;
 use rustros_util::sha256::{Hmac, Sha256, ct_eq};
-use rustros_util::wire::{Ip, IpFmt, fmt_ip_list, parse_cidr, parse_ip};
+use rustros_util::wire::{Ip, IpFmt, fmt_ip_list, parse_ip, parse_net};
 
 const DEFAULT_PORT: u16 = 8080;
 const MAX_HEAD: usize = 8192;
@@ -238,7 +238,7 @@ impl WebAdmin {
                     if f.1 != 0 {
                         allow.push((f.1 & f.2, f.2));
                     }
-                } else if let Some((n, m)) = parse_cidr(item) {
+                } else if let Some((n, m)) = parse_net(item) {
                     allow.push((n & m, m));
                 } else if let Some(a) = parse_ip(item) {
                     allow.push((a, !0));

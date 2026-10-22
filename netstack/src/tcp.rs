@@ -204,7 +204,11 @@ impl Sock {
             self.seg(iface, link, seq, ACK | PSH, &self.tx[flight..flight + n]);
             self.advance(n);
         }
-        if self.fin_queued && !self.fin_sent() && self.in_flight() == self.tx.len() {
+        // once our FIN is acknowledged (FIN-WAIT-2, TIME-WAIT) it is never
+        // sent again: `fin_sent` only sees one still in flight, and a new FIN
+        // one further on would be taken by the peer and answered, for ever
+        let fin_acked = matches!(self.state, State::FinWait2 | State::TimeWait);
+        if self.fin_queued && !fin_acked && !self.fin_sent() && self.in_flight() == self.tx.len() {
             self.seg(iface, link, self.snd_nxt, FIN | ACK, &[]);
             self.advance(1);
             self.state = match self.state {

@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 use rustros_api::{Caps, Module, Net, NetError, Param, SocketAddr, Sys, TcpListener, UdpSocket, say};
 use rustros_util::conn::Conn;
 use rustros_util::dns;
-use rustros_util::wire::{Ip, IpFmt, parse_cidr, parse_ip};
+use rustros_util::wire::{Ip, IpFmt, parse_ip, parse_net};
 
 const RELOAD_MS: u64 = 2000;
 const DNS_DEFAULT: Ip = 0x0101_0101;
@@ -298,7 +298,7 @@ impl Proxy {
                     if f.1 != 0 {
                         allow.push((f.1 & f.2, f.2));
                     }
-                } else if let Some((n, m)) = parse_cidr(item) {
+                } else if let Some((n, m)) = parse_net(item) {
                     allow.push((n & m, m));
                 } else if let Some(a) = parse_ip(item) {
                     allow.push((a, !0));
