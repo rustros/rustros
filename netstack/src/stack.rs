@@ -371,6 +371,12 @@ impl Stack {
         self.tcp.is_established(handle(s)).ok_or(NetError::Closed)
     }
 
+    pub fn tcp_local_addr(&self, owner: usize, s: TcpStream) -> R<SocketAddr> {
+        self.own_stream(owner, s)?;
+        let k = self.tcp.sock(handle(s)).ok_or(NetError::Closed)?;
+        Ok(SocketAddr { ip: k.lip, port: k.lport })
+    }
+
     fn own_stream(&self, owner: usize, s: TcpStream) -> R<()> {
         match self.tcp.sock(handle(s)) {
             None => Err(NetError::Closed),

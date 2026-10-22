@@ -3,7 +3,7 @@
 
 /// A module setting whose value is a secret: never shown or logged.
 pub fn is_secret(key: &str) -> bool {
-    key == "password" || key == "pwhash" || key.ends_with(".password") || key.starts_with("user.") || key.ends_with(".private") || key.ends_with(".psk")
+    key == "password" || key == "pwhash" || key.ends_with(".password") || key.starts_with("user.") || key.ends_with(".private") || key.ends_with(".psk") || key.contains(".user.")
 }
 
 /// In a console line, where the secret value starts: after

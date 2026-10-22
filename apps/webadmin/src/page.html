@@ -199,7 +199,7 @@ function showCfg(){const m=mods.find(x=>x.name===$("mname").value);
   $("mcfg").innerHTML=m&&m.config.length?"<table>"+m.config.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td><td><button class="b" onclick="editCfg(this)" data-k="${esc(k)}" data-v="${esc(v)}">编辑</button> <button class="b d" onclick="delCfg(this)" data-k="${esc(k)}">删除</button></td></tr>`).join("")+"</table>":"<p class=mut>没有设置</p>"}
 $("mname").onchange=showCfg;
 // a password setting is typed hidden
-const isSecret=k=>k==="password"||k==="pwhash"||k.endsWith(".password")||k.startsWith("user.")||k.endsWith(".private")||k.endsWith(".psk");
+const isSecret=k=>k==="password"||k==="pwhash"||k.endsWith(".password")||k.startsWith("user.")||k.endsWith(".private")||k.endsWith(".psk")||k.includes(".user.");
 $("mkey").oninput=()=>{$("mval").type=isSecret($("mkey").value.trim())?"password":"text"};
 function editCfg(b){$("mkey").value=b.dataset.k;$("mkey").oninput();$("mval").value=b.dataset.v==="(set)"?"":b.dataset.v;$("mval").focus()}
 async function delCfg(b){if(!confirm("删除设置 "+b.dataset.k+"？"))return;await modCall({name:$("mname").value,action:"del",key:b.dataset.k})}

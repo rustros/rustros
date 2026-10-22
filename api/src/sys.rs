@@ -322,6 +322,11 @@ pub trait Net: Base {
     fn tcp_connect_from(&mut self, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError> {
         if src == 0 { self.tcp_connect(to) } else { Err(NetError::NoRoute) }
     }
+    /// Our end of a connection: the address it was accepted on (or
+    /// connected from) and the port.
+    fn tcp_local_addr(&self, _s: TcpStream) -> Result<SocketAddr, NetError> {
+        Err(NetError::BadHandle)
+    }
     /// `Ok(false)` while the handshake is still in progress.
     fn tcp_is_connected(&self, s: TcpStream) -> Result<bool, NetError>;
     /// `Ok(0)` means the peer has closed its side and all data was read.
