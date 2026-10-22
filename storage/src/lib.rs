@@ -7,7 +7,8 @@
 //!                   (log ring, temporary files)
 //! 512 MiB - 1 GiB   system data partition: key-value store (configuration,
 //!                   modules, each module's data)
-//! 1 GiB - end       free, for a future file system (NAS)
+//! 1 GiB - end       files partition: files of the apps (a site, a package
+//!                   repository, later a NAS), see `files`
 //! ```
 //!
 //! Both partitions are created on first boot. On a disk too small for this
@@ -21,12 +22,13 @@
 
 extern crate alloc;
 
+pub mod files;
 pub mod gpt;
 
 use devices::BlockDevice;
 use kvstore::Store;
 
-use gpt::{CACHE_TYPE, DATA_TYPE, Gpt};
+use gpt::{CACHE_TYPE, DATA_TYPE, FILES_TYPE, Gpt};
 
 /// End of the boot area: where the cache partition starts (64 MiB).
 pub const BOOT_AREA_END: u64 = 64 * 2048;
@@ -36,6 +38,8 @@ pub const DATA_START: u64 = 512 * 2048;
 pub const DATA_END: u64 = 1024 * 2048;
 /// Smallest data partition worth creating.
 const MIN_SECTORS: u64 = 8 * 2048;
+/// Smallest files partition worth creating (64 MiB).
+const MIN_FILES: u64 = 64 * 2048;
 /// The store uses at most this much of the partition (256 MiB) so the log a
 /// boot has to replay stays bounded; the rest is left for later use.
 const STORE_SECTORS: u64 = 256 * 2048;
@@ -47,6 +51,10 @@ pub struct Info {
     pub cache: Option<(u64, u64)>,
     /// The partition was created during this open.
     pub created: bool,
+    /// (start, sectors) of the files partition, if there is one.
+    pub files: Option<(u64, u64)>,
+    /// The files partition was created during this open.
+    pub files_created: bool,
     /// The backup GPT was moved to the end of the disk (first boot after a
     /// dd, or the disk was enlarged).
     pub moved_backup: bool,
@@ -66,7 +74,8 @@ fn partition(disk: &mut dyn BlockDevice, seed: u64) -> Result<Info, &'static str
     }
     let cache = gpt.find(&CACHE_TYPE).map(|p| (p.first, p.last - p.first + 1));
     if let Some(p) = gpt.find(&DATA_TYPE) {
-        return Ok(Info { start: p.first, sectors: p.last - p.first + 1, cache, created: false, moved_backup });
+        let (files, files_created) = files_partition(disk, &mut gpt, last, seed)?;
+        return Ok(Info { start: p.first, sectors: p.last - p.first + 1, cache, created: false, moved_backup, files, files_created });
     }
     // nothing may sit where the new partitions go
     let limit = if cache.is_some() { DATA_START } else { BOOT_AREA_END };
@@ -98,7 +107,28 @@ fn partition(disk: &mut dyn BlockDevice, seed: u64) -> Result<Info, &'static str
     };
     gpt.add(&DATA_TYPE, "system-data", guid(2), start, end).ok_or("the partition table is full")?;
     gpt.write(disk, last)?;
-    Ok(Info { start, sectors: end - start + 1, cache, created: true, moved_backup })
+    let (files, files_created) = files_partition(disk, &mut gpt, last, seed)?;
+    Ok(Info { start, sectors: end - start + 1, cache, created: true, moved_backup, files, files_created })
+}
+
+/// The files partition (1 GiB to the end of the disk), made where there is
+/// room and nothing else.
+fn files_partition(disk: &mut dyn BlockDevice, gpt: &mut Gpt, last: u64, seed: u64) -> Result<(Option<(u64, u64)>, bool), &'static str> {
+    if let Some(p) = gpt.find(&FILES_TYPE) {
+        return Ok((Some((p.first, p.last - p.first + 1)), false));
+    }
+    let end = gpt.last_usable();
+    if end < DATA_END + MIN_FILES || gpt.used_end() > DATA_END {
+        return Ok((None, false));
+    }
+    let mut g = [0u8; 16];
+    g[..8].copy_from_slice(&(seed ^ 3).to_le_bytes());
+    g[8..].copy_from_slice(&(seed ^ 3).rotate_left(29).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+    if gpt.add(&FILES_TYPE, "files", g, DATA_END, end).is_none() {
+        return Ok((None, false));
+    }
+    gpt.write(disk, last)?;
+    Ok((Some((DATA_END, end - DATA_END + 1)), true))
 }
 
 pub fn open(disk: &mut dyn BlockDevice, seed: u64) -> Result<(Store, Info), &'static str> {

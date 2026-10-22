@@ -412,6 +412,32 @@ pub trait Kv: Base {
     /// This application's keys starting with `prefix`.
     fn keys(&self, prefix: &str) -> Vec<String>;
     fn storage_info(&self) -> Option<StorageInfo>;
+
+    // Files (the files partition, 1 GiB to the end of the disk): what is
+    // too big for the store, up to 64 MiB each — a site, packages. Names
+    // are paths ("site/index.html"); each app sees only its own.
+    fn file_put(&mut self, _name: &str, _data: &[u8]) -> Result<(), KvError> {
+        Err(KvError::NoStorage)
+    }
+    /// Bytes from `offset` (0 at the end); None if there is no such file.
+    fn file_read(&mut self, _name: &str, _offset: u64, _buf: &mut [u8]) -> Option<usize> {
+        None
+    }
+    /// (bytes, SHA-256)
+    fn file_stat(&self, _name: &str) -> Option<(u64, [u8; 32])> {
+        None
+    }
+    /// (name, bytes) under `prefix`.
+    fn file_list(&self, _prefix: &str) -> Vec<(String, u64)> {
+        Vec::new()
+    }
+    fn file_delete(&mut self, _name: &str) -> bool {
+        false
+    }
+    /// (total, used) bytes of the files partition.
+    fn files_usage(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// Raw Ethernet, for apps that forward packets (see `Module::on_frames`).

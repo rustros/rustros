@@ -29,7 +29,6 @@
 
 extern crate alloc;
 
-pub mod https;
 
 use alloc::format;
 use alloc::string::String;
@@ -39,7 +38,7 @@ use rustros_api::{Caps, ModuleKind, Module, Param, Sys, say};
 use rustros_util::json::{Json, quote};
 use rustros_util::wire::{Ip, IpFmt, parse_cidr, parse_ip};
 
-use https::{Call, Done, Request, Url};
+use httpc::{Call, Done, Request, Url};
 
 pub const BUILD: &str = match option_env!("RUSTROS_BUILD") {
     Some(b) => b,
@@ -106,6 +105,10 @@ pub struct Panel {
     /// (claim code, secret, expires unix s)
     claim: Option<(String, String, u64)>,
     call: Option<(Call, Purpose)>,
+    /// when the call on its way started (ms)
+    call_at: u64,
+    /// the last poll's time (ms), for the status line
+    now: u64,
     /// answers to send: (job id, body)
     results: Vec<(u64, String)>,
     after: Option<After>,
@@ -132,6 +135,8 @@ impl Default for Panel {
             node: None,
             claim: None,
             call: None,
+            call_at: 0,
+            now: 0,
             results: Vec::new(),
             after: None,
             next_at: 0,
@@ -279,9 +284,10 @@ impl Panel {
         let bearer = self.node.as_ref().map(|n| format!("{}.{}", n.server, n.token));
         let now = sys.now_ms();
         let Some(net) = sys.net() else { return };
-        let req = Request { method, path, bearer, body: body.into_bytes(), deadline: now + wait_ms };
+        let req = Request { method, content_type: "", path, bearer, body: body.into_bytes(), deadline: now + wait_ms };
         let call = Call::start(net, &url, &self.ca, &Self::agent(), self.dns, req);
         self.call = Some((call, purpose));
+        self.call_at = now;
     }
 
     /// Something went wrong reaching the panel: try again later (1, 2, 4 … 60 s).
@@ -615,17 +621,28 @@ impl Panel {
         }
     }
 
-    /// `net`: {nic?, ip, mask, gw?, mtu?, save?} applied now, kept once the
-    /// panel is reached again (else reverted by itself).
+    /// `net`: {nic?, ip?, mask?, gw?, mtu?, save?} applied now, kept once
+    /// the panel is reached again (else reverted by itself). What is not
+    /// given stays as it is (only an MTU, only a gateway).
     fn net(&mut self, sys: &mut dyn Sys, job: &Job) -> Result<(), String> {
         let nic = arg_str(job, "nic").unwrap_or("nic0");
-        let ip = arg_str(job, "ip").ok_or("no ip")?;
-        let (ip, mask) = match arg_str(job, "mask").and_then(parse_ip) {
-            Some(m) => (parse_ip(ip).ok_or("bad ip")?, m),
-            None => parse_cidr(ip).ok_or("bad ip")?,
+        let current = sys.admin().ok_or("not permitted")?.net_running().ifs.into_iter().find(|c| c.name() == nic).ok_or_else(|| format!("no interface {nic}"))?;
+        let (ip, mask) = match (arg_str(job, "ip"), arg_str(job, "mask").and_then(parse_ip)) {
+            (Some(ip), Some(m)) => (parse_ip(ip).ok_or("bad ip")?, m),
+            (Some(ip), None) if ip.contains('/') => parse_cidr(ip).ok_or("bad ip")?,
+            (Some(ip), None) => (parse_ip(ip).ok_or("bad ip")?, if current.mask != 0 { current.mask } else { 0xFFFF_FF00 }),
+            (None, m) => (current.ip, m.unwrap_or(current.mask)),
         };
-        let gw = arg_str(job, "gw").map(|g| parse_ip(g).ok_or("bad gw")).transpose()?.unwrap_or(0);
-        let mut cmds = alloc::vec![format!("ip {nic} {}/{} {}", IpFmt(ip), mask.count_ones(), IpFmt(gw))];
+        let gw = match arg_str(job, "gw") {
+            Some(g) => parse_ip(g).ok_or("bad gw")?,
+            None => current.gw,
+        };
+        let mut cmds = Vec::new();
+        if ip != 0 {
+            cmds.push(format!("ip {nic} {}/{} {}", IpFmt(ip), mask.count_ones(), IpFmt(gw)));
+        } else if arg_str(job, "ip").is_none() && arg(job, "mtu").is_none() {
+            return Err(String::from("nothing to change (ip, gw or mtu)"));
+        }
         if let Some(m) = arg(job, "mtu").and_then(Json::u64) {
             cmds.push(format!("mtu {nic} {m}"));
         }
@@ -766,6 +783,7 @@ impl Module for Panel {
 
     fn poll(&mut self, sys: &mut dyn Sys) {
         let now = sys.now_ms();
+        self.now = now;
         if now >= self.reload_at {
             tls::set_time(sys.unix_time());
             self.load(sys);
@@ -790,7 +808,22 @@ impl Module for Panel {
             (None, Some((c, _, _)), _) => format!("waiting to be claimed with code {c}"),
             (None, None, _) => String::from("asking for a claim code"),
         };
-        if self.last_error.is_empty() { state } else { format!("{state}; {}", self.last_error) }
+        let call = match &self.call {
+            Some((c, p)) => {
+                let what = match p {
+                    Purpose::Code => "claim code",
+                    Purpose::Claim => "claim",
+                    Purpose::Jobs => "jobs",
+                    Purpose::File(_) => "file",
+                    Purpose::Result => "result",
+                    Purpose::Metrics => "metrics",
+                };
+                format!("; {what}: {} for {} s", c.phase(), self.now.saturating_sub(self.call_at) / 1000)
+            }
+            None if self.next_at > self.now => format!("; next try in {} s", (self.next_at - self.now).div_ceil(1000)),
+            None => String::new(),
+        };
+        if self.last_error.is_empty() { format!("{state}{call}") } else { format!("{state}; {}{call}", self.last_error) }
     }
 }
 

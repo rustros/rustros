@@ -1,0 +1,14 @@
+[package]
+name = "httpc"
+version.workspace = true
+edition.workspace = true
+description = "One HTTPS request at a time, moved on by polling (no_std): DNS, TCP, TLS, HTTP/1.1"
+
+[lib]
+test = true
+bench = false
+
+[dependencies]
+rustros-api = { path = "../api" }
+rustros-util = { path = "../util" }
+tls = { path = "../apps/tls" }

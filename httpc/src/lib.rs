@@ -1,6 +1,10 @@
 //! One HTTPS request at a time, moved on by `poll` (the main loop never
 //! waits): the name looked up, TCP, TLS, the request, the answer (its body
 //! by Content-Length, chunked, or up to the end).
+#![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
@@ -35,6 +39,8 @@ impl Url {
 
 pub struct Request {
     pub method: &'static str,
+    /// Content-Type of the body (application/json if empty)
+    pub content_type: &'static str,
     pub path: String,
     /// "Authorization: Bearer ..." value, if any
     pub bearer: Option<String>,
@@ -82,15 +88,27 @@ impl Call {
         let host = if self.url.port == 443 { self.url.host.clone() } else { format!("{}:{}", self.url.host, self.url.port) };
         let auth = self.req.bearer.as_ref().map(|b| format!("Authorization: Bearer {b}\r\n")).unwrap_or_default();
         let mut r = format!(
-            "{} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {}\r\n{auth}Accept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "{} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {}\r\n{auth}Accept: */*\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.req.method,
             self.req.path,
             self.agent,
+            if self.req.content_type.is_empty() { "application/json" } else { self.req.content_type },
             self.req.body.len()
         )
         .into_bytes();
         r.extend_from_slice(&self.req.body);
         r
+    }
+
+    /// Where it is, for status lines.
+    pub fn phase(&self) -> &'static str {
+        match &self.phase {
+            Some(Phase::Resolve(_)) => "resolving",
+            Some(Phase::Connecting(_)) => "connecting",
+            Some(Phase::Talking(_, t)) if !t.established => "TLS",
+            Some(Phase::Talking(..)) => "waiting for the answer",
+            None => "done",
+        }
     }
 
     /// Give it up (sockets closed).

@@ -417,6 +417,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "httpc"
+version = "0.1.0"
+dependencies = [
+ "rustros-api",
+ "rustros-util",
+ "tls",
+]
+
+[[package]]
 name = "httpd"
 version = "0.1.0"
 dependencies = [
@@ -584,6 +593,7 @@ dependencies = [
 name = "panel"
 version = "0.1.0"
 dependencies = [
+ "httpc",
  "rustros-api",
  "rustros-util",
  "tls",

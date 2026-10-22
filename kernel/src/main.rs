@@ -280,7 +280,14 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 }
                 None => kprintln!("log: no cache partition, the console log is not kept"),
             }
-            Some(sys::Boot { disk: Box::new(disk), upd, store, log })
+            let files = store.as_ref().and_then(|(st, part)| {
+                let (start, n) = part.files?;
+                let f = storage::files::Files::open(st, start, n);
+                let (total, used) = f.usage();
+                kprintln!("storage: files partition {} MiB at 1 GiB{}, {} MiB used", total >> 20, if part.files_created { " (created)" } else { "" }, used >> 20);
+                Some(f)
+            });
+            Some(sys::Boot { disk: Box::new(disk), upd, store, log, files })
         }
         Err(e) => {
             kprintln!("disk: online update and storage disabled: {}", e);

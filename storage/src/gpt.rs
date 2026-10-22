@@ -14,6 +14,7 @@ const SIGNATURE: &[u8; 8] = b"EFI PART";
 /// Partition types of the system data and cache partitions.
 pub const DATA_TYPE: [u8; 16] = *b"HullOS-data-v1\0\0";
 pub const CACHE_TYPE: [u8; 16] = *b"HullOS-cache-v1\0";
+pub const FILES_TYPE: [u8; 16] = *b"RustROS-files-v1";
 
 pub struct Gpt {
     header: Vec<u8>,
