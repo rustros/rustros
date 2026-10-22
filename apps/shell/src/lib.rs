@@ -27,6 +27,8 @@ struct HttpGet {
 
 struct Ping {
     dst: Ip,
+    /// our source address (0: the outgoing interface's)
+    src: Ip,
     id: u16,
     seq: u16,
     count: u16,
@@ -94,7 +96,7 @@ impl Shell {
         match cmd {
             "help" => say!(
                 sys,
-                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping <ip> [count]   ICMP echo (Ctrl-C stops)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
+                "commands:\n  ip                  all NICs: addresses and counters\n  ip [nicN] <a.b.c.d/n> [gw] | none   set an address (until reboot, see save)\n  ip [nicN] add|del <a.b.c.d>   extra addresses (NAT egress)\n  mtu [nicN] <n>      set MTU\n  cand ip|mtu ...     change the candidate only (cand: show it and the changes)\n  apply [s]           candidate in effect, then asks; reverted unless kept in s (10)\n  revert              back to what ran before (apply again at will)\n  confirm / discard   keep what apply did / drop the candidate\n  save                keep the running network settings across reboots and updates\n  arp                 show ARP cache\n  conns               show TCP connections\n  modules             list running modules\n  ping <ip> [count] [src <ip> | interface nicN]   ICMP echo (Ctrl-C stops)\n  http <ip> [port] [path]  HTTP GET (TCP connect test)\n  kv [prefix]         list stored keys (shell's own namespace)\n  kv get|set|del <key> [value]\n  df                  storage usage\n  crash [clear]       show (or clear) the last recorded crash\n  crash panic|hang|freeze  test panic reboot / software / hardware watchdog\n  mod                 installed modules (native / wasm)\n  mod rm <name> [kind]  remove a module (or one form of it)\n  mod switch <name> native|wasm\n  cfg <module> [key [value | -]]  module settings (- removes; a password key\n                      without a value asks for it, hidden)\n  uptime\n  slot                show A/B boot slot\n  confirm             make the running kernel the default\n  log [prev|this|<boot> [lines]]  console log of a boot (40 lines)\n  reboot / poweroff\n"
             ),
             "cfg" => match (args.next(), args.next(), args.next()) {
                 (Some(m), None, _) => {
@@ -138,17 +140,49 @@ impl Shell {
                 say!(sys, "{}\n", apps.join(", "));
             }
             "ping" => {
+                const USAGE: &str = "usage: ping a.b.c.d [count] [src a.b.c.d | interface nicN]\n";
                 let Some(dst) = args.next().and_then(parse_ip) else {
-                    say!(sys, "usage: ping a.b.c.d [count]\n");
+                    say!(sys, "{}", USAGE);
                     return;
                 };
                 if self.icmp.is_none() {
                     say!(sys, "ping: no ICMP socket\n");
                     return;
                 }
-                let count = args.next().and_then(|c| c.parse().ok()).unwrap_or(4);
-                say!(sys, "PING {}\n", IpFmt(dst));
-                self.ping = Some(Ping { dst, id: sys.random() as u16, seq: 0, count, received: 0, next_at: 0, sent_at: Vec::new() });
+                let (mut count, mut src) = (4, 0);
+                while let Some(a) = args.next() {
+                    let addr = match (a, args.clone().next()) {
+                        ("src", Some(v)) => parse_ip(v),
+                        ("interface", Some(v)) => netcmd::find_nic(sys, v).and_then(|i| net(sys).nic_info(i)).map(|n| n.ip),
+                        (n, _) => match n.parse() {
+                            Ok(c) => {
+                                count = c;
+                                continue;
+                            }
+                            Err(_) => None,
+                        },
+                    };
+                    args.next();
+                    // replies only reach an interface's own address
+                    let ours = |ip: Ip, sys: &mut dyn Sys| (0..net(sys).nic_count()).any(|i| net(sys).nic_info(i).is_some_and(|n| n.ip == ip));
+                    match addr {
+                        Some(ip) if ip != 0 && ours(ip, sys) => src = ip,
+                        _ => {
+                            say!(sys, "ping: {} is not an interface's address\n{}", a, USAGE);
+                            return;
+                        }
+                    }
+                }
+                if src != 0 && sys.packet().is_none() {
+                    say!(sys, "ping: no packet access for a chosen source\n");
+                    return;
+                }
+                if src != 0 {
+                    say!(sys, "PING {} from {}\n", IpFmt(dst), IpFmt(src));
+                } else {
+                    say!(sys, "PING {}\n", IpFmt(dst));
+                }
+                self.ping = Some(Ping { dst, src, id: sys.random() as u16, seq: 0, count, received: 0, next_at: 0, sent_at: Vec::new() });
             }
             "http" => {
                 let Some(ip) = args.next().and_then(parse_ip) else {
@@ -368,8 +402,21 @@ impl Shell {
         m[2..4].copy_from_slice(&c.to_be_bytes());
         p.sent_at.push((p.seq, now));
         p.next_at = now + 1000;
-        let dst = p.dst;
-        if let Err(e) = net(sys).raw_send(sock, dst, &m) {
+        let (dst, src) = (p.dst, p.src);
+        if src != 0 {
+            // a whole IP packet from the chosen address, routed by it
+            let mut ip = alloc::vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, PROTO_ICMP, 0, 0];
+            ip[2..4].copy_from_slice(&((20 + m.len()) as u16).to_be_bytes());
+            ip[4..6].copy_from_slice(&p.seq.to_be_bytes());
+            ip.extend_from_slice(&src.to_be_bytes());
+            ip.extend_from_slice(&dst.to_be_bytes());
+            let c = checksum(&ip, 0);
+            ip[10..12].copy_from_slice(&c.to_be_bytes());
+            ip.extend_from_slice(&m);
+            if !sys.packet().is_some_and(|pk| pk.send_packet(&ip)) {
+                say!(sys, "ping: no route from {}\n", IpFmt(src));
+            }
+        } else if let Err(e) = net(sys).raw_send(sock, dst, &m) {
             say!(sys, "ping: {:?}\n", e);
         }
     }
@@ -381,7 +428,8 @@ impl Module for Shell {
     }
 
     fn caps(&self) -> Caps {
-        Caps::NET | Caps::KV | Caps::ADMIN | Caps::CONSOLE
+        // PACKET: pings from a chosen source address
+        Caps::NET | Caps::KV | Caps::ADMIN | Caps::CONSOLE | Caps::PACKET
     }
 
     fn start(&mut self, sys: &mut dyn Sys) {
