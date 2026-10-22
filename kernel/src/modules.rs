@@ -503,12 +503,13 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
             continue;
         }
         slots[id] = slot;
-        let caps = slots[id].app().map_or(Caps::NONE, |a| a.caps());
+        // what module_list reports, from the start (not only after the next refresh)
+        let (caps, version, params) = slots[id].app().map_or((Caps::NONE, "", Vec::new()), |a| (a.caps(), a.version(), a.params().iter().map(rustros_api::ParamInfo::from).collect()));
         // WebAssembly apps never get ADMIN (it is not importable either)
         let caps = if kind == ModuleKind::Wasm { caps & (Caps::NET | Caps::KV | Caps::PACKET | Caps::CONSOLE) } else { caps };
         set_slot(k, id, leaked, caps);
         kprintln!("modules: {} started ({}, {} KiB)", name, kind.as_str(), image.len() / 1024);
-        k.app_status.push(ModuleStatus { name: leaked, kind, state: String::from("running"), restarts: 0, params: Vec::new(), version: "" });
+        k.app_status.push(ModuleStatus { name: leaked, kind, state: String::from("running"), restarts: 0, params, version });
         call(k, slots, id, |app, ctx| app.start(ctx));
     }
 }
