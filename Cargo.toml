@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "api", "util", "devices", "netstack", "kvstore", "slots", "storage", "wasmhost", "nat", "l2tp", "apps/*"]
+members = ["kernel", "api", "util", "devices", "netstack", "kvstore", "slots", "storage", "wasmhost", "nat", "l2tp", "wireguard", "apps/*"]
 resolver = "3"
 
 [workspace.package]

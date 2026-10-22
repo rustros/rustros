@@ -3,7 +3,7 @@
 
 /// A module setting whose value is a secret: never shown or logged.
 pub fn is_secret(key: &str) -> bool {
-    key == "password" || key == "pwhash" || key.ends_with(".password") || key.starts_with("user.")
+    key == "password" || key == "pwhash" || key.ends_with(".password") || key.starts_with("user.") || key.ends_with(".private") || key.ends_with(".psk")
 }
 
 /// In a console line, where the secret value starts: after
@@ -82,6 +82,7 @@ mod tests {
     #[test]
     fn keys() {
         assert!(is_secret("password") && is_secret("user.alice") && is_secret("pwhash") && is_secret("api.password"));
+        assert!(is_secret("wg0.private") && is_secret("wg0.peer.warp.psk") && !is_secret("wg0.peer.warp.public"));
         assert!(!is_secret("allow") && !is_secret("port") && !is_secret("srcnat.10.0.0.1"));
     }
 

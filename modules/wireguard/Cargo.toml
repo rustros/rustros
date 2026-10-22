@@ -1,0 +1,14 @@
+[package]
+name = "wireguard-mod"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wireguard"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+wireguard = { path = "../../apps/wireguard" }

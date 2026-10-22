@@ -1,0 +1,13 @@
+[package]
+name = "wg-core"
+version.workspace = true
+edition.workspace = true
+description = "WireGuard (Noise IKpsk2, transport): no_std, no OS dependencies"
+
+[lib]
+bench = false
+
+[dependencies]
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+blake2 = { version = "0.10", default-features = false }
