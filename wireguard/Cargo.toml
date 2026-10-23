@@ -1,6 +1,8 @@
 [package]
 name = "wg-core"
 version.workspace = true
+license.workspace = true
+publish.workspace = true
 edition.workspace = true
 description = "WireGuard (Noise IKpsk2, transport): no_std, no OS dependencies"
 

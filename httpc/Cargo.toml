@@ -1,6 +1,8 @@
 [package]
 name = "httpc"
 version.workspace = true
+license.workspace = true
+publish.workspace = true
 edition.workspace = true
 description = "One HTTPS request at a time, moved on by polling (no_std): DNS, TCP, TLS, HTTP/1.1"
 

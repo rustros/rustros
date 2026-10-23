@@ -1,6 +1,8 @@
 [package]
 name = "echo-mod"
 version.workspace = true
+license.workspace = true
+publish.workspace = true
 edition.workspace = true
 
 # The very same echo app as the built-in one, as a loadable native module.

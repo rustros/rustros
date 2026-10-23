@@ -1,6 +1,8 @@
 [package]
 name = "nat-core"
 version.workspace = true
+license.workspace = true
+publish.workspace = true
 edition.workspace = true
 description = "Packet-level NAPT for IPv4: no_std, no OS dependencies"
 

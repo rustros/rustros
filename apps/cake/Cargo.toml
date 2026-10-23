@@ -1,6 +1,8 @@
 [package]
 name = "cake"
 version.workspace = true
+license.workspace = true
+publish.workspace = true
 edition.workspace = true
 
 [lib]

@@ -13,8 +13,10 @@ image (tools/mkimg.py --template), the manifest releases/latest.json signed
 with the release key (Ed25519, by openssl: releases/latest.json.sig,
 base64url; a copy of both in releases/<version>/) and the public key
 releases/key.pub; adds the release to releases/index.json (the history the
-website shows, with its notes); and uploads them, site/ and
-tools/rustros-update.py over HTTPS (PUT /_sites/files/...).
+website shows, with its notes); and uploads them, site/,
+tools/rustros-update.py, LICENSE.txt and THIRD-PARTY-NOTICES.txt (tools/notices.py;
+a copy in releases/<version>/) and the source of the GRUB in the images
+(releases/sources/, once per GRUB version) over HTTPS (PUT /_sites/files/...).
 
 The manifest is what the panel and `pkg` read:
   {"format":1, "version", "date",
@@ -24,6 +26,8 @@ The manifest is what the panel and `pkg` read:
                         "native":{"x86_64":{"url","sha256","size"}}}}}
 """
 import argparse, base64, datetime, hashlib, http.client, json, os, socket, ssl, subprocess, sys, urllib.error, urllib.request
+
+import notices
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -65,6 +69,17 @@ def put(host, site, token, path, data, ctx):
         raise SystemExit(f"upload {path}: {r.status} {body.decode(errors='replace').strip()}")
 
 
+def published(site, path):
+    """Whether the site already serves this file."""
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"https://{site}/{path}", method="HEAD", headers={"User-Agent": "rustros-release/1"}), timeout=30)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", required=True, help="the machine running the site (address)")
@@ -92,6 +107,19 @@ def main():
     files = {}  # published path (under releases/<version>/) -> bytes
     files["rustros-x86_64.elf"] = kernel
     files["rustros-x86_64.img"] = image
+    subprocess.run(["python3", f"{ROOT}/tools/notices.py", f"{ROOT}/build/THIRD-PARTY-NOTICES.txt"], check=True, stdout=subprocess.DEVNULL)
+    notice = open(f"{ROOT}/build/THIRD-PARTY-NOTICES.txt", "rb").read()
+    files["THIRD-PARTY-NOTICES.txt"] = notice
+    files["LICENSE.txt"] = open(f"{ROOT}/LICENSE", "rb").read()
+    # GRUB's source, as Debian ships it for the GRUB the images carry
+    grub = []
+    os.makedirs(f"{ROOT}/build/sources", exist_ok=True)
+    for name, url in notices.grub_sources():
+        path = f"{ROOT}/build/sources/{name}"
+        if not os.path.exists(path):
+            urllib.request.urlretrieve(url, path + ".part")
+            os.rename(path + ".part", path)
+        grub.append((name, path))
     mods = {}
     for name, desc in APPS.items():
         data = open(f"{ROOT}/build/modules/{name}.mod", "rb").read()
@@ -143,6 +171,12 @@ def main():
         print(f"  releases/{version}/{name} ({len(data)} bytes)")
     up(f"releases/{version}/manifest.json", body)
     up(f"releases/{version}/manifest.json.sig", b64u(sig).encode())
+    for name, path in grub:
+        if not published(a.site, f"releases/sources/{name}"):
+            up(f"releases/sources/{name}", open(path, "rb").read())
+            print(f"  releases/sources/{name}")
+    up("LICENSE.txt", files["LICENSE.txt"])
+    up("THIRD-PARTY-NOTICES.txt", notice)
     up("tools/rustros-update.py", open(f"{ROOT}/tools/rustros-update.py", "rb").read())
     for d, _, fs in os.walk(f"{ROOT}/site"):
         for f in fs:

@@ -1,6 +1,8 @@
 [package]
 name = "proxy-mod"
 version.workspace = true
+license.workspace = true
+publish.workspace = true
 edition.workspace = true
 
 [[bin]]

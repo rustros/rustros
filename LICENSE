@@ -1,0 +1,25 @@
+RustROS
+Copyright (c) 2026 the RustROS authors. All rights reserved.
+
+This is proprietary software. The source code is confidential: no part of it
+may be copied, modified, distributed, published or used to make other works
+without the written permission of the RustROS authors.
+
+The official release files published at https://rustros.com/releases/ (the
+kernel, the modules and the disk images) may be installed and used, free of
+charge, on machines you operate. You may not sell, sublicense or redistribute
+them, nor reverse engineer, decompile or disassemble them, except where the
+law allows it notwithstanding this limitation.
+
+Third-party software included in the release files remains under its own
+licence (THIRD-PARTY-NOTICES.txt published with each release); nothing here
+limits the rights those licences give you. In particular GRUB, the boot
+loader in the disk images, is free software under the GNU General Public
+License version 3 or later, and its source is published with the releases.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

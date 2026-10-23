@@ -1,6 +1,8 @@
 [package]
 name = "wasm-mod"
 version.workspace = true
+license.workspace = true
+publish.workspace = true
 edition.workspace = true
 
 # The WebAssembly runtime (wasmi) as a loadable native module; install it

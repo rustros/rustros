@@ -11,17 +11,17 @@
 <body>
 <header><div class="wrap">
   <a class="logo" href="/">Rust<span>ROS</span></a>
-  <nav><a class="on" href="/docs/"><span data-l="zh">文档</span><span data-l="en">Docs</span></a><a href="/releases/"><span data-l="zh">发布</span><span data-l="en">Releases</span></a><a class="opt" href="https://github.com/rustros/rustros">GitHub</a></nav>
+  <nav><a class="on" href="/docs/"><span data-l="zh">文档</span><span data-l="en">Docs</span></a><a href="/releases/"><span data-l="zh">发布</span><span data-l="en">Releases</span></a></nav>
   <button class="lang" id="lang" type="button">EN</button>
 </div></header>
 
 <main class="wrap docs">
 <aside class="toc">
   <div data-l="zh">
-    <a href="#install">安装到云主机</a><a href="#qemu">在 QEMU 里试</a><a href="#console">控制台</a><a href="#network">网络设置</a><a href="#apps">应用与 pkg</a><a href="#update">在线更新</a><a href="#webadmin">网页管理</a><a href="#panel">面板</a><a href="#storage">存储</a><a href="#security">安全</a><a href="#build">从源码构建</a>
+    <a href="#install">安装到云主机</a><a href="#qemu">在 QEMU 里试</a><a href="#console">控制台</a><a href="#network">网络设置</a><a href="#apps">应用与 pkg</a><a href="#update">在线更新</a><a href="#webadmin">网页管理</a><a href="#panel">面板</a><a href="#storage">存储</a><a href="#security">安全</a><a href="#license">许可</a>
   </div>
   <div data-l="en">
-    <a href="#install">Install on a VPS</a><a href="#qemu">Try it in QEMU</a><a href="#console">The console</a><a href="#network">Network settings</a><a href="#apps">Apps and pkg</a><a href="#update">Online updates</a><a href="#webadmin">Web admin</a><a href="#panel">Panel</a><a href="#storage">Storage</a><a href="#security">Security</a><a href="#build">Build from source</a>
+    <a href="#install">Install on a VPS</a><a href="#qemu">Try it in QEMU</a><a href="#console">The console</a><a href="#network">Network settings</a><a href="#apps">Apps and pkg</a><a href="#update">Online updates</a><a href="#webadmin">Web admin</a><a href="#panel">Panel</a><a href="#storage">Storage</a><a href="#security">Security</a><a href="#license-en">License</a>
   </div>
 </aside>
 
@@ -138,11 +138,9 @@ cfg webadmin password      # 输入两次，不回显</pre></div>
 <li>内核之外的代码都是 <code>#![forbid(unsafe_code)]</code> 的 Rust。</li>
 </ul>
 
-<h2 id="build">从源码构建</h2>
-<div class="cmd"><pre>git clone https://github.com/rustros/rustros && cd rustros
-make            # 内核和磁盘镜像 build/rustros.img（需要 Rust、nasm、GRUB、mtools）
-make modules    # 应用：build/modules/*.mod
-make run-bios   # 在 QEMU 里运行</pre></div>
+<h2 id="license">许可</h2>
+<p>RustROS 是闭源的专有软件（<a href="/LICENSE.txt">许可条款</a>）：这里发布的内核、模块和镜像可以免费装在自己的机器上使用，不能转卖、再分发或逆向。</p>
+<p>其中用到的第三方软件按各自的许可使用，版权声明和许可全文见 <a href="/THIRD-PARTY-NOTICES.txt">THIRD-PARTY-NOTICES.txt</a>。镜像里的引导程序 GRUB 是 GPLv3 的自由软件，它的源码随版本发布，下载地址见上面的第三方声明。</p>
 </div>
 
 <!-- ============================================================ English -->
@@ -257,16 +255,14 @@ cfg webadmin password      # asked twice, not shown</pre></div>
 <li>Outside the kernel, all code is Rust with <code>#![forbid(unsafe_code)]</code>.</li>
 </ul>
 
-<h2 id="build-en">Build from source</h2>
-<div class="cmd"><pre>git clone https://github.com/rustros/rustros && cd rustros
-make            # the kernel and the disk image build/rustros.img (Rust, nasm, GRUB, mtools)
-make modules    # the apps: build/modules/*.mod
-make run-bios   # run it in QEMU</pre></div>
+<h2 id="license-en">License</h2>
+<p>RustROS is proprietary software (<a href="/LICENSE.txt">the license</a>): the kernel, modules and images published here may be installed and used free of charge on machines you operate; they may not be sold, redistributed or reverse engineered.</p>
+<p>The third-party software in them is used under its own licenses; their notices and texts are in <a href="/THIRD-PARTY-NOTICES.txt">THIRD-PARTY-NOTICES.txt</a>. GRUB, the boot loader in the images, is free software under the GPLv3; its source is published with the releases (the links are in the third-party notices).</p>
 </div>
 </article>
 </main>
 
-<footer><div class="wrap">RustROS · <a href="https://github.com/rustros/rustros">github.com/rustros/rustros</a> · <a href="/releases/">releases</a></div></footer>
+<footer><div class="wrap">RustROS · <a href="/LICENSE.txt">license</a> · <a href="/THIRD-PARTY-NOTICES.txt">third-party notices</a> · <a href="/releases/">releases</a></div></footer>
 
 <script src="/site.js"></script>
 <script>
