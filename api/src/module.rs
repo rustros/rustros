@@ -310,7 +310,7 @@ pub trait Runtime {
 
 // ---------------------------------------------------------------- network stack
 
-use crate::sys::{ConnInfo, IfConf, Ip, NetError, NetInfo, RawSocket, RouteConf, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use crate::sys::{ConnInfo, IfConf, Ip, NetConf, NetError, NetInfo, RawSocket, RouteConf, SocketAddr, TcpListener, TcpStream, UdpSocket};
 
 /// What the network stack needs from the kernel.
 pub trait Link {
@@ -347,6 +347,11 @@ pub trait NetStack {
     fn set_interfaces(&mut self, ifs: Vec<IfSet>);
     fn routes(&self) -> Vec<RouteConf>;
     fn set_routes(&mut self, routes: Vec<RouteConf>);
+    /// The configuration to boot with for `nics` NICs, from the kernel
+    /// command line and grubenv (`env`), and the lines for the boot log.
+    fn boot_config(&self, nics: usize, cmdline: &str, env: &dyn Fn(&str) -> Option<String>) -> (NetConf, Vec<String>);
+    /// The grubenv variables that make `conf` the boot configuration.
+    fn config_vars(&self, conf: &NetConf) -> Vec<(String, String)>;
     /// Application names by owner (connection listings).
     fn set_owner_names(&mut self, names: Vec<&'static str>);
     /// Drop everything `owner` holds (it was stopped or crashed).

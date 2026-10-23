@@ -92,7 +92,7 @@ pub fn parse_ip_list(s: &str) -> Option<alloc::vec::Vec<Ip>> {
         }
         out.extend(a..=b);
     }
-    out.sort_unstable();
+    crate::sort::sort(&mut out);
     out.dedup();
     Some(out)
 }

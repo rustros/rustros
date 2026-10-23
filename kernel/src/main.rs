@@ -31,10 +31,9 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use rustros_api::{Module, Caps, Frame, HEADROOM, Offload, Verdict};
-use rustros_api::module::{IfSet, Storage};
-use rustros_api::{IfConf, RouteConf};
+use rustros_api::module::Storage;
 use devices::{BlockDevice, NetDevice};
-use rustros_util::wire::{IpFmt, cmdline_get, parse_cidr, parse_ip};
+use rustros_util::wire::cmdline_get;
 
 use modules::Slot;
 use sys::Kernel;
@@ -272,13 +271,6 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         klog::flush(b);
     }
 
-    let (ip, mask) = cmdline_get(&cmdline, "ip").and_then(parse_cidr).unwrap_or((0, 0));
-    let gw = cmdline_get(&cmdline, "gw").and_then(parse_ip).unwrap_or(0);
-    if ip == 0 {
-        kprintln!("net: no ip= on the command line, address unconfigured");
-    } else {
-        kprintln!("net: ip {} gw {}", IpFmt(ip), IpFmt(gw));
-    }
     // NIC offloads (TSO / checksums) unless turned off: "offload=off" on the
     // command line or net_offload=off in grubenv
     let offloads = cmdline_get(&cmdline, "offload").or_else(|| boot.as_ref().and_then(|b| b.env("net_offload"))) != Some("off");
@@ -297,48 +289,20 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         kprintln!("net: nic{} {} mac {}", i, n.kind(), rustros_util::wire::MacFmt(n.mac()));
     }
 
-    let Some(mut stack) = bm.netstack.take() else {
+    let Some(stack) = bm.netstack.take() else {
         kprintln!("no network stack (boot modules), halting");
         arch::halt_forever();
     };
-    // the interfaces: the NICs, then the VLANs
-    let mut ifs: Vec<IfConf> = (0..nics.len()).map(|_| IfConf { mtu: 1500, ..IfConf::default() }).collect();
-    (ifs[0].ip, ifs[0].mask, ifs[0].gw) = (ip, mask, gw);
-    if let Some(mtu) = cmdline_get(&cmdline, "mtu").and_then(|m| m.parse::<usize>().ok()) {
-        ifs[0].mtu = mtu.clamp(576, 1500) as u16;
-        kprintln!("net: mtu {}", ifs[0].mtu);
+    let env = |key: &str| boot.as_ref().and_then(|b| b.env(key)).map(String::from);
+    let (conf, log) = stack.boot_config(nics.len(), &cmdline, &env);
+    for l in log {
+        kprintln!("{}", l);
     }
-    let mut ifmap: Vec<sys::IfMap> = (0..nics.len()).map(|phys| sys::IfMap { phys, vlan: None }).collect();
-    // VLAN interfaces: "vlans=0.109,1.20" on the command line, else net_vlans in grubenv
-    let vlans = cmdline_get(&cmdline, "vlans").map(String::from).or_else(|| boot.as_ref().and_then(|b| b.env("net_vlans")).map(String::from));
-    for v in vlans.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()) {
-        let parsed = v.split_once('.').and_then(|(p, id)| Some((p.parse::<usize>().ok()?, id.parse::<u16>().ok()?)));
-        match parsed {
-            Some((phys, vid)) if phys < nics.len() && (1..=4094).contains(&vid) && !ifmap.contains(&sys::IfMap { phys, vlan: Some(vid) }) => {
-                ifs.push(IfConf { mtu: 1500, ..IfConf::default() });
-                ifmap.push(sys::IfMap { phys, vlan: Some(vid) });
-                kprintln!("net: nic{} is VLAN {} on nic{}", ifmap.len() - 1, vid, phys);
-            }
-            _ => kprintln!("net: bad VLAN '{}' (want <nic>.<id>)", v),
-        }
+    let mut k = Kernel::new(nics, boot, cmdline, stack);
+    if let Err(e) = k.net_set_running(&conf) {
+        kprintln!("net: {}; the interfaces start unconfigured", e);
+        let _ = k.net_set_running(&rustros_api::NetConf::default());
     }
-    net_config_extra(&mut ifs, &cmdline, boot.as_deref());
-    stack.set_interfaces(ifs.into_iter().zip(&ifmap).map(|(conf, m)| IfSet { was: None, mac: nics[m.phys].mac(), conf }).collect());
-    // static routes: "routes=10.9.0.0/16>10.20.0.1,0.0.0.0/0>gw<10.20.0.1/32,..."
-    // or net_routes in grubenv
-    let routes = cmdline_get(&cmdline, "routes").map(String::from).or_else(|| boot.as_ref().and_then(|b| b.env("net_routes")).map(String::from));
-    let mut rts = Vec::new();
-    for r in routes.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()) {
-        match parse_route(r) {
-            Some(rt) => {
-                kprintln!("net: route {}", fmt_route(&rt).replace('>', " via ").replace('<', " from "));
-                rts.push(rt);
-            }
-            None => kprintln!("net: bad route '{}' (want a.b.c.d/n>gateway[<source/n])", r),
-        }
-    }
-    stack.set_routes(rts);
-    let mut k = Kernel::new(nics, ifmap, boot, cmdline, stack);
     // boot-loop protection: GRUB appends an "x" to boot_count on every boot
     k.unstable_boots = cmdline_get(&k.cmdline, "rustros.boots").map_or(1, |b| b.len() as u32).max(1);
     k.safe_mode = k.unstable_boots >= SAFE_MODE_AT;
@@ -515,60 +479,6 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             }
         }
     }
-}
-
-/// Configuration beyond NIC 0's address: NIC 0's extra addresses and the
-/// other NICs, from the command line (`extra=`, `ip1=`, `gw1=`, `mtu1=`,
-/// `extra1=`, ...) or else from grubenv (`net_extra`, `net1_ip`, ...,
-/// written by `save`).
-fn net_config_extra(ifs: &mut [IfConf], cmdline: &str, env: Option<&dyn Storage>) {
-    for nic in 0..ifs.len() {
-        let (c, e) = if nic == 0 { (String::new(), String::from("net_")) } else { (format!("{nic}"), format!("net{nic}_")) };
-        let get = |k: &str| -> Option<String> {
-            cmdline_get(cmdline, &format!("{k}{c}")).map(String::from).or_else(|| env.and_then(|u| u.env(&format!("{e}{k}"))).map(String::from))
-        };
-        let f = &mut ifs[nic];
-        if nic > 0 {
-            if let Some((ip, mask)) = get("ip").as_deref().and_then(parse_cidr) {
-                f.ip = ip;
-                f.mask = mask;
-                f.gw = get("gw").as_deref().and_then(parse_ip).unwrap_or(0);
-            }
-            if let Some(mtu) = get("mtu").and_then(|m| m.parse::<usize>().ok()) {
-                f.mtu = mtu.clamp(576, 1500) as u16;
-            }
-        }
-        if let Some(list) = get("extra") {
-            f.extra = rustros_util::wire::parse_ip_list(&list).unwrap_or_default();
-            f.extra.retain(|&a| a != 0 && a != f.ip);
-        }
-        if nic > 0 && f.ip != 0 {
-            kprintln!("net: nic{} ip {}/{}{}", nic, IpFmt(f.ip), f.mask.count_ones(), if f.gw != 0 { format!(" gw {}", IpFmt(f.gw)) } else { String::new() });
-        }
-        if !f.extra.is_empty() {
-            kprintln!("net: nic{} {} extra addresses {}", nic, f.extra.len(), rustros_util::wire::fmt_ip_list(&f.extra));
-        }
-    }
-}
-
-/// A route as stored: "net/n>gw" or "net/n>gw<src/n".
-fn parse_route(r: &str) -> Option<RouteConf> {
-    let (r, src) = match r.split_once('<') {
-        Some((r, s)) => (r, Some(parse_cidr(s)?)),
-        None => (r, None),
-    };
-    let (n, g) = r.split_once('>')?;
-    let ((net, mask), gw) = (parse_cidr(n)?, parse_ip(g)?);
-    let (src, src_mask) = src.unwrap_or((0, 0));
-    (net & !mask == 0 && src & !src_mask == 0).then_some(RouteConf { net, mask, gw, src, src_mask })
-}
-
-pub fn fmt_route(r: &RouteConf) -> String {
-    let mut s = format!("{}/{}>{}", IpFmt(r.net), r.mask.count_ones(), IpFmt(r.gw));
-    if r.src_mask != 0 {
-        s += &format!("<{}/{}", IpFmt(r.src), r.src_mask.count_ones());
-    }
-    s
 }
 
 const BATCH: usize = 32;

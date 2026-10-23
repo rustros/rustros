@@ -112,7 +112,7 @@ impl Perf {
         // where the time goes: modules that used any, the rest is the kernel
         // (drivers, the network stack, the loop)
         let mut used: Vec<_> = self.mod_cpu.iter().filter(|m| m.2 > 0 && !m.0.is_empty()).collect();
-        used.sort_unstable_by_key(|m| core::cmp::Reverse(m.2));
+        rustros_util::sort::sort_by(&mut used, |a, b| a.2 > b.2);
         if !used.is_empty() {
             let mods: u64 = self.mod_cpu.iter().map(|m| m.1).sum();
             s += &format!("\nby module (now, peak): kernel {}%", self.cpu.saturating_sub(mods));

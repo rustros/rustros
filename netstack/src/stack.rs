@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use alloc::string::String;
 use rustros_api::module::{IfSet, NetStack};
-use rustros_api::{ConnInfo, IfConf, Ip, NetError, NetInfo, RawSocket, RouteConf, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use rustros_api::{ConnInfo, IfConf, Ip, NetConf, NetError, NetInfo, RawSocket, RouteConf, SocketAddr, TcpListener, TcpStream, UdpSocket};
 
 use crate::Link;
 use crate::iface::{Iface, Ifaces, IpPkt, PROTO_ICMP, PROTO_TCP, PROTO_UDP, Route, parse_udp};
@@ -539,6 +539,12 @@ impl NetStack for Stack {
     }
     fn set_routes(&mut self, routes: Vec<RouteConf>) {
         self.ifs.1 = routes.into_iter().map(|r| Route { net: r.net, mask: r.mask, gw: r.gw, src: r.src, src_mask: r.src_mask }).collect();
+    }
+    fn boot_config(&self, nics: usize, cmdline: &str, env: &dyn Fn(&str) -> Option<String>) -> (NetConf, Vec<String>) {
+        rustros_util::netconf::from_boot(nics, cmdline, env)
+    }
+    fn config_vars(&self, conf: &NetConf) -> Vec<(String, String)> {
+        rustros_util::netconf::to_env(conf)
     }
     fn set_owner_names(&mut self, names: Vec<&'static str>) {
         self.owner_names = names;

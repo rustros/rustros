@@ -297,7 +297,7 @@ pub fn boot(k: &mut Kernel) {
     let mut names = installed(k);
     let fs: Vec<bool> = names.iter().map(|n| get(k, &key(n, ROLE)).as_deref() == Some(ROLE_FS)).collect();
     let mut order: Vec<(bool, bool, String)> = names.drain(..).zip(fs).map(|(n, fs)| (!fs, n != RUNTIME, n)).collect();
-    order.sort();
+    rustros_util::sort::sort(&mut order);
     let names: Vec<String> = order.into_iter().map(|(_, _, n)| n).collect();
     for name in names {
         k.app_ops.push(ModuleOp::Start(name));
@@ -413,7 +413,7 @@ fn apply_runtime(k: &mut Kernel, slots: &mut [Slot], start: bool, pending: &[Str
     // started anyway) gets another chance on the new runtime
     restart.extend(installed(k).into_iter().filter(|n| n != RUNTIME && !k.names.iter().any(|r| r == n)));
     restart.retain(|n| !pending.contains(n));
-    restart.sort();
+    rustros_util::sort::sort(&mut restart);
     restart.dedup();
     k.app_ops.extend(restart.into_iter().map(ModuleOp::Start));
 }

@@ -15,7 +15,7 @@ kernel/        HAL（启动、CPU、内存、控制台、PCI、virtio、看门�
 api/           rustros-api：应用接口 App/Sys、类型、错误码、WebAssembly ABI（无依赖）
 util/          rustros-util：给应用用的工具：Conn、地址和报文工具、SHA-256/HMAC
 devices/       设备接口：BlockDevice、NetDevice
-netstack/      协议栈（在引导模块里）：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发
+netstack/      协议栈（在引导模块里）：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发；网络配置的读取与保存（命令行/grubenv，util::netconf）
 kvstore/       键值存储引擎（断电安全）
 storage/       存储服务（在引导模块里）：GPT 分区、kvstore、A/B 槽与 grubenv、开机日志、files 分区
 virtio/        virtio-pci 传输层、PCI 配置空间、virtio-blk 和 virtio-net 驱动（在引导模块里）

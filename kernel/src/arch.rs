@@ -297,7 +297,7 @@ pub fn init_clock() {
         2_000_000 // no usable PIT: assume 2 GHz
     } else {
         let s = &mut samples[..n];
-        s.sort_unstable();
+        rustros_util::sort::sort(s);
         s[n / 2]
     };
     TSC_PER_MS.store(per_ms, Ordering::Relaxed);

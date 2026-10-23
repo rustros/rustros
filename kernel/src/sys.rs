@@ -124,10 +124,10 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    pub fn new(nics: Vec<Box<dyn NetDevice>>, ifmap: Vec<IfMap>, boot: Option<Box<dyn Storage>>, cmdline: String, stack: Box<dyn NetStack>) -> Kernel {
+    pub fn new(nics: Vec<Box<dyn NetDevice>>, boot: Option<Box<dyn Storage>>, cmdline: String, stack: Box<dyn NetStack>) -> Kernel {
         Kernel {
             nics,
-            ifmap,
+            ifmap: Vec::new(),
             boot,
             cmdline,
             stack,
@@ -204,7 +204,7 @@ impl Kernel {
             let conf = match (by_map[i], was) {
                 (Some(c), _) => {
                     let mut extra: Vec<Ip> = c.extra.iter().copied().filter(|&a| a != 0 && a != c.ip).collect();
-                    extra.sort_unstable();
+                    rustros_util::sort::sort(&mut extra);
                     extra.dedup();
                     IfConf { mtu: c.mtu.clamp(576, 1500), extra, ..c.clone() }
                 }
@@ -570,7 +570,7 @@ impl Kv for Ctx<'_> {
                 }
             }
         }
-        out.sort();
+        rustros_util::sort::sort(&mut out);
         out
     }
     fn file_delete(&mut self, name: &str) -> bool {
@@ -763,27 +763,7 @@ impl Admin for Ctx<'_> {
         self.k.net_baseline = None;
         self.k.net_deadline = None;
         self.k.net_candidate = None;
-        // NIC 0 as net_ip/net_gw/net_mtu (GRUB passes those on the command
-        // line), the rest as net<n>_* read straight from grubenv at boot
-        let mut vars: Vec<(String, String)> = Vec::new();
-        let vlans: Vec<String> = self.k.ifmap.iter().filter_map(|m| m.vlan.map(|v| format!("{}.{}", m.phys, v))).collect();
-        vars.push((String::from("net_vlans"), vlans.join(",")));
-        let routes: Vec<String> = self.k.stack.routes().iter().map(crate::fmt_route).collect();
-        vars.push((String::from("net_routes"), routes.join(",")));
-        // clear what interfaces that went away left behind
-        for i in self.k.ifmap.len()..16 {
-            for k in ["ip", "gw", "mtu", "extra"] {
-                vars.push((format!("net{i}_{k}"), String::new()));
-            }
-        }
-        for (i, f) in self.k.stack.interfaces().iter().enumerate() {
-            let p = if i == 0 { String::from("net_") } else { format!("net{i}_") };
-            let set = f.ip != 0;
-            vars.push((format!("{p}ip"), if set { format!("{}/{}", IpFmt(f.ip), f.mask.count_ones()) } else { String::new() }));
-            vars.push((format!("{p}gw"), if set && f.gw != 0 { format!("{}", IpFmt(f.gw)) } else { String::new() }));
-            vars.push((format!("{p}mtu"), if f.mtu == 1500 { String::new() } else { format!("{}", f.mtu) }));
-            vars.push((format!("{p}extra"), rustros_util::wire::fmt_ip_list(&f.extra)));
-        }
+        let vars = self.k.stack.config_vars(&self.k.net_running());
         let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         self.k.boot.as_mut().is_some_and(|b| b.env_set(&refs))
     }
