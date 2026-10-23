@@ -4,8 +4,10 @@
   pack.py KERNEL.elf OUT.elf [--boot=NAME=FILE ...]
 
 With --boot, the boot modules follow the ELF (4 KiB aligned) in OUT: the
-kernel image a slot holds, GRUB loads (the ELF) and hands over again
-(module2) for the kernel to start them.
+kernel image a slot holds. A third segment has GRUB load them above the
+stub, and their address and length go into the kernel (over the
+"RRSBNDL1@ADDRESS" of kernel/src/bootmods.rs), so the kernel has its drivers
+before it can read a disk.
 
 The kernel's loadable image (code, read-only data, data) is LZ4-compressed
 and put behind a 32-bit stub. GRUB loads two segments:
@@ -217,7 +219,8 @@ def segments(elf: bytes):
     return entry, sorted(loads)
 
 
-def pack(kernel: bytes) -> bytes:
+def pack(kernel: bytes, bundle: bytes = b"") -> bytes:
+    """The packed ELF (with `bundle`: then the bundle, 4 KiB aligned) and the ELF's size."""
     if kernel[:4] == b"\x7fELF" and b"RUSTPACK" in kernel[:512]:
         sys.exit("pack: already packed")
     entry, loads = segments(kernel)
@@ -228,6 +231,16 @@ def pack(kernel: bytes) -> bytes:
     for p, off, f, _ in loads:
         image[p - base:p - base + f] = kernel[off:off + f]
     end = max(p + m for p, _, _, m in loads)
+
+    # the boot modules right above the kernel, where they stay; the stub
+    # above them (its memory is free once the kernel runs)
+    bundle_base = (end + 0xFFF) & ~0xFFF
+    stub_base = (bundle_base + len(bundle) + 0xFFF) & ~0xFFF
+    if bundle:
+        if image.count(BUNDLE_AT) != 1:
+            sys.exit("pack: the kernel has no (or more than one) boot module address field")
+        at = image.index(BUNDLE_AT)
+        image[at:at + 16] = struct.pack("<QQ", bundle_base, len(bundle))
 
     # the multiboot2 header, copied (it must be in the first 32 KiB of the file)
     mb2 = None
@@ -242,7 +255,6 @@ def pack(kernel: bytes) -> bytes:
     data = lz4_compress(bytes(image))
     assert lz4_decompress(data) == bytes(image), "LZ4 round trip"
 
-    stub_base = (end + 0xFFF) & ~0xFFF
     with tempfile.TemporaryDirectory() as tmp:
         t = lambda n: os.path.join(tmp, n)
         open(t("mb2"), "wb").write(mb2)
@@ -257,21 +269,34 @@ def pack(kernel: bytes) -> bytes:
         stub = open(t("stub.bin"), "rb").read()
     start = stub_base + ((len(mb2) + 15) & ~15)
 
-    # ELF64: header, two program headers, a marker, the stub segment, then a
-    # section header table with just the null entry (GRUB wants one)
+    # ELF64: header, program headers, a marker, the stub segment, then a
+    # section header table with just the null entry (GRUB wants one); the
+    # bundle after that, 4 KiB aligned
     PH = 56
+    nph = 3 if bundle else 2
     seg_off = 0x100
     shoff = (seg_off + len(stub) + 7) & ~7
+    elf_end = shoff + 64
+    bundle_off = (elf_end + 0xFFF) & ~0xFFF
     ehdr = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
-    ehdr += struct.pack("<HHIQQQIHHHHHH", 2, 0x3E, 1, start, 64, shoff, 0, 64, PH, 2, 64, 1, 0)
-    ph_zero = struct.pack("<IIQQQQQQ", 1, 6, seg_off, base, base, 0, end - base, 8)
-    ph_stub = struct.pack("<IIQQQQQQ", 1, 7, seg_off, stub_base, stub_base, len(stub), len(stub), 8)
-    head = ehdr + ph_zero + ph_stub + b"RUSTPACK"
+    ehdr += struct.pack("<HHIQQQIHHHHHH", 2, 0x3E, 1, start, 64, shoff, 0, 64, PH, nph, 64, 1, 0)
+    ph = struct.pack("<IIQQQQQQ", 1, 6, seg_off, base, base, 0, end - base, 8)
+    ph += struct.pack("<IIQQQQQQ", 1, 7, seg_off, stub_base, stub_base, len(stub), len(stub), 8)
+    if bundle:
+        ph += struct.pack("<IIQQQQQQ", 1, 4, bundle_off, bundle_base, bundle_base, len(bundle), len(bundle), 4096)
+    head = ehdr + ph + b"RUSTPACK"
+    assert len(head) <= seg_off
     head += bytes(seg_off - len(head))
     body = head + stub
-    return body + bytes(shoff - len(body)) + bytes(64)
+    out = body + bytes(shoff - len(body)) + bytes(64)
+    elf = len(out)
+    if bundle:
+        out += bytes(bundle_off - len(out)) + bundle
+    return out, elf
 
 
+# the kernel's field for the boot modules' address and length (kernel/src/bootmods.rs)
+BUNDLE_AT = b"RRSBNDL1@ADDRESS"
 BUNDLE_MAGIC = b"RRSBNDL1"
 BUNDLE_HEAD = 4096   # magic, count, then 80-byte entries: name (32), offset in sectors (4), stored bytes (4),
                      # SHA-256 of the module (32), its bytes (4), flags (4: 1 = stored LZ4-compressed)
@@ -301,11 +326,7 @@ def main():
     if len(args) != 2:
         sys.exit(__doc__)
     kernel = open(args[0], "rb").read()
-    out = pack(kernel)
-    elf = len(out)
-    if boot:
-        # the kernel image: the ELF, then (4 KiB aligned) its boot modules
-        out += bytes(-len(out) % 4096) + boot_bundle(boot)
+    out, elf = pack(kernel, boot_bundle(boot) if boot else b"")
     open(args[1], "wb").write(out)
     print(f"pack: kernel {len(kernel)} -> {elf} bytes" + (f", with boot modules {len(out)} bytes ({', '.join(b.split('=')[0] for b in boot)})" if boot else ""))
 

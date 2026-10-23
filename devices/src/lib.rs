@@ -29,18 +29,8 @@ pub fn buf_for(len: usize) -> Buf {
     alloc::vec![0u8; (HEADROOM + len).max(BUF_SIZE)].into_boxed_slice()
 }
 
-/// A disk addressed in 512-byte sectors.
-pub trait BlockDevice {
-    /// Read `buf.len()` bytes (a multiple of 512) starting at sector `lba`.
-    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool;
-    /// Write `buf.len()` bytes (a multiple of 512) starting at sector `lba`;
-    /// durable when it returns true.
-    fn write(&mut self, lba: u64, buf: &[u8]) -> bool;
-    fn sectors(&self) -> u64;
-    fn read_only(&self) -> bool {
-        false
-    }
-}
+/// A disk addressed in 512-byte sectors (the trait drivers implement).
+pub use rustros_api::module::Disk as BlockDevice;
 
 /// Counters of a NIC, kept by its driver (all traffic, forwarded too).
 #[derive(Clone, Copy, Default, Debug)]

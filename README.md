@@ -5,7 +5,7 @@
 - 一张 raw 盘同时支持 **BIOS 和 UEFI** 启动（GRUB 2 + multiboot2）
 - 面向 KVM/VPS：**virtio-net**、**virtio-blk**，modern（1.0）和 legacy 设备都支持
 - **在线更新**：通过网络上传新内核写入备用槽，试启动一次，确认后才切换；不确认就自动回滚
-- **内核保持在 256 KiB 以内**：内核只做驱动、内存、协议栈、块存储和模块加载；文件系统驱动（ext4）、应用、WebAssembly 运行时都是可以在线安装和更新的模块
+- **内核保持在 256 KiB 以内**：内核只做内存、协议栈、块存储和模块加载；磁盘驱动（virtio-blk）、rescue、dhcp、updater 是随内核一起放在槽里的引导模块，文件系统驱动（ext4）、应用、WebAssembly 运行时都是可以在线安装和更新的模块
 - unsafe 只出现在 `kernel/`（以及 `wasmhost` 的一处）；其余 crate 和应用都是 `#![forbid(unsafe_code)]`
 
 ## 目录结构
@@ -18,6 +18,7 @@ devices/       设备接口：BlockDevice、NetDevice
 netstack/      协议栈：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发
 kvstore/       键值存储引擎（断电安全）
 storage/       数据分区（MBR 分区 2）+ kvstore
+virtio/        virtio-pci 传输层、PCI 配置空间和 virtio-blk 驱动（内核的网卡驱动和引导模块共用）
 slots/         A/B 内核槽位 + grubenv（在线更新、试启动、回滚）
 wasmhost/      WebAssembly 运行时（wasmi），可选：`make WASM=0` 不带它
 apps/          原生应用：shell、echo、httpd、updater
@@ -198,6 +199,7 @@ pub trait App {
    - 容器需要的内核机制：namespaces、cgroups、overlayfs、veth/bridge、netfilter；
    - 目标是 dockerd、containerd、runc 原样运行。
 4. **业务和网络的衔接**：容器的网络接到 RustROS 的数据面上，转发路径不经过兼容层。
+5. **硬件驱动全部用 Rust 写（纯血 Rust）**：Linux 兼容模块只兼容系统调用层，不搬 Linux 的内核驱动。物理机需要的驱动用 Rust 写成驱动模块（`Driver` 接口），先做 NVMe 和 Intel 网卡（e1000e、ixgbe、i40e），RAID 用 Rust 的软 RAID（硬件 RAID 卡设成直通）。
 
 ## 现状与限制
 

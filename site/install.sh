@@ -255,7 +255,7 @@ def prepare(a):
     parts = sh(f"{pre}-probe", "--target=partmap", "/boot", check=False).split()
     args = f"rustros.testboot={TEST_SECS} key={key}" + (f" ip={ip} gw={gw}" if ip else "")
     entry = (f"#!/bin/sh\nexec tail -n +3 $0\nmenuentry 'RustROS test' {{\n" + "".join(f"    insmod part_{p}\n" for p in parts) +
-             f"    insmod {fsmod}\n    insmod multiboot2\n    search --no-floppy --fs-uuid --set=root {uuid}\n    multiboot2 {rel} {args}\n    module2 {rel}\n    boot\n}}\n")
+             f"    insmod {fsmod}\n    insmod multiboot2\n    search --no-floppy --fs-uuid --set=root {uuid}\n    multiboot2 {rel} {args}\n    boot\n}}\n")
     fd = os.open("/etc/grub.d/45_rustros_test", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)  # it holds the key
     os.write(fd, entry.encode())
     os.close(fd)

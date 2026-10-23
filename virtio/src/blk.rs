@@ -1,11 +1,12 @@
 //! virtio-blk driver: synchronous, one request at a time.
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::format;
 
-use crate::arch::now_ms;
+use rustros_api::module::{Device, Disk, Driver, Hw};
+
 use crate::pci::PciDev;
-use crate::virtio::{D_NEXT, D_WRITE, Queue, Virtio};
+use crate::{D_NEXT, D_WRITE, Queue, Virtio};
 
 const F_SIZE_MAX: u64 = 1 << 1;
 const F_SEG_MAX: u64 = 1 << 2;
@@ -18,7 +19,7 @@ const T_FLUSH: u32 = 4;
 const MAX_REQUEST: usize = 64 * 1024;
 
 pub struct VirtioBlk {
-    _dev: Virtio,
+    dev: Virtio,
     q: Queue,
     pub sectors: u64,
     pub read_only: bool,
@@ -57,8 +58,8 @@ struct ReqHdr {
 }
 
 impl VirtioBlk {
-    pub fn new(pci: &PciDev) -> Option<VirtioBlk> {
-        let mut dev = Virtio::probe(pci)?;
+    pub fn new(hw: &'static dyn Hw, pci: &PciDev) -> Option<VirtioBlk> {
+        let mut dev = Virtio::probe(hw, pci)?;
         let feat = dev.begin(F_RO | F_SIZE_MAX | F_SEG_MAX | F_FLUSH)?;
         let q = dev.queue(0, 16)?;
         let sectors = dev.config32(0) as u64 | (dev.config32(4) as u64) << 32;
@@ -72,15 +73,15 @@ impl VirtioBlk {
             return None;
         }
         dev.finish();
-        crate::kprintln!(
+        hw.log(&format!(
             "disk: virtio-blk {} MiB{}, requests up to {} KiB{}",
             sectors / 2048,
             if feat & F_RO != 0 { " read-only" } else { "" },
             max_len / 1024,
             if flush { ", write cache flushed" } else { "" }
-        );
+        ));
         Some(VirtioBlk {
-            _dev: dev,
+            dev,
             q,
             sectors,
             read_only: feat & F_RO != 0,
@@ -136,13 +137,13 @@ impl VirtioBlk {
         self.q.set_desc(2, status as u64, 1, D_WRITE, 0);
         self.q.push(0);
         self.q.notify();
-        let start = now_ms();
+        let start = self.dev.hw.now_ms();
         loop {
             if self.q.pop().is_some() {
                 break;
             }
-            if now_ms() - start > 5000 {
-                crate::kprintln!("disk: request {} at sector {} ({} bytes) timed out, disk given up", ty, sector, len);
+            if self.dev.hw.now_ms() - start > 5000 {
+                self.dev.hw.log(&format!("disk: request {} at sector {} ({} bytes) timed out, disk given up", ty, sector, len));
                 self.dead = true;
                 return false;
             }
@@ -152,7 +153,7 @@ impl VirtioBlk {
         if st != 0 {
             self.errors += 1;
             if self.errors <= 5 {
-                crate::kprintln!("disk: request {} at sector {} ({} bytes) failed: status {}", ty, sector, len, st);
+                self.dev.hw.log(&format!("disk: request {} at sector {} ({} bytes) failed: status {}", ty, sector, len, st));
             }
         }
         st == 0
@@ -160,30 +161,32 @@ impl VirtioBlk {
 
 }
 
-/// A request is in flight (the watchdog must not write the disk then).
-static BUSY: AtomicBool = AtomicBool::new(false);
-
-pub fn busy() -> bool {
-    BUSY.load(Ordering::Relaxed)
-}
-
-impl devices::BlockDevice for VirtioBlk {
+impl Disk for VirtioBlk {
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> bool {
-        BUSY.store(true, Ordering::Relaxed);
-        let ok = self.io(sector, buf.as_mut_ptr(), buf.len(), false);
-        BUSY.store(false, Ordering::Relaxed);
-        ok
+        self.io(sector, buf.as_mut_ptr(), buf.len(), false)
     }
     fn write(&mut self, sector: u64, buf: &[u8]) -> bool {
-        BUSY.store(true, Ordering::Relaxed);
-        let ok = self.io(sector, buf.as_ptr() as *mut u8, buf.len(), true);
-        BUSY.store(false, Ordering::Relaxed);
-        ok
+        self.io(sector, buf.as_ptr() as *mut u8, buf.len(), true)
     }
     fn sectors(&self) -> u64 {
         self.sectors
     }
     fn read_only(&self) -> bool {
         self.read_only
+    }
+}
+
+/// The virtio-blk driver (a boot module's).
+pub struct BlkDriver;
+
+impl Driver for BlkDriver {
+    fn name(&self) -> &'static str {
+        "virtio-blk"
+    }
+    fn probe(&mut self, hw: &'static dyn Hw, dev: PciDev) -> Option<Device> {
+        if !is_blk(&dev) {
+            return None;
+        }
+        Some(Device::Block(Box::new(VirtioBlk::new(hw, &dev)?)))
     }
 }

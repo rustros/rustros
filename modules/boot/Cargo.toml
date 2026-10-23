@@ -14,3 +14,4 @@ rustros-module = { path = "../support" }
 rescue = { path = "../../apps/rescue" }
 dhcp = { path = "../../apps/dhcp" }
 updater = { path = "../../apps/updater" }
+virtio = { path = "../../virtio" }

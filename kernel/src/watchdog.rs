@@ -5,7 +5,7 @@
 use core::ptr::write_volatile;
 
 use crate::arch::now_ms;
-use crate::pci::{self, PciDev};
+use virtio::pci::{self, Config, PciDev};
 
 /// Total time without a pet before the reset (longer than the software
 /// watchdog, which should normally fire first).

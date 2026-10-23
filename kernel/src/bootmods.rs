@@ -1,53 +1,55 @@
-//! Boot modules: the modules that come with the kernel (one binary with
-//! rescue, dhcp and the updater, LZ4-compressed), in its image after the ELF. They start before the installed
-//! modules, in safe mode too, and are updated and rolled back with the
-//! kernel (one file, one slot). GRUB hands the image over again as a
-//! module (`module2`); without that the kernel reads its slot.
+//! Boot modules: the modules that come with the kernel (one binary with the
+//! disk driver, rescue, dhcp and the updater, LZ4-compressed), in its image
+//! after the ELF. GRUB loads them with the kernel (tools/pack.py makes them
+//! a segment of it), so they are there before any disk is. They start before
+//! the installed modules, in safe mode too, and are updated and rolled back
+//! with the kernel (one file, one slot).
 
+use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
-use devices::BlockDevice;
+use rustros_api::Module;
+use rustros_api::module::{Driver, Export};
 use rustros_util::sha256::Sha256;
 
 const MAGIC: &[u8; 8] = b"RRSBNDL1";
 const HEAD: usize = 4096;
 const ENTRY: usize = 80;
 
-fn le16(b: &[u8], o: usize) -> usize {
-    u16::from_le_bytes([b[o], b[o + 1]]) as usize
-}
+/// Where the boot modules are and how long: tools/pack.py writes it here.
+#[used]
+static BUNDLE: [u8; 16] = *b"RRSBNDL1@ADDRESS";
+
 fn le32(b: &[u8], o: usize) -> usize {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize
 }
 
-/// Where the bundle starts in a kernel image: after the ELF (its section
-/// header table ends it), 4 KiB aligned.
-fn bundle_at(img: &[u8]) -> Option<usize> {
-    if img.len() < 64 || &img[..4] != b"\x7fELF" {
+/// The boot modules GRUB loaded with the kernel (None: an unpacked kernel).
+pub fn bundle() -> Option<&'static [u8]> {
+    // Safety: a plain static; read volatile, pack.py changed it after the build
+    let v = unsafe { core::ptr::read_volatile(&raw const BUNDLE) };
+    let at = u64::from_le_bytes(v[..8].try_into().ok()?);
+    let len = u64::from_le_bytes(v[8..].try_into().ok()?);
+    // left as it was (its text is no address below 4 GiB): no boot modules
+    if at == 0 || at.checked_add(len)? > 1 << 32 {
         return None;
     }
-    let shoff = u64::from_le_bytes(img[0x28..0x30].try_into().ok()?) as usize;
-    let end = shoff.checked_add(le16(img, 0x3A) * le16(img, 0x3C))?;
-    Some(end.next_multiple_of(4096))
+    // Safety: GRUB loaded the segment there, identity-mapped; nothing else uses it
+    Some(unsafe { core::slice::from_raw_parts(at as *const u8, len as usize) })
 }
 
-/// The boot modules in a kernel image: (name, image), each checked against
-/// its SHA-256.
+/// The boot modules in the bundle: (name, image), each checked against its
+/// SHA-256.
 pub fn parse(img: &[u8]) -> Result<Vec<(String, Vec<u8>)>, &'static str> {
-    let at = bundle_at(img).ok_or("not a kernel image")?;
-    let head = img.get(at..at + HEAD).ok_or("the kernel image carries no boot modules")?;
-    if &head[..8] != MAGIC {
-        return Err("the kernel image carries no boot modules");
-    }
+    let head = img.get(..HEAD).filter(|h| &h[..8] == MAGIC).ok_or("damaged")?;
     let count = le32(head, 8).min((HEAD - 16) / ENTRY);
     let mut out = Vec::new();
     for i in 0..count {
         let e = &head[16 + i * ENTRY..16 + (i + 1) * ENTRY];
         let name = String::from(String::from_utf8_lossy(&e[..32]).trim_end_matches('\0'));
         let (off, len) = (le32(e, 32) * 512, le32(e, 36));
-        let stored = img.get(at + off..at + off + len).ok_or("a boot module past the image's end")?;
+        let stored = img.get(off..off + len).ok_or("a boot module past the bundle's end")?;
         let data = if le32(e, 76) & 1 != 0 { lz4(stored, le32(e, 72)).ok_or("a boot module does not decompress")? } else { stored.to_vec() };
         if Sha256::digest(&data)[..] != e[40..72] {
             return Err("a boot module does not match its checksum");
@@ -57,24 +59,14 @@ pub fn parse(img: &[u8]) -> Result<Vec<(String, Vec<u8>)>, &'static str> {
     Ok(out)
 }
 
-/// The running kernel's image, read from its slot (`lba`, `sectors` long).
-pub fn read_slot(disk: &mut dyn BlockDevice, lba: u64, sectors: u64) -> Option<Vec<u8>> {
-    let mut first = vec![0u8; 4096];
-    if !disk.read(lba, &mut first) {
-        return None;
+/// Sort what a boot module exports into apps and drivers.
+pub fn take(e: Export, apps: &mut Vec<Box<dyn Module>>, drivers: &mut Vec<Box<dyn Driver>>) {
+    match e {
+        Export::Module(a) => apps.push(a),
+        Export::Driver(d) => drivers.push(d),
+        Export::Many(v) => v.into_iter().for_each(|e| take(e, apps, drivers)),
+        _ => crate::kprintln!("modules: a boot module holds apps and drivers only"),
     }
-    let at = bundle_at(&first)?;
-    let mut head = vec![0u8; HEAD];
-    if (at + HEAD) as u64 > sectors * 512 || !disk.read(lba + at as u64 / 512, &mut head) || &head[..8] != MAGIC {
-        return None;
-    }
-    let count = le32(&head, 8).min((HEAD - 16) / ENTRY);
-    let end = (0..count).map(|i| le32(&head, 16 + i * ENTRY + 32) * 512 + le32(&head, 16 + i * ENTRY + 36)).max()? + at;
-    if end as u64 > sectors * 512 {
-        return None;
-    }
-    let mut img = vec![0u8; end.next_multiple_of(512)];
-    disk.read(lba, &mut img).then_some(img)
 }
 
 /// An LZ4 block (as tools/pack.py makes it) of `len` bytes, unpacked.

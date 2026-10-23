@@ -38,8 +38,10 @@ pub enum Export {
     Module(Box<dyn Module>),
     /// Runs applications in another format (the WebAssembly runtime).
     Runtime(Box<dyn Runtime>),
-    /// Several apps from one binary (sharing its code): the boot modules.
-    Apps(alloc::vec::Vec<Box<dyn Module>>),
+    /// Several things from one binary (sharing its code): the boot modules.
+    Many(Vec<Export>),
+    /// A device driver ("virtio-blk"): the kernel offers it the PCI functions.
+    Driver(Box<dyn Driver>),
     /// A file system driver ("ext4", "xfs", ...): the kernel mounts the
     /// files partition with the one that recognises it.
     Filesystem(Box<dyn Filesystem>),
@@ -77,13 +79,50 @@ pub trait Filesystem {
     fn close(&mut self, disk: &mut dyn Disk);
 }
 
-/// Sectors the kernel lends a module: LBAs count from their start.
+/// A disk addressed in 512-byte sectors: one a driver drives, or sectors
+/// the kernel lends a module (LBAs count from their start).
 pub trait Disk {
     /// `buf.len()` bytes (a multiple of 512) from sector `lba`.
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool;
     /// Durable when it returns true.
     fn write(&mut self, lba: u64, buf: &[u8]) -> bool;
     fn sectors(&self) -> u64;
+    fn read_only(&self) -> bool {
+        false
+    }
+}
+
+/// A PCI function the kernel found.
+#[derive(Clone, Copy)]
+pub struct PciAddr {
+    pub bus: u8,
+    pub dev: u8,
+    pub func: u8,
+    pub vendor: u16,
+    pub device: u16,
+}
+
+/// What a driver needs from the kernel besides the device itself (port I/O
+/// and identity-mapped memory it has: it runs in the kernel).
+pub trait Hw: Sync {
+    /// Map a device's registers (uncached); false if they cannot be.
+    fn map_device(&self, phys: u64, len: u64) -> bool;
+    fn now_ms(&self) -> u64;
+    /// A line for the console.
+    fn log(&self, line: &str);
+}
+
+/// A device driver. Drivers come with the kernel (boot modules) and are
+/// offered the PCI functions at boot, before anything uses a disk.
+pub trait Driver {
+    fn name(&self) -> &'static str;
+    /// Drive `dev` if it is this driver's kind of device.
+    fn probe(&mut self, hw: &'static dyn Hw, dev: PciAddr) -> Option<Device>;
+}
+
+/// A device a driver drives.
+pub enum Device {
+    Block(Box<dyn Disk>),
 }
 
 /// An application runtime: turns application images of its format into apps.

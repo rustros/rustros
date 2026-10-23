@@ -1,11 +1,12 @@
-//! RustROS kernel: boots, brings up the console, virtio-net and virtio-blk, runs
-//! the network stack and polls the built-in applications (see rustros_api::sys).
+//! RustROS kernel: boots, brings up the console, its boot modules (the disk
+//! driver among them) and virtio-net, runs the network stack and polls the built-in applications (see rustros_api::sys).
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
 mod bootmods;
+mod drivers;
 mod modules;
 mod offload;
 mod klog;
@@ -18,10 +19,7 @@ mod font;
 mod loader;
 mod mem;
 mod multiboot;
-mod pci;
 mod sys;
-mod virtio;
-mod virtio_blk;
 mod virtio_net;
 mod watchdog;
 
@@ -34,7 +32,7 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use rustros_api::{Module, Caps, Frame, HEADROOM, Offload, Verdict};
-use devices::NetDevice;
+use devices::{BlockDevice, NetDevice};
 use netstack::Stack;
 use rustros_util::wire::{IpFmt, cmdline_get, parse_cidr, parse_ip};
 
@@ -151,7 +149,7 @@ fn console_owner(k: &Kernel, slots: &[Slot], force_rescue: bool) -> Option<usize
 /// disk is idle.
 pub fn watchdog_expired(samples: [u64; 8], rip: u64) -> ! {
     match modules::current_native() {
-        Some(name) if !virtio_blk::busy() => crash(format_args!("watchdog: main loop stuck in native app {}", name)),
+        Some(name) if !drivers::busy() => crash(format_args!("watchdog: main loop stuck in native app {}", name)),
         _ => {
             kprintln!("\n*** watchdog: main loop stuck for {} s (at {:#x}; also {:x?}), rebooting", arch::WATCHDOG_MS / 1000, rip, samples);
             arch::reboot()
@@ -193,8 +191,6 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     mem::HEAP.init();
     let bi = multiboot::parse(magic, info);
     console::init(bi.fb, bi.efi);
-    // the kernel image GRUB loaded again as a module: its boot modules (copied before anything else is loaded)
-    let grub_image: Option<Vec<u8>> = bi.module.map(|m| m.to_vec());
     kprintln!("RustROS {} ({} boot, {})", rustros_api::BUILD, if bi.efi { "UEFI" } else { "BIOS" }, console::describe());
     if magic != multiboot::MAGIC {
         kprintln!("warning: not booted by a multiboot2 loader");
@@ -226,24 +222,40 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let shown: Vec<&str> = cmdline.split_ascii_whitespace().map(|w| if w.starts_with("key=") { "key=***" } else { w }).collect();
     kprintln!("cmdline: {}", shown.join(" "));
 
+    // the boot modules: the drivers probe the devices, the apps start later
+    let (mut boot_apps, mut drivers) = (Vec::new(), Vec::new());
+    match bootmods::bundle().map(bootmods::parse) {
+        Some(Ok(mods)) => {
+            for (name, img) in mods {
+                let name: &'static str = Box::leak(name.into_boxed_str());
+                let before = modules::set_current_native(Some(name));
+                let r = loader::load(&img);
+                modules::set_current_native(before);
+                match r {
+                    Ok(mut m) => {
+                        if let Some(e) = m.export.take() {
+                            bootmods::take(e, &mut boot_apps, &mut drivers);
+                        }
+                        // its code serves them for good
+                        Box::leak(Box::new(m));
+                    }
+                    Err(e) => kprintln!("modules: boot module {}: {}", name, e),
+                }
+            }
+        }
+        Some(Err(e)) => kprintln!("modules: boot modules: {}", e),
+        None => kprintln!("modules: the kernel image carries no boot modules"),
+    }
+
     let mut nets = Vec::new();
-    let mut blks = Vec::new();
-    pci::scan(|d| {
+    let mut disks = Vec::new();
+    virtio::pci::scan(|d| {
         if virtio_net::is_net(&d) {
             nets.push(d);
-        } else if virtio_blk::is_blk(&d) {
-            blks.push(d);
+        } else {
+            drivers::probe(&mut drivers, d, &mut disks);
         }
     });
-    let mut disks: Vec<_> = blks.iter().filter_map(virtio_blk::VirtioBlk::new).collect();
-    // "rustros.disktest=<lba>,<sectors>": exercise the first disk on a spare
-    // area (its content is put back), for new hardware
-    if let (Some(spec), Some(d)) = (cmdline_get(&cmdline, "rustros.disktest"), disks.first_mut()) {
-        let mut it = spec.split(',').map(|v| v.parse::<u64>().ok());
-        if let (Some(Some(lba)), Some(Some(n))) = (it.next(), it.next()) {
-            disk_test(d, lba, n);
-        }
-    }
     let boot = match slots::Updater::new(&cmdline, disks) {
         Ok((mut disk, upd)) => {
             kprintln!("disk: running slot {}{}", upd.slot, if upd.trial { " (trial boot)" } else { "" });
@@ -253,7 +265,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             let store = match storage::open(&mut disk, arch::rdtsc()) {
                 Ok((store, part)) => {
                     if part.moved_backup {
-                        kprintln!("storage: disk is {} MiB; moved the backup GPT to its end", disk.sectors / 2048);
+                        kprintln!("storage: disk is {} MiB; moved the backup GPT to its end", disk.sectors() / 2048);
                     }
                     if part.created {
                         kprintln!("storage: created data partition, {} MiB at {} MiB", part.sectors / 2048, part.start / 2048);
@@ -379,36 +391,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
 
     let mut slots: Vec<Slot> = make_apps().into_iter().map(Slot::Builtin).collect();
-    // the boot modules: from GRUB (module2), else read from the running slot
-    let image = grub_image.or_else(|| {
-        let b = k.boot.as_mut()?;
-        let (lba, sectors) = b.upd.running();
-        bootmods::read_slot(&mut *b.disk, lba, sectors)
-    });
-    match image.as_deref().map(bootmods::parse) {
-        Some(Ok(mods)) => {
-            for (name, img) in mods {
-                let name: &'static str = Box::leak(name.into_boxed_str());
-                let before = modules::set_current_native(Some(name));
-                let r = loader::load(&img);
-                modules::set_current_native(before);
-                match r {
-                    Ok(m) if matches!(m.export, Some(rustros_api::module::Export::Module(_))) => slots.push(Slot::Native(m)),
-                    Ok(mut m) if matches!(m.export, Some(rustros_api::module::Export::Apps(_))) => {
-                        // several apps sharing one binary: it stays loaded for good
-                        if let Some(rustros_api::module::Export::Apps(apps)) = m.export.take() {
-                            slots.extend(apps.into_iter().map(Slot::Boot));
-                        }
-                        Box::leak(Box::new(m));
-                    }
-                    Ok(_) => kprintln!("modules: boot module {} is not an app", name),
-                    Err(e) => kprintln!("modules: boot module {}: {}", name, e),
-                }
-            }
-        }
-        Some(Err(e)) => kprintln!("modules: no boot modules: {}", e),
-        None => kprintln!("modules: no boot modules (no kernel image from GRUB, the slot not readable)"),
-    }
+    slots.extend(boot_apps.into_iter().map(Slot::Boot));
     k.names = slots.iter_mut().map(|s| s.app().map_or("", |a| a.name())).collect();
     // boot modules get what they ask for
     k.caps = slots.iter_mut().map(|s| s.app().map_or(Caps::NONE, |a| a.caps())).collect();
@@ -877,38 +860,4 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     crash(format_args!("panic: {}", info))
-}
-
-/// Write and read back patterns of many sizes (and buffer alignments) on
-/// `[lba, lba+n)`, then restore what was there.
-fn disk_test(d: &mut dyn devices::BlockDevice, lba: u64, n: u64) {
-    let len = (n * 512) as usize;
-    let mut orig = alloc::vec![0u8; len];
-    if !d.read(lba, &mut orig) {
-        kprintln!("disktest: reading the area failed");
-        return;
-    }
-    let (mut ok, mut bad) = (0, 0);
-    for size in [512usize, 4096, 65536, 65536 + 512, 131072, 184320, len] {
-        for skew in [0usize, 3, 512] {
-            if size > len {
-                continue;
-            }
-            let mut w = alloc::vec![0u8; size + skew];
-            for (i, b) in w[skew..].iter_mut().enumerate() {
-                *b = (i as u32).wrapping_mul(2_654_435_761).wrapping_add((size + skew) as u32).to_le_bytes()[1];
-            }
-            let mut r = alloc::vec![0u8; size + skew + 7];
-            let good = d.write(lba, &w[skew..]) && d.read(lba, &mut r[skew + 7..]) && r[skew + 7..] == w[skew..];
-            if good {
-                ok += 1;
-            } else {
-                bad += 1;
-                kprintln!("disktest: {} bytes (buffer offset {}) FAILED", size, skew);
-            }
-        }
-    }
-    let mut back = alloc::vec![0u8; len];
-    let restored = d.write(lba, &orig) && d.read(lba, &mut back) && back == orig;
-    kprintln!("disktest: {} of {} cases ok{}, area {}", ok, ok + bad, if bad == 0 { "" } else { " (FAILURES above)" }, if restored { "restored" } else { "NOT restored" });
 }

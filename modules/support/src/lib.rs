@@ -97,16 +97,17 @@ macro_rules! export_module {
     };
 }
 
-/// Export several apps from one binary (they share its code).
+/// Export several things from one binary (they share its code): the boot
+/// modules' apps and drivers, each an `Export`.
 #[macro_export]
-macro_rules! export_apps {
-    ($($ctor:expr),+ $(,)?) => {
+macro_rules! export_many {
+    ($($export:expr),+ $(,)?) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rustros_module_init(
             host: *const $crate::rustros_api::module::HostTable,
             out: *mut Option<$crate::rustros_api::module::Export>,
         ) -> u64 {
-            unsafe { $crate::init(host, out, || $crate::rustros_api::module::Export::Apps($crate::alloc_vec![$($crate::Box::new($ctor) as $crate::Box<dyn $crate::rustros_api::Module>),+])) }
+            unsafe { $crate::init(host, out, || $crate::rustros_api::module::Export::Many($crate::alloc_vec![$($export),+])) }
         }
     };
 }

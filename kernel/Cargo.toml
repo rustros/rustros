@@ -20,6 +20,7 @@ rustros-api = { path = "../api" }
 rustros-util = { path = "../util" }
 netstack = { path = "../netstack" }
 devices = { path = "../devices" }
+virtio = { path = "../virtio" }
 slots = { path = "../slots" }
 storage = { path = "../storage" }
 kvstore = { path = "../kvstore" }

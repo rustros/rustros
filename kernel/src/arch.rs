@@ -21,14 +21,6 @@ pub unsafe fn inw(port: u16) -> u16 {
     unsafe { asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags)) }
     v
 }
-pub unsafe fn outl(port: u16, v: u32) {
-    unsafe { asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags)) }
-}
-pub unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    unsafe { asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags)) }
-    v
-}
 
 /// A random number from the CPU (RDSEED, else RDRAND); None if it has
 /// neither or they keep failing.
@@ -186,7 +178,7 @@ extern "C" fn isr_handler(f: &mut Frame) {
                 }
             }
             if (33..48).contains(&v) {
-                crate::virtio::ack_irq((v - 32) as u8);
+                crate::virtio_net::ack_irq((v - 32) as u8);
             }
             unsafe {
                 if v >= 40 {

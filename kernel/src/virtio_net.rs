@@ -22,8 +22,8 @@ use alloc::vec::Vec;
 
 use devices::{BUF_SIZE, Buf, HEADROOM, Offload, new_buf};
 
-use crate::pci::PciDev;
-use crate::virtio::{D_NEXT, D_WRITE, Queue, Virtio};
+use virtio::pci::{Config, PciDev};
+use virtio::{D_NEXT, D_WRITE, Isr, Queue, Virtio};
 
 const F_CSUM: u64 = 1 << 0;
 const F_GUEST_CSUM: u64 = 1 << 1;
@@ -169,7 +169,7 @@ fn flow_hash(f: &[u8]) -> u32 {
 
 impl VirtioNet {
     pub fn new(pci: &PciDev, offloads: bool) -> Option<VirtioNet> {
-        let mut dev = Virtio::probe(pci)?;
+        let mut dev = Virtio::probe(crate::drivers::HW, pci)?;
         let offered = dev.offered();
         // whether the device is driven the modern way, decided by `begin`
         let mut modern = dev.is_modern();
@@ -182,7 +182,7 @@ impl VirtioNet {
             want |= F_CSUM | F_HOST_TSO4 | F_HOST_ECN;
         }
         // interrupts by message where the device can: some hosts give no line
-        let msix = dev.enable_msix(pci, crate::arch::MSI_VECTOR);
+        let msix = crate::arch::lapic_init().is_some_and(|apic| dev.enable_msix(pci, apic, crate::arch::MSI_VECTOR));
         let mut feat = dev.begin(want)?;
         if !dev.is_modern() && modern {
             // fell back to legacy: none of the modern-only features
@@ -280,7 +280,7 @@ impl VirtioNet {
             // with MSI-X on, the line stays quiet too
             crate::kprintln!("net: the device refused an MSI-X vector, the timer paces receiving");
         } else {
-            n.irq = n.dev.isr().is_some_and(|isr| crate::virtio::register_irq(line, isr));
+            n.irq = n.dev.isr().is_some_and(|isr| register_irq(line, isr));
             if n.irq {
                 pci.enable_intx();
             } else {
@@ -528,6 +528,39 @@ impl devices::NetDevice for VirtioNet {
             for r in &self.rx {
                 r.q.set_interrupts(on);
             }
+        }
+    }
+}
+
+const MAX_ISRS: usize = 8;
+
+/// Interrupt lines and the ISR registers of the virtio devices on them.
+static ISRS: crate::Global<([(u8, Isr); MAX_ISRS], usize)> = crate::Global::new(([(0, Isr::Port(0)); MAX_ISRS], 0));
+
+/// Route a device's legacy interrupt `line` through the PIC; false if the
+/// line is unusable (then only the timer wakes the CPU).
+fn register_irq(line: u8, isr: Isr) -> bool {
+    if line == 0 || line == 2 || line >= 16 {
+        return false;
+    }
+    // Safety: boot time, single core, before the line is unmasked.
+    let r = unsafe { ISRS.get() };
+    if r.1 == MAX_ISRS {
+        return false;
+    }
+    r.0[r.1] = (line, isr);
+    r.1 += 1;
+    crate::arch::unmask_irq(line);
+    true
+}
+
+/// Interrupt on `line`: acknowledge every device on it (level-triggered).
+pub fn ack_irq(line: u8) {
+    // Safety: written only before the lines were unmasked.
+    let r = unsafe { ISRS.get() };
+    for &(l, isr) in &r.0[..r.1] {
+        if l == line {
+            isr.ack();
         }
     }
 }

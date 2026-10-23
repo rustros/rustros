@@ -1,12 +1,20 @@
 //! virtio-pci transport (modern 1.0 MMIO, with legacy I/O-port fallback) and
-//! split virtqueues. Everything is polled; device interrupts stay off.
+//! split virtqueues, and the drivers on them that live in boot modules
+//! (`blk`). Shared by the kernel (virtio-net) and the boot module.
+#![no_std]
+
+extern crate alloc;
+
+pub mod blk;
+pub mod pci;
 
 use alloc::alloc::{Layout, alloc_zeroed};
+use alloc::format;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 
-use crate::arch::{inb, inl, outb, outl};
-use crate::pci::PciDev;
+use pci::{Config, PciDev, inb, inl, inw, outb, outl, outw};
+pub use rustros_api::module::Hw;
 
 pub const F_VERSION_1: u64 = 1 << 32;
 /// The device sits behind the platform's DMA translation (none here: we
@@ -86,6 +94,7 @@ impl Lio {
 }
 
 pub struct Virtio {
+    pub hw: &'static dyn Hw,
     t: Transport,
     /// the legacy registers of a transitional device, to fall back to
     legacy_io: Option<Lio>,
@@ -102,14 +111,6 @@ unsafe fn rd<T>(a: usize) -> T {
 }
 unsafe fn wr<T>(a: usize, v: T) {
     unsafe { write_volatile(a as *mut T, v) }
-}
-unsafe fn outw(port: u16, v: u16) {
-    unsafe { core::arch::asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack, preserves_flags)) }
-}
-unsafe fn inw(port: u16) -> u16 {
-    let v: u16;
-    unsafe { core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags)) }
-    v
 }
 
 // modern common configuration offsets
@@ -143,7 +144,7 @@ const L_QVEC: u16 = 22;
 const L_CONFIG: u16 = 20;
 
 impl Virtio {
-    pub fn probe(pci: &PciDev) -> Option<Virtio> {
+    pub fn probe(hw: &'static dyn Hw, pci: &PciDev) -> Option<Virtio> {
         pci.enable();
         let at = alloc::format!("{:02x}:{:02x}.{}", pci.bus, pci.dev, pci.func);
         let (mut common, mut notify, mut device, mut mul, mut isr) = (None, None, None, 0, None);
@@ -162,8 +163,8 @@ impl Virtio {
             if !(1..=4).contains(&ty) {
                 continue;
             }
-            if io || base == 0 || !crate::mem::map_device(base + off, len) {
-                crate::kprintln!("virtio {}: capability {} in BAR{} at {:#x}+{:#x} not usable", at, ty, bar, base, off);
+            if io || base == 0 || !hw.map_device(base + off, len) {
+                hw.log(&format!("virtio {}: capability {} in BAR{} at {:#x}+{:#x} not usable", at, ty, bar, base, off));
                 continue;
             }
             let a = (base + off) as usize;
@@ -182,7 +183,7 @@ impl Virtio {
         let modern = common.is_some() && notify.is_some() && device.is_some();
         let legacy_io = if is_io && io != 0 {
             Some(Lio::Port(io as u16))
-        } else if !modern && io != 0 && crate::mem::map_device(io, 4096) {
+        } else if !modern && io != 0 && hw.map_device(io, 4096) {
             // a legacy device with its registers in memory
             Some(Lio::Mem(io as usize))
         } else {
@@ -202,12 +203,12 @@ impl Virtio {
             _ => match legacy_io {
                 Some(io) => Transport::Legacy { io },
                 None => {
-                    crate::kprintln!("virtio {}: neither modern registers nor legacy ones (BAR0 {:#x})", at, io);
+                    hw.log(&format!("virtio {}: neither modern registers nor legacy ones (BAR0 {:#x})", at, io));
                     return None;
                 }
             },
         };
-        Some(Virtio { t, legacy_io, at, msix: false, msix_refused: core::cell::Cell::new(false) })
+        Some(Virtio { hw, t, legacy_io, at, msix: false, msix_refused: core::cell::Cell::new(false) })
     }
 
     /// The ISR status register (reading it acknowledges the interrupt).
@@ -220,18 +221,17 @@ impl Virtio {
         }
     }
 
-    /// Interrupt by MSI-X on `vector` of this CPU (before `begin`): true if
-    /// the device has MSI-X and the local APIC works. Whether the device
+    /// Interrupt by MSI-X on `vector` of the CPU with local APIC `apic`
+    /// (before `begin`): true if the device has MSI-X. Whether the device
     /// took it shows once the queues are set up (`msix_ok`).
-    pub fn enable_msix(&mut self, pci: &PciDev, vector: u8) -> bool {
-        let Some(apic) = crate::arch::lapic_init() else { return false };
+    pub fn enable_msix(&mut self, pci: &PciDev, apic: u8, vector: u8) -> bool {
         let Some(cap) = pci.caps().find(|&c| pci.read8(c) == 0x11) else { return false };
         let ctl = pci.read16(cap + 2);
         let table = pci.read32(cap + 4);
         let (base, io) = pci.bar((table & 7) as u8);
         let entries = (ctl & 0x7FF) as u64 + 1;
         let at = base + (table & !7) as u64;
-        if io || base == 0 || !crate::mem::map_device(at, 16 * entries) {
+        if io || base == 0 || !self.hw.map_device(at, 16 * entries) {
             return false;
         }
         unsafe {
@@ -288,7 +288,7 @@ impl Virtio {
         match self.negotiate(wanted) {
             Some(f) => Some(f),
             None if self.is_modern() && self.legacy_io.is_some() => {
-                crate::kprintln!("virtio {}: trying the legacy interface", self.at);
+                self.hw.log(&format!("virtio {}: trying the legacy interface", self.at));
                 self.set_status(0);
                 self.t = Transport::Legacy { io: self.legacy_io? };
                 self.negotiate(wanted)
@@ -312,7 +312,7 @@ impl Virtio {
                     let offered = lo | hi << 32;
                     let f = offered & (wanted | F_VERSION_1 | F_ACCESS_PLATFORM | F_ORDER_PLATFORM);
                     if f & F_VERSION_1 == 0 {
-                        crate::kprintln!("virtio {}: no VERSION_1 (offers {:#x})", self.at, offered);
+                        self.hw.log(&format!("virtio {}: no VERSION_1 (offers {:#x})", self.at, offered));
                         return None;
                     }
                     wr::<u32>(common + C_GFSEL, 0);
@@ -321,7 +321,7 @@ impl Virtio {
                     wr::<u32>(common + C_GF, (f >> 32) as u32);
                     self.set_status(S_ACK | S_DRIVER | S_FEATURES_OK);
                     if self.status() & S_FEATURES_OK == 0 {
-                        crate::kprintln!("virtio {}: features {:#x} refused (offers {:#x})", self.at, f, offered);
+                        self.hw.log(&format!("virtio {}: features {:#x} refused (offers {:#x})", self.at, f, offered));
                         return None;
                     }
                     Some(f)
@@ -391,7 +391,7 @@ impl Virtio {
                 }
             };
             if size == 0 {
-                crate::kprintln!("virtio {}: no queue {}", self.at, idx);
+                self.hw.log(&format!("virtio {}: no queue {}", self.at, idx));
                 return None;
             }
             // modern devices let us shrink the queue; legacy ones don't
@@ -537,42 +537,16 @@ pub enum Isr {
     Port(u16),
 }
 
-const MAX_ISRS: usize = 8;
-
-/// Interrupt lines and the ISR registers of the virtio devices on them.
-static ISRS: crate::Global<([(u8, Isr); MAX_ISRS], usize)> = crate::Global::new(([(0, Isr::Port(0)); MAX_ISRS], 0));
-
-/// Route a device's legacy interrupt `line` through the PIC; false if the
-/// line is unusable (then only the timer wakes the CPU).
-pub fn register_irq(line: u8, isr: Isr) -> bool {
-    if line == 0 || line == 2 || line >= 16 {
-        return false;
-    }
-    // Safety: boot time, single core, before the line is unmasked.
-    let r = unsafe { ISRS.get() };
-    if r.1 == MAX_ISRS {
-        return false;
-    }
-    r.0[r.1] = (line, isr);
-    r.1 += 1;
-    crate::arch::unmask_irq(line);
-    true
-}
-
-/// Interrupt on `line`: acknowledge every device on it (level-triggered).
-pub fn ack_irq(line: u8) {
-    // Safety: written only before the lines were unmasked.
-    let r = unsafe { ISRS.get() };
-    for &(l, isr) in &r.0[..r.1] {
-        if l == line {
-            unsafe {
-                match isr {
-                    Isr::Mmio(a) => {
-                        rd::<u8>(a);
-                    }
-                    Isr::Port(p) => {
-                        inb(p);
-                    }
+impl Isr {
+    /// Read the ISR status register: acknowledges a legacy interrupt.
+    pub fn ack(self) {
+        unsafe {
+            match self {
+                Isr::Mmio(a) => {
+                    rd::<u8>(a);
+                }
+                Isr::Port(p) => {
+                    inb(p);
                 }
             }
         }
