@@ -8,11 +8,11 @@ use rustros_util::wire::{be16, be32, checksum};
 use alloc::vec::Vec;
 
 use alloc::string::String;
-use rustros_api::module::{IfSet, NetStack};
-use rustros_api::{ConnInfo, IfConf, Ip, NetConf, NetError, NetInfo, RawSocket, RouteConf, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use rustros_api::module::NetStack;
+use rustros_api::{ConnInfo, Ip, NetConf, NetError, NetInfo, RawSocket, SocketAddr, TcpListener, TcpStream, UdpSocket};
 
 use crate::Link;
-use crate::iface::{Iface, Ifaces, IpPkt, PROTO_ICMP, PROTO_TCP, PROTO_UDP, Route, parse_udp};
+use crate::iface::{Iface, Ifaces, IpPkt, PROTO_ICMP, PROTO_TCP, PROTO_UDP, parse_udp};
 use crate::tcp::{Handle, State, Tcp};
 
 /// Datagrams queued per socket before new ones are dropped.
@@ -52,6 +52,8 @@ pub struct Stack {
     /// A pass of `loopback` used its whole budget: the last packet, for
     /// the log (a storm between two of our own sockets).
     pub loop_storm: Option<alloc::string::String>,
+    /// The interfaces' and routes' configuration (config.rs).
+    pub(crate) conf: crate::config::Config,
 }
 
 type R<T> = Result<T, NetError>;
@@ -75,6 +77,7 @@ impl Stack {
             next_id: 1,
             owner_names: Vec::new(),
             loop_storm: None,
+            conf: crate::config::Config::default(),
         }
     }
 
@@ -519,32 +522,47 @@ impl NetStack for Stack {
         Stack::poll(self, link);
         self.loop_storm.take()
     }
-    fn interfaces(&self) -> Vec<IfConf> {
-        self.ifs.0.iter().map(|f| IfConf { phys: 0, vlan: None, ip: f.ip, mask: f.mask, gw: f.gw, mtu: f.mtu as u16, extra: f.extra.clone() }).collect()
+    fn set_nics(&mut self, macs: Vec<[u8; 6]>) {
+        self.conf.macs = macs;
     }
-    fn set_interfaces(&mut self, ifs: Vec<IfSet>) {
-        let mut old: Vec<Option<Iface>> = core::mem::take(&mut self.ifs.0).into_iter().map(Some).collect();
-        for (i, s) in ifs.into_iter().enumerate() {
-            let mut f = s.was.and_then(|w| old.get_mut(w)?.take()).unwrap_or_else(|| Iface::new(i, s.mac, 0, 0, 0));
-            let c = s.conf;
-            if (f.ip, f.mask, f.gw) != (c.ip, c.mask, c.gw) {
-                f.arp.clear();
-            }
-            (f.nic, f.ip, f.mask, f.gw, f.mtu, f.extra) = (i, c.ip, c.mask, c.gw, c.mtu as usize, c.extra);
-            self.ifs.0.push(f);
-        }
+    fn config(&self) -> NetConf {
+        Stack::running(self)
     }
-    fn routes(&self) -> Vec<RouteConf> {
-        self.ifs.1.iter().map(|r| RouteConf { net: r.net, mask: r.mask, gw: r.gw, src: r.src, src_mask: r.src_mask }).collect()
+    fn set_config(&mut self, conf: &NetConf) -> Result<(), String> {
+        Stack::set_config(self, conf)
     }
-    fn set_routes(&mut self, routes: Vec<RouteConf>) {
-        self.ifs.1 = routes.into_iter().map(|r| Route { net: r.net, mask: r.mask, gw: r.gw, src: r.src, src_mask: r.src_mask }).collect();
+    fn candidate(&self) -> Option<NetConf> {
+        Stack::candidate(self)
+    }
+    fn set_candidate(&mut self, conf: Option<NetConf>) {
+        Stack::set_candidate(self, conf)
+    }
+    fn apply(&mut self, now: u64, seconds: u32) -> Result<(), String> {
+        Stack::apply(self, now, seconds)
+    }
+    fn revert(&mut self) -> Result<bool, String> {
+        Stack::revert(self)
+    }
+    fn confirm(&mut self) -> bool {
+        Stack::confirm(self)
+    }
+    fn discard(&mut self) {
+        Stack::discard(self)
+    }
+    fn pending(&self, now: u64) -> Option<u64> {
+        Stack::pending(self, now)
+    }
+    fn applied(&self) -> bool {
+        Stack::applied(self)
+    }
+    fn tick(&mut self, now: u64) -> Option<String> {
+        Stack::tick(self, now)
     }
     fn boot_config(&self, nics: usize, cmdline: &str, env: &dyn Fn(&str) -> Option<String>) -> (NetConf, Vec<String>) {
         rustros_util::netconf::from_boot(nics, cmdline, env)
     }
-    fn config_vars(&self, conf: &NetConf) -> Vec<(String, String)> {
-        rustros_util::netconf::to_env(conf)
+    fn save(&mut self) -> Vec<(String, String)> {
+        Stack::save(self)
     }
     fn set_owner_names(&mut self, names: Vec<&'static str>) {
         self.owner_names = names;

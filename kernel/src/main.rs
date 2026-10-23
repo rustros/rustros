@@ -289,10 +289,11 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         kprintln!("net: nic{} {} mac {}", i, n.kind(), rustros_util::wire::MacFmt(n.mac()));
     }
 
-    let Some(stack) = bm.netstack.take() else {
+    let Some(mut stack) = bm.netstack.take() else {
         kprintln!("no network stack (boot modules), halting");
         arch::halt_forever();
     };
+    stack.set_nics(nics.iter().map(|n| n.mac()).collect());
     let env = |key: &str| boot.as_ref().and_then(|b| b.env(key)).map(String::from);
     let (conf, log) = stack.boot_config(nics.len(), &cmdline, &env);
     for l in log {
@@ -418,9 +419,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             }
         }
         modules::apply(&mut k, &mut slots);
-        if k.net_deadline.is_some_and(|t| arch::now_ms() >= t) && k.net_revert() {
-            kprintln!("net: apply not confirmed in time, previous configuration restored (the candidate is kept)");
-        }
+        k.net_tick();
         if testboot.is_some_and(|t| arch::now_ms() >= t) {
             kprintln!("test boot over: restarting into the previous system");
             arch::reboot();

@@ -15,7 +15,7 @@ kernel/        HAL（启动、CPU、内存、控制台、PCI、virtio、看门�
 api/           rustros-api：应用接口 App/Sys、类型、错误码、WebAssembly ABI（无依赖）
 util/          rustros-util：给应用用的工具：Conn、地址和报文工具、SHA-256/HMAC
 devices/       设备接口：BlockDevice、NetDevice
-netstack/      协议栈（在引导模块里）：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发；网络配置的读取与保存（命令行/grubenv，util::netconf）
+netstack/      协议栈（在引导模块里）：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发；网络配置：生效、候选、apply/确认/超时回滚，读取与保存（命令行/grubenv，util::netconf）
 kvstore/       键值存储引擎（断电安全）
 storage/       存储服务（在引导模块里）：GPT 分区、kvstore、A/B 槽与 grubenv、开机日志、files 分区
 modman/        模块管理（在引导模块里）：已装模块的存放（sys/app/<名>/）、安装/删除/切换、选择原生或 WebAssembly 形式、开机顺序、崩溃后关掉原生形式、镜像自带模块；内核只负责加载和运行

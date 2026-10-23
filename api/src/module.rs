@@ -312,7 +312,7 @@ pub trait Runtime {
 
 // ---------------------------------------------------------------- network stack
 
-use crate::sys::{ConnInfo, IfConf, Ip, NetConf, NetError, NetInfo, RawSocket, RouteConf, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use crate::sys::{ConnInfo, Ip, NetConf, NetError, NetInfo, RawSocket, SocketAddr, TcpListener, TcpStream, UdpSocket};
 
 /// What the network stack needs from the kernel.
 pub trait Link {
@@ -322,15 +322,6 @@ pub trait Link {
     fn send(&mut self, nic: usize, frame: &[u8]) -> bool;
     /// Not cryptographically strong; fine for ISNs and port numbers.
     fn random(&mut self) -> u64;
-}
-
-/// An interface for `NetStack::set_interfaces`: the one that was number
-/// `was` (keeping its ARP cache if its addresses stay), or a new one.
-pub struct IfSet {
-    pub was: Option<usize>,
-    pub mac: [u8; 6],
-    /// its addresses (`phys` and `vlan` are the kernel's business)
-    pub conf: IfConf,
 }
 
 /// The system's network stack (Ethernet, ARP, IPv4, ICMP, UDP, TCP) and the
@@ -344,16 +335,41 @@ pub trait NetStack {
     /// log when packets to ourselves used the whole budget (a storm).
     fn poll(&mut self, link: &mut dyn Link) -> Option<String>;
 
-    /// The interfaces' addresses, in order (`phys` 0, `vlan` None).
-    fn interfaces(&self) -> Vec<IfConf>;
-    fn set_interfaces(&mut self, ifs: Vec<IfSet>);
-    fn routes(&self) -> Vec<RouteConf>;
-    fn set_routes(&mut self, routes: Vec<RouteConf>);
+    /// The NICs' MACs: interface `i < macs.len()` is NIC `i`, VLAN
+    /// interfaces follow.
+    fn set_nics(&mut self, macs: Vec<[u8; 6]>);
+    /// The configuration in effect: the interfaces in order (what each is:
+    /// `phys`, `vlan`) and the static routes.
+    fn config(&self) -> NetConf;
+    /// Put a whole configuration in effect (it lists the NICs, and the VLAN
+    /// interfaces to have): interfaces that stay keep their ARP cache
+    /// unless their addresses change.
+    fn set_config(&mut self, conf: &NetConf) -> Result<(), String>;
+    /// The configuration being edited (not in effect).
+    fn candidate(&self) -> Option<NetConf>;
+    fn set_candidate(&mut self, conf: Option<NetConf>);
+    /// The candidate into effect; unless confirmed within `seconds` (0: no
+    /// limit) it is reverted (`tick`). The revert point is what ran before
+    /// the first apply.
+    fn apply(&mut self, now: u64, seconds: u32) -> Result<(), String>;
+    /// Back to the revert point; Ok(false) if nothing was applied.
+    fn revert(&mut self) -> Result<bool, String>;
+    /// Stop the revert timer; false if none ran.
+    fn confirm(&mut self) -> bool;
+    /// Revert if applied, and drop the candidate.
+    fn discard(&mut self);
+    /// Seconds before an applied candidate is reverted.
+    fn pending(&self, now: u64) -> Option<u64>;
+    /// Whether what runs differs from the revert point.
+    fn applied(&self) -> bool;
+    /// Revert an applied candidate whose time is up; a line for the log.
+    fn tick(&mut self, now: u64) -> Option<String>;
     /// The configuration to boot with for `nics` NICs, from the kernel
     /// command line and grubenv (`env`), and the lines for the boot log.
     fn boot_config(&self, nics: usize, cmdline: &str, env: &dyn Fn(&str) -> Option<String>) -> (NetConf, Vec<String>);
-    /// The grubenv variables that make `conf` the boot configuration.
-    fn config_vars(&self, conf: &NetConf) -> Vec<(String, String)>;
+    /// The grubenv variables that make what runs the boot configuration
+    /// (`net save`; it ends the apply/revert round).
+    fn save(&mut self) -> Vec<(String, String)>;
     /// Application names by owner (connection listings).
     fn set_owner_names(&mut self, names: Vec<&'static str>);
     /// Drop everything `owner` holds (it was stopped or crashed).

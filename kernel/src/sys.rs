@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_util::wire::{Ip, IpFmt};
+use rustros_util::wire::Ip;
 use rustros_api::{
     IfConf, NetConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetError, NetInfo, RawSocket, SocketAddr, StorageInfo, Sys, TcpListener, TcpStream,
     UdpSocket, UpdateInfo, Frame, Verdict,
@@ -14,7 +14,7 @@ use rustros_api::{
 
 use devices::NetDevice;
 
-use rustros_api::module::{Disk, Export, Filesystem, IfSet, Link, NetStack, Runtime, Storage};
+use rustros_api::module::{Disk, Export, Filesystem, Link, NetStack, Runtime, Storage};
 
 use crate::{arch, console, kprintln, modules};
 
@@ -107,8 +107,6 @@ pub struct Kernel {
     /// Boots in a row that did not run stable (from grubenv via GRUB).
     pub unstable_boots: u32,
     pub safe_mode: bool,
-    /// Network configuration being edited, not in effect.
-    pub net_candidate: Option<NetConf>,
     /// Throughput and CPU use.
     pub perf: crate::perf::Perf,
     /// Frames put back on the packet path: (interface, after which module
@@ -117,10 +115,6 @@ pub struct Kernel {
     /// Frames the system's stack sends: they pass the egress hook (shapers)
     /// before the NIC, like forwarded ones. (interface, frame)
     pub stack_tx: alloc::collections::VecDeque<(u8, Vec<u8>)>,
-    /// What ran before the first apply (the revert point).
-    pub net_baseline: Option<NetConf>,
-    /// When an applied candidate is reverted unless confirmed.
-    pub net_deadline: Option<u64>,
     seed: u64,
 }
 
@@ -142,91 +136,40 @@ impl Kernel {
             app_status: Vec::new(),
             unstable_boots: 1,
             safe_mode: false,
-            net_candidate: None,
-            net_baseline: None,
             perf: crate::perf::Perf::default(),
             injected: alloc::collections::VecDeque::new(),
             stack_tx: alloc::collections::VecDeque::new(),
-            net_deadline: None,
             seed: arch::rdtsc() | 1,
         }
     }
 
-    pub fn net_running(&self) -> NetConf {
-        let ifs = self.ifmap.iter().zip(self.stack.interfaces()).map(|(m, f)| IfConf { phys: m.phys as u8, vlan: m.vlan, ..f }).collect();
-        NetConf { ifs, routes: self.stack.routes() }
+    /// The interfaces as the stack has them (after a change to its configuration).
+    pub fn sync_ifmap(&mut self) {
+        self.ifmap = self.stack.config().ifs.iter().map(|f| IfMap { phys: f.phys as usize, vlan: f.vlan }).collect();
     }
 
-    /// Back to the revert point (the candidate and the revert point stay).
-    pub fn net_revert(&mut self) -> bool {
-        self.net_deadline = None;
-        let Some(base) = self.net_baseline.clone() else { return false };
-        match self.net_set_running(&base) {
-            Ok(()) => true,
-            Err(e) => {
-                kprintln!("net: revert failed: {}", e);
-                false
-            }
-        }
-    }
-
-    /// Put a whole network configuration in effect: the NICs keep their
-    /// interfaces (and ARP caches unless their address changes), VLAN
-    /// interfaces come and go as listed.
+    /// Put a whole network configuration in effect (see `NetStack::set_config`).
     pub fn net_set_running(&mut self, net: &NetConf) -> Result<(), String> {
-        let conf = &net.ifs;
-        for r in &net.routes {
-            if r.net & !r.mask != 0 || r.src & !r.src_mask != 0 || r.gw == 0 {
-                return Err(format!("bad route {}/{}", IpFmt(r.net), r.mask.count_ones()));
-            }
-        }
-        let nics = self.nics.len();
-        let mut map: Vec<IfMap> = (0..nics).map(|phys| IfMap { phys, vlan: None }).collect();
-        let mut by_map: Vec<Option<&IfConf>> = alloc::vec![None; nics];
-        for c in conf {
-            let m = IfMap { phys: c.phys as usize, vlan: c.vlan };
-            if m.phys >= nics {
-                return Err(format!("no nic{}", m.phys));
-            }
-            match c.vlan {
-                None => by_map[m.phys] = Some(c),
-                Some(v) if (1..=4094).contains(&v) && !map.contains(&m) => {
-                    map.push(m);
-                    by_map.push(Some(c));
-                }
-                Some(_) => return Err(format!("bad or repeated VLAN {}", c.name())),
-            }
-        }
-        // interfaces that stay keep what they have (their ARP cache too)
-        let old = self.stack.interfaces();
-        let mut ifs = Vec::new();
-        for (i, m) in map.iter().enumerate() {
-            let was = self.ifmap.iter().position(|o| o == m);
-            let conf = match (by_map[i], was) {
-                (Some(c), _) => {
-                    let mut extra: Vec<Ip> = c.extra.iter().copied().filter(|&a| a != 0 && a != c.ip).collect();
-                    rustros_util::sort::sort(&mut extra);
-                    extra.dedup();
-                    IfConf { mtu: c.mtu.clamp(576, 1500), extra, ..c.clone() }
-                }
-                (None, Some(w)) => old[w].clone(),
-                (None, None) => IfConf { mtu: 1500, ..IfConf::default() },
-            };
-            ifs.push(IfSet { was, mac: self.nics[m.phys].mac(), conf });
-        }
-        self.stack.set_interfaces(ifs);
-        self.ifmap = map;
-        self.stack.set_routes(net.routes.clone());
-        Ok(())
+        let r = self.stack.set_config(net);
+        self.sync_ifmap();
+        r
     }
 
     /// Change interface `i`'s addresses (the others stay as they are).
     pub fn set_if(&mut self, i: usize, f: impl FnOnce(&mut IfConf)) {
-        let mut ifs: Vec<IfSet> = self.stack.interfaces().into_iter().enumerate().map(|(n, conf)| IfSet { was: Some(n), mac: [0; 6], conf }).collect();
-        if let Some(s) = ifs.get_mut(i) {
-            f(&mut s.conf);
+        let mut conf = self.stack.config();
+        if let Some(c) = conf.ifs.get_mut(i) {
+            f(c);
         }
-        self.stack.set_interfaces(ifs);
+        let _ = self.net_set_running(&conf);
+    }
+
+    /// An applied candidate that was not confirmed in time goes.
+    pub fn net_tick(&mut self) {
+        if let Some(m) = self.stack.tick(arch::now_ms()) {
+            kprintln!("{}", m);
+            self.sync_ifmap();
+        }
     }
 
     /// A reboot or power off on purpose: not an unstable boot.
@@ -407,7 +350,7 @@ impl Net for Ctx<'_> {
         self.k.stack.nic_info(nic)
     }
     fn extra_addrs(&self, nic: usize) -> Vec<Ip> {
-        self.k.stack.interfaces().get(nic).map(|f| f.extra.clone()).unwrap_or_default()
+        self.k.stack.config().ifs.get(nic).map(|f| f.extra.clone()).unwrap_or_default()
     }
     fn tcp_connections(&self) -> Vec<ConnInfo> {
         self.k.stack.connections()
@@ -674,7 +617,7 @@ impl Admin for Ctx<'_> {
         ok && self.k.boot.as_mut().is_some_and(|b| b.env_set(&[(key, value)]))
     }
     fn net_running(&self) -> NetConf {
-        self.k.net_running()
+        self.k.stack.config()
     }
     fn log_list(&mut self) -> Vec<(u64, u64)> {
         let Some(b) = self.k.boot.as_deref_mut() else { return Vec::new() };
@@ -705,39 +648,38 @@ impl Admin for Ctx<'_> {
         self.k.net_set_running(conf)
     }
     fn net_candidate(&self) -> Option<NetConf> {
-        self.k.net_candidate.clone()
+        self.k.stack.candidate()
     }
     fn net_set_candidate(&mut self, conf: Option<NetConf>) {
-        self.k.net_candidate = conf;
+        self.k.stack.set_candidate(conf);
     }
     fn net_apply(&mut self, seconds: u32) -> Result<(), String> {
-        let cand = self.k.net_candidate.clone().ok_or_else(|| String::from("no candidate configuration"))?;
-        let before = self.k.net_running();
-        self.k.net_set_running(&cand)?;
-        // the revert point is what ran before the first apply
-        if self.k.net_baseline.is_none() {
-            self.k.net_baseline = Some(before);
-        }
-        self.k.net_deadline = (seconds > 0).then(|| arch::now_ms() + seconds as u64 * 1000);
+        let r = self.k.stack.apply(arch::now_ms(), seconds);
+        self.k.sync_ifmap();
+        r?;
         kprintln!("net: candidate applied{}", if seconds > 0 { format!("; reverted in {seconds} s unless confirmed") } else { String::new() });
         Ok(())
     }
     fn net_revert(&mut self) -> bool {
-        self.k.net_revert()
+        let r = self.k.stack.revert();
+        self.k.sync_ifmap();
+        r.unwrap_or_else(|e| {
+            kprintln!("net: revert failed: {}", e);
+            false
+        })
     }
     fn net_confirm(&mut self) -> bool {
-        self.k.net_deadline.take().is_some()
+        self.k.stack.confirm()
     }
     fn net_discard(&mut self) {
-        self.k.net_revert();
-        self.k.net_baseline = None;
-        self.k.net_candidate = None;
+        self.k.stack.discard();
+        self.k.sync_ifmap();
     }
     fn net_pending(&self) -> Option<u64> {
-        self.k.net_deadline.map(|t| t.saturating_sub(arch::now_ms()) / 1000)
+        self.k.stack.pending(arch::now_ms())
     }
     fn net_applied(&self) -> bool {
-        self.k.net_baseline.is_some() && self.k.net_running() != self.k.net_baseline.clone().unwrap_or_default()
+        self.k.stack.applied()
     }
     fn esp_read(&mut self, lba: u64, sectors: usize) -> Option<Vec<u8>> {
         self.k.boot.as_mut()?.esp_read(lba, sectors)
@@ -761,10 +703,7 @@ impl Admin for Ctx<'_> {
     }
     fn net_save(&mut self) -> bool {
         // saving what runs ends the apply/revert round
-        self.k.net_baseline = None;
-        self.k.net_deadline = None;
-        self.k.net_candidate = None;
-        let vars = self.k.stack.config_vars(&self.k.net_running());
+        let vars = self.k.stack.save();
         let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         self.k.boot.as_mut().is_some_and(|b| b.env_set(&refs))
     }

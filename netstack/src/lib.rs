@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+pub mod config;
 pub mod iface;
 pub mod stack;
 pub mod tcp;
