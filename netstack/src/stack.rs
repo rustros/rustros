@@ -7,10 +7,12 @@ use alloc::collections::VecDeque;
 use rustros_util::wire::{be16, be32, checksum};
 use alloc::vec::Vec;
 
-use rustros_api::{ConnInfo, Ip, NetError, NetInfo, RawSocket, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use alloc::string::String;
+use rustros_api::module::{IfSet, NetStack};
+use rustros_api::{ConnInfo, IfConf, Ip, NetError, NetInfo, RawSocket, RouteConf, SocketAddr, TcpListener, TcpStream, UdpSocket};
 
 use crate::Link;
-use crate::iface::{Iface, Ifaces, IpPkt, PROTO_ICMP, PROTO_TCP, PROTO_UDP, parse_udp};
+use crate::iface::{Iface, Ifaces, IpPkt, PROTO_ICMP, PROTO_TCP, PROTO_UDP, Route, parse_udp};
 use crate::tcp::{Handle, State, Tcp};
 
 /// Datagrams queued per socket before new ones are dropped.
@@ -504,6 +506,120 @@ impl Stack {
 
     pub fn raw_close(&mut self, owner: usize, s: RawSocket) {
         self.raw.retain(|r| !(r.id as u64 == s.to_raw() && r.owner == owner));
+    }
+}
+
+// ---------------------------------------------------------------- the kernel's view
+
+impl NetStack for Stack {
+    fn input(&mut self, link: &mut dyn Link, nic: usize, frame: &[u8]) {
+        Stack::input(self, link, nic, frame)
+    }
+    fn poll(&mut self, link: &mut dyn Link) -> Option<String> {
+        Stack::poll(self, link);
+        self.loop_storm.take()
+    }
+    fn interfaces(&self) -> Vec<IfConf> {
+        self.ifs.0.iter().map(|f| IfConf { phys: 0, vlan: None, ip: f.ip, mask: f.mask, gw: f.gw, mtu: f.mtu as u16, extra: f.extra.clone() }).collect()
+    }
+    fn set_interfaces(&mut self, ifs: Vec<IfSet>) {
+        let mut old: Vec<Option<Iface>> = core::mem::take(&mut self.ifs.0).into_iter().map(Some).collect();
+        for (i, s) in ifs.into_iter().enumerate() {
+            let mut f = s.was.and_then(|w| old.get_mut(w)?.take()).unwrap_or_else(|| Iface::new(i, s.mac, 0, 0, 0));
+            let c = s.conf;
+            if (f.ip, f.mask, f.gw) != (c.ip, c.mask, c.gw) {
+                f.arp.clear();
+            }
+            (f.nic, f.ip, f.mask, f.gw, f.mtu, f.extra) = (i, c.ip, c.mask, c.gw, c.mtu as usize, c.extra);
+            self.ifs.0.push(f);
+        }
+    }
+    fn routes(&self) -> Vec<RouteConf> {
+        self.ifs.1.iter().map(|r| RouteConf { net: r.net, mask: r.mask, gw: r.gw, src: r.src, src_mask: r.src_mask }).collect()
+    }
+    fn set_routes(&mut self, routes: Vec<RouteConf>) {
+        self.ifs.1 = routes.into_iter().map(|r| Route { net: r.net, mask: r.mask, gw: r.gw, src: r.src, src_mask: r.src_mask }).collect();
+    }
+    fn set_owner_names(&mut self, names: Vec<&'static str>) {
+        self.owner_names = names;
+    }
+    fn release_owner(&mut self, owner: usize, link: &mut dyn Link) {
+        Stack::release_owner(self, owner, link)
+    }
+    fn nic_info(&self, nic: usize) -> Option<NetInfo> {
+        Stack::nic_info(self, nic)
+    }
+    fn arp_table(&self, now: u64) -> Vec<(Ip, [u8; 6], u64)> {
+        Stack::arp_table(self, now)
+    }
+    fn connections(&self) -> Vec<ConnInfo> {
+        Stack::connections(self)
+    }
+    fn route_from(&self, src: Ip, dst: Ip) -> Option<(usize, Ip)> {
+        Stack::route_from(self, src, dst)
+    }
+    fn neighbor(&mut self, link: &mut dyn Link, nic: usize, ip: Ip) -> Option<[u8; 6]> {
+        Stack::neighbor(self, link, nic, ip)
+    }
+    fn send_packet(&mut self, link: &mut dyn Link, packet: &[u8]) -> bool {
+        Stack::send_packet(self, link, packet)
+    }
+    fn udp_bind(&mut self, owner: usize, link: &mut dyn Link, port: u16) -> R<UdpSocket> {
+        Stack::udp_bind(self, owner, link, port)
+    }
+    fn udp_local_port(&self, owner: usize, s: UdpSocket) -> R<u16> {
+        Stack::udp_local_port(self, owner, s)
+    }
+    fn udp_send_to(&mut self, owner: usize, link: &mut dyn Link, s: UdpSocket, to: SocketAddr, data: &[u8]) -> R<()> {
+        Stack::udp_send_to(self, owner, link, s, to, data)
+    }
+    fn udp_recv_from(&mut self, owner: usize, s: UdpSocket, buf: &mut [u8]) -> R<(usize, SocketAddr)> {
+        Stack::udp_recv_from(self, owner, s, buf)
+    }
+    fn udp_close(&mut self, owner: usize, s: UdpSocket) {
+        Stack::udp_close(self, owner, s)
+    }
+    fn tcp_listen(&mut self, owner: usize, port: u16) -> R<TcpListener> {
+        Stack::tcp_listen(self, owner, port)
+    }
+    fn tcp_unlisten(&mut self, owner: usize, link: &mut dyn Link, l: TcpListener) {
+        Stack::tcp_unlisten(self, owner, link, l)
+    }
+    fn tcp_accept(&mut self, owner: usize, l: TcpListener) -> R<(TcpStream, SocketAddr)> {
+        Stack::tcp_accept(self, owner, l)
+    }
+    fn tcp_connect_from(&mut self, owner: usize, link: &mut dyn Link, src: Ip, to: SocketAddr) -> R<TcpStream> {
+        Stack::tcp_connect_from(self, owner, link, src, to)
+    }
+    fn tcp_local_addr(&self, owner: usize, s: TcpStream) -> R<SocketAddr> {
+        Stack::tcp_local_addr(self, owner, s)
+    }
+    fn tcp_is_connected(&self, owner: usize, s: TcpStream) -> R<bool> {
+        Stack::tcp_is_connected(self, owner, s)
+    }
+    fn tcp_read(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, buf: &mut [u8]) -> R<usize> {
+        Stack::tcp_read(self, owner, link, s, buf)
+    }
+    fn tcp_write(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, data: &[u8]) -> R<usize> {
+        Stack::tcp_write(self, owner, link, s, data)
+    }
+    fn tcp_close(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream) {
+        Stack::tcp_close(self, owner, link, s)
+    }
+    fn tcp_abort(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream) {
+        Stack::tcp_abort(self, owner, link, s)
+    }
+    fn raw_open(&mut self, owner: usize, proto: u8) -> R<RawSocket> {
+        Stack::raw_open(self, owner, proto)
+    }
+    fn raw_recv(&mut self, owner: usize, s: RawSocket, buf: &mut [u8]) -> R<(usize, Ip, u8)> {
+        Stack::raw_recv(self, owner, s, buf)
+    }
+    fn raw_send(&mut self, owner: usize, link: &mut dyn Link, s: RawSocket, dst: Ip, payload: &[u8]) -> R<()> {
+        Stack::raw_send(self, owner, link, s, dst, payload)
+    }
+    fn raw_close(&mut self, owner: usize, s: RawSocket) {
+        Stack::raw_close(self, owner, s)
     }
 }
 

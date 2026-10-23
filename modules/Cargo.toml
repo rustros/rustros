@@ -106,3 +106,6 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.virtio]
 opt-level = 3
+# the boot module's network stack: the data path, as in the kernel before
+[profile.release.package.netstack]
+opt-level = 3

@@ -6,16 +6,15 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use netstack::{Link, Stack};
 use rustros_util::wire::{Ip, IpFmt};
 use rustros_api::{
-    IfConf, NetConf, RouteConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetError, NetInfo, RawSocket, SocketAddr, StorageInfo, Sys, TcpListener, TcpStream,
+    IfConf, NetConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetError, NetInfo, RawSocket, SocketAddr, StorageInfo, Sys, TcpListener, TcpStream,
     UdpSocket, UpdateInfo, Frame, Verdict,
 };
 
 use devices::NetDevice;
 
-use rustros_api::module::{Disk, Export, Filesystem, Runtime, Storage};
+use rustros_api::module::{Disk, Export, Filesystem, IfSet, Link, NetStack, Runtime, Storage};
 
 use crate::{arch, console, kprintln, modules};
 
@@ -88,7 +87,8 @@ pub struct Kernel {
     pub ifmap: Vec<IfMap>,
     pub boot: Option<Box<dyn Storage>>,
     pub cmdline: String,
-    pub stack: Stack,
+    /// The network stack (the boot module's).
+    pub stack: Box<dyn NetStack>,
     /// Module names by id ("" for a free slot).
     pub names: Vec<&'static str>,
     /// Capabilities granted, by app id.
@@ -124,7 +124,7 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    pub fn new(nics: Vec<Box<dyn NetDevice>>, ifmap: Vec<IfMap>, boot: Option<Box<dyn Storage>>, cmdline: String, stack: Stack) -> Kernel {
+    pub fn new(nics: Vec<Box<dyn NetDevice>>, ifmap: Vec<IfMap>, boot: Option<Box<dyn Storage>>, cmdline: String, stack: Box<dyn NetStack>) -> Kernel {
         Kernel {
             nics,
             ifmap,
@@ -152,22 +152,8 @@ impl Kernel {
     }
 
     pub fn net_running(&self) -> NetConf {
-        let ifs = self
-            .ifmap
-            .iter()
-            .zip(&self.stack.ifs.0)
-            .map(|(m, f)| IfConf {
-                phys: m.phys as u8,
-                vlan: m.vlan,
-                ip: f.ip,
-                mask: f.mask,
-                gw: f.gw,
-                mtu: f.mtu as u16,
-                extra: f.extra.clone(),
-            })
-            .collect();
-        let routes = self.stack.ifs.1.iter().map(|r| RouteConf { net: r.net, mask: r.mask, gw: r.gw, src: r.src, src_mask: r.src_mask }).collect();
-        NetConf { ifs, routes }
+        let ifs = self.ifmap.iter().zip(self.stack.interfaces()).map(|(m, f)| IfConf { phys: m.phys as u8, vlan: m.vlan, ..f }).collect();
+        NetConf { ifs, routes: self.stack.routes() }
     }
 
     /// Back to the revert point (the candidate and the revert point stay).
@@ -210,28 +196,36 @@ impl Kernel {
                 Some(_) => return Err(format!("bad or repeated VLAN {}", c.name())),
             }
         }
-        let mut old: Vec<(IfMap, netstack::iface::Iface)> = self.ifmap.iter().copied().zip(core::mem::take(&mut self.stack.ifs.0)).collect();
+        // interfaces that stay keep what they have (their ARP cache too)
+        let old = self.stack.interfaces();
+        let mut ifs = Vec::new();
         for (i, m) in map.iter().enumerate() {
-            let mut f = match old.iter().position(|(o, _)| o == m) {
-                Some(p) => old.swap_remove(p).1,
-                None => netstack::iface::Iface::new(i, self.nics[m.phys].mac(), 0, 0, 0),
-            };
-            f.nic = i;
-            if let Some(c) = by_map[i] {
-                if (f.ip, f.mask, f.gw) != (c.ip, c.mask, c.gw) {
-                    f.arp.clear();
+            let was = self.ifmap.iter().position(|o| o == m);
+            let conf = match (by_map[i], was) {
+                (Some(c), _) => {
+                    let mut extra: Vec<Ip> = c.extra.iter().copied().filter(|&a| a != 0 && a != c.ip).collect();
+                    extra.sort_unstable();
+                    extra.dedup();
+                    IfConf { mtu: c.mtu.clamp(576, 1500), extra, ..c.clone() }
                 }
-                (f.ip, f.mask, f.gw) = (c.ip, c.mask, c.gw);
-                f.mtu = (c.mtu as usize).clamp(576, 1500);
-                f.extra = c.extra.iter().copied().filter(|&a| a != 0 && a != c.ip).collect();
-                f.extra.sort_unstable();
-                f.extra.dedup();
-            }
-            self.stack.ifs.0.push(f);
+                (None, Some(w)) => old[w].clone(),
+                (None, None) => IfConf { mtu: 1500, ..IfConf::default() },
+            };
+            ifs.push(IfSet { was, mac: self.nics[m.phys].mac(), conf });
         }
+        self.stack.set_interfaces(ifs);
         self.ifmap = map;
-        self.stack.ifs.1 = net.routes.iter().map(|r| netstack::iface::Route { net: r.net, mask: r.mask, gw: r.gw, src: r.src, src_mask: r.src_mask }).collect();
+        self.stack.set_routes(net.routes.clone());
         Ok(())
+    }
+
+    /// Change interface `i`'s addresses (the others stay as they are).
+    pub fn set_if(&mut self, i: usize, f: impl FnOnce(&mut IfConf)) {
+        let mut ifs: Vec<IfSet> = self.stack.interfaces().into_iter().enumerate().map(|(n, conf)| IfSet { was: Some(n), mac: [0; 6], conf }).collect();
+        if let Some(s) = ifs.get_mut(i) {
+            f(&mut s.conf);
+        }
+        self.stack.set_interfaces(ifs);
     }
 
     /// A reboot or power off on purpose: not an unstable boot.
@@ -277,8 +271,8 @@ impl Kernel {
     }
 
     /// The stack plus a link to transmit through.
-    pub fn net(&mut self) -> (&mut Stack, NicLink<'_>) {
-        (&mut self.stack, NicLink { tx: &mut self.stack_tx, ifmap: &self.ifmap, seed: &mut self.seed })
+    pub fn net(&mut self) -> (&mut dyn NetStack, NicLink<'_>) {
+        (&mut *self.stack, NicLink { tx: &mut self.stack_tx, ifmap: &self.ifmap, seed: &mut self.seed })
     }
 }
 
@@ -397,7 +391,7 @@ impl Sys for Ctx<'_> {
 
 impl Net for Ctx<'_> {
     fn net_info(&self) -> NetInfo {
-        self.k.stack.info()
+        self.k.stack.nic_info(0).unwrap()
     }
     fn arp_table(&self) -> Vec<(Ip, [u8; 6], u64)> {
         self.k.stack.arp_table(arch::now_ms())
@@ -412,7 +406,7 @@ impl Net for Ctx<'_> {
         self.k.stack.nic_info(nic)
     }
     fn extra_addrs(&self, nic: usize) -> Vec<Ip> {
-        self.k.stack.ifs.0.get(nic).map(|f| f.extra.clone()).unwrap_or_default()
+        self.k.stack.interfaces().get(nic).map(|f| f.extra.clone()).unwrap_or_default()
     }
     fn tcp_connections(&self) -> Vec<ConnInfo> {
         self.k.stack.connections()
@@ -450,7 +444,7 @@ impl Net for Ctx<'_> {
     fn tcp_connect(&mut self, to: SocketAddr) -> Result<TcpStream, NetError> {
         let id = self.id;
         let (st, mut l) = self.k.net();
-        st.tcp_connect(id, &mut l, to)
+        st.tcp_connect_from(id, &mut l, 0, to)
     }
     fn tcp_connect_from(&mut self, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError> {
         let id = self.id;
@@ -609,7 +603,7 @@ impl Packet for Ctx<'_> {
         if_send_offload(&mut self.k.nics, &self.k.ifmap, nic, frame, offload)
     }
     fn route(&self, dst: Ip) -> Option<(usize, Ip)> {
-        self.k.stack.route(dst)
+        self.k.stack.route_from(0, dst)
     }
     fn route_from(&self, src: Ip, dst: Ip) -> Option<(usize, Ip)> {
         self.k.stack.route_from(src, dst)
@@ -665,10 +659,10 @@ impl Admin for Ctx<'_> {
         self.k.boot.as_mut().is_some_and(|b| b.env_set(&[("last_panic", "")]))
     }
     fn net_config(&mut self, ip: Ip, mask: Ip, gw: Ip) {
-        self.k.stack.config(ip, mask, gw);
+        self.k.set_if(0, |c| (c.ip, c.mask, c.gw) = (ip, mask, gw));
     }
     fn net_set_mtu(&mut self, mtu: usize) {
-        self.k.stack.primary().mtu = mtu.clamp(576, 1500);
+        self.k.set_if(0, |c| c.mtu = mtu.clamp(576, 1500) as u16);
     }
     fn boot_net(&self) -> Vec<(String, String)> {
         let Some(b) = self.k.boot.as_ref() else { return Vec::new() };
@@ -774,7 +768,7 @@ impl Admin for Ctx<'_> {
         let mut vars: Vec<(String, String)> = Vec::new();
         let vlans: Vec<String> = self.k.ifmap.iter().filter_map(|m| m.vlan.map(|v| format!("{}.{}", m.phys, v))).collect();
         vars.push((String::from("net_vlans"), vlans.join(",")));
-        let routes: Vec<String> = self.k.stack.ifs.1.iter().map(crate::fmt_route).collect();
+        let routes: Vec<String> = self.k.stack.routes().iter().map(crate::fmt_route).collect();
         vars.push((String::from("net_routes"), routes.join(",")));
         // clear what interfaces that went away left behind
         for i in self.k.ifmap.len()..16 {
@@ -782,7 +776,7 @@ impl Admin for Ctx<'_> {
                 vars.push((format!("net{i}_{k}"), String::new()));
             }
         }
-        for (i, f) in self.k.stack.ifs.0.iter().enumerate() {
+        for (i, f) in self.k.stack.interfaces().iter().enumerate() {
             let p = if i == 0 { String::from("net_") } else { format!("net{i}_") };
             let set = f.ip != 0;
             vars.push((format!("{p}ip"), if set { format!("{}/{}", IpFmt(f.ip), f.mask.count_ones()) } else { String::new() }));

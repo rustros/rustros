@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustros_api::Module;
-use rustros_api::module::{Driver, Export, Storage};
+use rustros_api::module::{Driver, Export, NetStack, Storage};
 use rustros_util::sha256::Sha256;
 
 const MAGIC: &[u8; 8] = b"RRSBNDL1";
@@ -59,14 +59,26 @@ pub fn parse(img: &[u8]) -> Result<Vec<(String, Vec<u8>)>, &'static str> {
     Ok(out)
 }
 
-/// Sort what a boot module exports into apps, drivers and the storage service.
-pub fn take(e: Export, apps: &mut Vec<Box<dyn Module>>, drivers: &mut Vec<Box<dyn Driver>>, storage: &mut Option<Box<dyn Storage>>) {
-    match e {
-        Export::Module(a) => apps.push(a),
-        Export::Driver(d) => drivers.push(d),
-        Export::Storage(s) => *storage = Some(s),
-        Export::Many(v) => v.into_iter().for_each(|e| take(e, apps, drivers, storage)),
-        _ => crate::kprintln!("modules: a boot module holds apps, drivers and storage only"),
+/// What the boot modules provide.
+#[derive(Default)]
+pub struct Boot {
+    pub apps: Vec<Box<dyn Module>>,
+    pub drivers: Vec<Box<dyn Driver>>,
+    pub storage: Option<Box<dyn Storage>>,
+    pub netstack: Option<Box<dyn NetStack>>,
+}
+
+impl Boot {
+    /// Sort what a boot module exports.
+    pub fn take(&mut self, e: Export) {
+        match e {
+            Export::Module(a) => self.apps.push(a),
+            Export::Driver(d) => self.drivers.push(d),
+            Export::Storage(s) => self.storage = Some(s),
+            Export::NetStack(n) => self.netstack = Some(n),
+            Export::Many(v) => v.into_iter().for_each(|e| self.take(e)),
+            _ => crate::kprintln!("modules: a boot module holds apps, drivers, storage and the network stack only"),
+        }
     }
 }
 

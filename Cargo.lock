@@ -846,7 +846,6 @@ dependencies = [
  "dhcp",
  "echo",
  "httpd",
- "netstack",
  "rescue",
  "rustros-api",
  "rustros-util",

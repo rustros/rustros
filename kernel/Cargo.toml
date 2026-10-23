@@ -20,7 +20,6 @@ default = []
 [dependencies]
 rustros-api = { path = "../api" }
 rustros-util = { path = "../util" }
-netstack = { path = "../netstack" }
 devices = { path = "../devices" }
 virtio = { path = "../virtio" }
 rescue = { path = "../apps/rescue", optional = true }

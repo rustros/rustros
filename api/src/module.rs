@@ -47,6 +47,8 @@ pub enum Export {
     /// A file system driver ("ext4", "xfs", ...): the kernel mounts the
     /// files partition with the one that recognises it.
     Filesystem(Box<dyn Filesystem>),
+    /// The system's network stack (a boot module's).
+    NetStack(Box<dyn NetStack>),
 }
 
 /// A file system driver, a module of its own. The kernel lends it the files
@@ -304,4 +306,81 @@ pub trait Runtime {
     fn validate(&self, image: &[u8]) -> Result<(), String>;
     /// A new app instance called `name` running `image`.
     fn instantiate(&mut self, name: &'static str, image: &[u8]) -> Result<Box<dyn Module>, String>;
+}
+
+// ---------------------------------------------------------------- network stack
+
+use crate::sys::{ConnInfo, IfConf, Ip, NetError, NetInfo, RawSocket, RouteConf, SocketAddr, TcpListener, TcpStream, UdpSocket};
+
+/// What the network stack needs from the kernel.
+pub trait Link {
+    fn now_ms(&self) -> u64;
+    /// Transmit one Ethernet frame (without FCS) on interface `nic`. False
+    /// if it cannot be queued.
+    fn send(&mut self, nic: usize, frame: &[u8]) -> bool;
+    /// Not cryptographically strong; fine for ISNs and port numbers.
+    fn random(&mut self) -> u64;
+}
+
+/// An interface for `NetStack::set_interfaces`: the one that was number
+/// `was` (keeping its ARP cache if its addresses stay), or a new one.
+pub struct IfSet {
+    pub was: Option<usize>,
+    pub mac: [u8; 6],
+    /// its addresses (`phys` and `vlan` are the kernel's business)
+    pub conf: IfConf,
+}
+
+/// The system's network stack (Ethernet, ARP, IPv4, ICMP, UDP, TCP) and the
+/// sockets the applications have in it, by owner (the application's id).
+/// The kernel feeds it the frames for us and sends what it sends; a boot
+/// module provides it.
+pub trait NetStack {
+    /// One received frame (plain: no offloads pending) from interface `nic`.
+    fn input(&mut self, link: &mut dyn Link, nic: usize, frame: &[u8]);
+    /// Timers, retransmissions, packets to ourselves. Returns a line for the
+    /// log when packets to ourselves used the whole budget (a storm).
+    fn poll(&mut self, link: &mut dyn Link) -> Option<String>;
+
+    /// The interfaces' addresses, in order (`phys` 0, `vlan` None).
+    fn interfaces(&self) -> Vec<IfConf>;
+    fn set_interfaces(&mut self, ifs: Vec<IfSet>);
+    fn routes(&self) -> Vec<RouteConf>;
+    fn set_routes(&mut self, routes: Vec<RouteConf>);
+    /// Application names by owner (connection listings).
+    fn set_owner_names(&mut self, names: Vec<&'static str>);
+    /// Drop everything `owner` holds (it was stopped or crashed).
+    fn release_owner(&mut self, owner: usize, link: &mut dyn Link);
+
+    fn nic_info(&self, nic: usize) -> Option<NetInfo>;
+    /// (address, MAC, age in ms)
+    fn arp_table(&self, now: u64) -> Vec<(Ip, [u8; 6], u64)>;
+    fn connections(&self) -> Vec<ConnInfo>;
+
+    /// (interface, next hop) towards `dst`, for a packet from `src` (0: any).
+    fn route_from(&self, src: Ip, dst: Ip) -> Option<(usize, Ip)>;
+    /// MAC of `ip` on interface `nic`; None (asking ARP) if not known yet.
+    fn neighbor(&mut self, link: &mut dyn Link, nic: usize, ip: Ip) -> Option<[u8; 6]>;
+    /// Route and send a finished IPv4 packet (its source left alone).
+    fn send_packet(&mut self, link: &mut dyn Link, packet: &[u8]) -> bool;
+
+    fn udp_bind(&mut self, owner: usize, link: &mut dyn Link, port: u16) -> Result<UdpSocket, NetError>;
+    fn udp_local_port(&self, owner: usize, s: UdpSocket) -> Result<u16, NetError>;
+    fn udp_send_to(&mut self, owner: usize, link: &mut dyn Link, s: UdpSocket, to: SocketAddr, data: &[u8]) -> Result<(), NetError>;
+    fn udp_recv_from(&mut self, owner: usize, s: UdpSocket, buf: &mut [u8]) -> Result<(usize, SocketAddr), NetError>;
+    fn udp_close(&mut self, owner: usize, s: UdpSocket);
+    fn tcp_listen(&mut self, owner: usize, port: u16) -> Result<TcpListener, NetError>;
+    fn tcp_unlisten(&mut self, owner: usize, link: &mut dyn Link, l: TcpListener);
+    fn tcp_accept(&mut self, owner: usize, l: TcpListener) -> Result<(TcpStream, SocketAddr), NetError>;
+    fn tcp_connect_from(&mut self, owner: usize, link: &mut dyn Link, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError>;
+    fn tcp_local_addr(&self, owner: usize, s: TcpStream) -> Result<SocketAddr, NetError>;
+    fn tcp_is_connected(&self, owner: usize, s: TcpStream) -> Result<bool, NetError>;
+    fn tcp_read(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, buf: &mut [u8]) -> Result<usize, NetError>;
+    fn tcp_write(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, data: &[u8]) -> Result<usize, NetError>;
+    fn tcp_close(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream);
+    fn tcp_abort(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream);
+    fn raw_open(&mut self, owner: usize, proto: u8) -> Result<RawSocket, NetError>;
+    fn raw_recv(&mut self, owner: usize, s: RawSocket, buf: &mut [u8]) -> Result<(usize, Ip, u8), NetError>;
+    fn raw_send(&mut self, owner: usize, link: &mut dyn Link, s: RawSocket, dst: Ip, payload: &[u8]) -> Result<(), NetError>;
+    fn raw_close(&mut self, owner: usize, s: RawSocket);
 }

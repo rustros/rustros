@@ -101,6 +101,7 @@ name = "boot-mod"
 version = "0.1.0"
 dependencies = [
  "dhcp",
+ "netstack",
  "rescue",
  "rustros-module",
  "storage",
@@ -591,6 +592,14 @@ version = "0.1.0"
 dependencies = [
  "nat",
  "rustros-module",
+]
+
+[[package]]
+name = "netstack"
+version = "0.1.0"
+dependencies = [
+ "rustros-api",
+ "rustros-util",
 ]
 
 [[package]]

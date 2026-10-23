@@ -1,5 +1,6 @@
-//! RustROS kernel: boots, brings up the console, its boot modules (the disk
-//! driver among them) and virtio-net, runs the network stack and polls the built-in applications (see rustros_api::sys).
+//! RustROS kernel: boots, brings up the console and its boot modules (the
+//! drivers, the storage service, the network stack), runs the packet path
+//! and polls the applications (see rustros_api::sys).
 #![no_std]
 #![no_main]
 
@@ -30,9 +31,9 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use rustros_api::{Module, Caps, Frame, HEADROOM, Offload, Verdict};
-use rustros_api::module::Storage;
+use rustros_api::module::{IfSet, Storage};
+use rustros_api::{IfConf, RouteConf};
 use devices::{BlockDevice, NetDevice};
-use netstack::Stack;
 use rustros_util::wire::{IpFmt, cmdline_get, parse_cidr, parse_ip};
 
 use modules::Slot;
@@ -219,7 +220,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     kprintln!("cmdline: {}", shown.join(" "));
 
     // the boot modules: the drivers probe the devices, the apps start later
-    let (mut boot_apps, mut drivers, mut storage) = (Vec::new(), Vec::new(), None);
+    let mut bm = bootmods::Boot::default();
     match bootmods::bundle().map(bootmods::parse) {
         Some(Ok(mods)) => {
             for (name, img) in mods {
@@ -230,7 +231,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 match r {
                     Ok(mut m) => {
                         if let Some(e) = m.export.take() {
-                            bootmods::take(e, &mut boot_apps, &mut drivers, &mut storage);
+                            bm.take(e);
                         }
                         // its code serves them for good
                         Box::leak(Box::new(m));
@@ -248,12 +249,12 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     virtio::pci::scan(|d| pci.push(d));
     let mut disks = Vec::new();
     for d in pci.iter().filter(|d| d.class != 2) {
-        if let Some((rustros_api::module::Device::Block(dev), driver)) = drivers::probe(&mut drivers, *d, "") {
+        if let Some((rustros_api::module::Device::Block(dev), driver)) = drivers::probe(&mut bm.drivers, *d, "") {
             disks.push(drivers::Disk { dev, driver });
         }
     }
     let disks: Vec<Box<dyn BlockDevice>> = disks.into_iter().map(|d| Box::new(d) as Box<dyn BlockDevice>).collect();
-    let mut boot = match storage {
+    let mut boot = match bm.storage.take() {
         Some(mut s) => match s.open(drivers::HW, &cmdline, disks, arch::rdtsc()) {
             Ok(()) => Some(s),
             Err(e) => {
@@ -284,7 +285,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let options = if offloads { "" } else { "offload=off" };
     let mut nics: Vec<Box<dyn NetDevice>> = Vec::new();
     for d in pci.iter().filter(|d| d.class == 2) {
-        if let Some((rustros_api::module::Device::Net(n), _)) = drivers::probe(&mut drivers, *d, options) {
+        if let Some((rustros_api::module::Device::Net(n), _)) = drivers::probe(&mut bm.drivers, *d, options) {
             nics.push(n);
         }
     }
@@ -296,13 +297,16 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         kprintln!("net: nic{} {} mac {}", i, n.kind(), rustros_util::wire::MacFmt(n.mac()));
     }
 
-    let mut stack = Stack::new(nics[0].mac(), ip, mask, gw);
+    let Some(mut stack) = bm.netstack.take() else {
+        kprintln!("no network stack (boot modules), halting");
+        arch::halt_forever();
+    };
+    // the interfaces: the NICs, then the VLANs
+    let mut ifs: Vec<IfConf> = (0..nics.len()).map(|_| IfConf { mtu: 1500, ..IfConf::default() }).collect();
+    (ifs[0].ip, ifs[0].mask, ifs[0].gw) = (ip, mask, gw);
     if let Some(mtu) = cmdline_get(&cmdline, "mtu").and_then(|m| m.parse::<usize>().ok()) {
-        stack.primary().mtu = mtu.clamp(576, 1500);
-        kprintln!("net: mtu {}", stack.primary().mtu);
-    }
-    for n in &nics[1..] {
-        stack.add_iface(n.mac());
+        ifs[0].mtu = mtu.clamp(576, 1500) as u16;
+        kprintln!("net: mtu {}", ifs[0].mtu);
     }
     let mut ifmap: Vec<sys::IfMap> = (0..nics.len()).map(|phys| sys::IfMap { phys, vlan: None }).collect();
     // VLAN interfaces: "vlans=0.109,1.20" on the command line, else net_vlans in grubenv
@@ -311,26 +315,29 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         let parsed = v.split_once('.').and_then(|(p, id)| Some((p.parse::<usize>().ok()?, id.parse::<u16>().ok()?)));
         match parsed {
             Some((phys, vid)) if phys < nics.len() && (1..=4094).contains(&vid) && !ifmap.contains(&sys::IfMap { phys, vlan: Some(vid) }) => {
-                stack.add_iface(nics[phys].mac());
+                ifs.push(IfConf { mtu: 1500, ..IfConf::default() });
                 ifmap.push(sys::IfMap { phys, vlan: Some(vid) });
                 kprintln!("net: nic{} is VLAN {} on nic{}", ifmap.len() - 1, vid, phys);
             }
             _ => kprintln!("net: bad VLAN '{}' (want <nic>.<id>)", v),
         }
     }
-    net_config_extra(&mut stack, &cmdline, boot.as_deref());
+    net_config_extra(&mut ifs, &cmdline, boot.as_deref());
+    stack.set_interfaces(ifs.into_iter().zip(&ifmap).map(|(conf, m)| IfSet { was: None, mac: nics[m.phys].mac(), conf }).collect());
     // static routes: "routes=10.9.0.0/16>10.20.0.1,0.0.0.0/0>gw<10.20.0.1/32,..."
     // or net_routes in grubenv
     let routes = cmdline_get(&cmdline, "routes").map(String::from).or_else(|| boot.as_ref().and_then(|b| b.env("net_routes")).map(String::from));
+    let mut rts = Vec::new();
     for r in routes.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()) {
         match parse_route(r) {
             Some(rt) => {
-                stack.ifs.1.push(rt);
                 kprintln!("net: route {}", fmt_route(&rt).replace('>', " via ").replace('<', " from "));
+                rts.push(rt);
             }
             None => kprintln!("net: bad route '{}' (want a.b.c.d/n>gateway[<source/n])", r),
         }
     }
+    stack.set_routes(rts);
     let mut k = Kernel::new(nics, ifmap, boot, cmdline, stack);
     // boot-loop protection: GRUB appends an "x" to boot_count on every boot
     k.unstable_boots = cmdline_get(&k.cmdline, "rustros.boots").map_or(1, |b| b.len() as u32).max(1);
@@ -358,12 +365,12 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
 
     let mut slots: Vec<Slot> = make_apps().into_iter().map(Slot::Builtin).collect();
-    slots.extend(boot_apps.into_iter().map(Slot::Boot));
+    slots.extend(bm.apps.into_iter().map(Slot::Boot));
     k.names = slots.iter_mut().map(|s| s.app().map_or("", |a| a.name())).collect();
     // boot modules get what they ask for
     k.caps = slots.iter_mut().map(|s| s.app().map_or(Caps::NONE, |a| a.caps())).collect();
     k.builtin_names = k.names.clone();
-    k.stack.owner_names = k.names.clone();
+    k.stack.set_owner_names(k.names.clone());
     kprintln!("modules: {} (boot modules)", k.names.join(", "));
     for id in 0..slots.len() {
         modules::call(&mut k, &mut slots, id, |app, ctx| app.start(ctx));
@@ -406,8 +413,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
         {
             let (st, mut link) = k.net();
-            st.poll(&mut link);
-            if let Some(m) = st.loop_storm.take() {
+            if let Some(m) = st.poll(&mut link) {
                 // at most one a second
                 static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                 let now = arch::now_ms();
@@ -515,13 +521,13 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
 /// other NICs, from the command line (`extra=`, `ip1=`, `gw1=`, `mtu1=`,
 /// `extra1=`, ...) or else from grubenv (`net_extra`, `net1_ip`, ...,
 /// written by `save`).
-fn net_config_extra(stack: &mut Stack, cmdline: &str, env: Option<&dyn Storage>) {
-    for nic in 0..stack.ifs.0.len() {
+fn net_config_extra(ifs: &mut [IfConf], cmdline: &str, env: Option<&dyn Storage>) {
+    for nic in 0..ifs.len() {
         let (c, e) = if nic == 0 { (String::new(), String::from("net_")) } else { (format!("{nic}"), format!("net{nic}_")) };
         let get = |k: &str| -> Option<String> {
             cmdline_get(cmdline, &format!("{k}{c}")).map(String::from).or_else(|| env.and_then(|u| u.env(&format!("{e}{k}"))).map(String::from))
         };
-        let f = &mut stack.ifs.0[nic];
+        let f = &mut ifs[nic];
         if nic > 0 {
             if let Some((ip, mask)) = get("ip").as_deref().and_then(parse_cidr) {
                 f.ip = ip;
@@ -529,7 +535,7 @@ fn net_config_extra(stack: &mut Stack, cmdline: &str, env: Option<&dyn Storage>)
                 f.gw = get("gw").as_deref().and_then(parse_ip).unwrap_or(0);
             }
             if let Some(mtu) = get("mtu").and_then(|m| m.parse::<usize>().ok()) {
-                f.mtu = mtu.clamp(576, 1500);
+                f.mtu = mtu.clamp(576, 1500) as u16;
             }
         }
         if let Some(list) = get("extra") {
@@ -546,7 +552,7 @@ fn net_config_extra(stack: &mut Stack, cmdline: &str, env: Option<&dyn Storage>)
 }
 
 /// A route as stored: "net/n>gw" or "net/n>gw<src/n".
-fn parse_route(r: &str) -> Option<netstack::iface::Route> {
+fn parse_route(r: &str) -> Option<RouteConf> {
     let (r, src) = match r.split_once('<') {
         Some((r, s)) => (r, Some(parse_cidr(s)?)),
         None => (r, None),
@@ -554,10 +560,10 @@ fn parse_route(r: &str) -> Option<netstack::iface::Route> {
     let (n, g) = r.split_once('>')?;
     let ((net, mask), gw) = (parse_cidr(n)?, parse_ip(g)?);
     let (src, src_mask) = src.unwrap_or((0, 0));
-    (net & !mask == 0 && src & !src_mask == 0).then_some(netstack::iface::Route { net, mask, gw, src, src_mask })
+    (net & !mask == 0 && src & !src_mask == 0).then_some(RouteConf { net, mask, gw, src, src_mask })
 }
 
-pub fn fmt_route(r: &netstack::iface::Route) -> String {
+pub fn fmt_route(r: &RouteConf) -> String {
     let mut s = format!("{}/{}>{}", IpFmt(r.net), r.mask.count_ones(), IpFmt(r.gw));
     if r.src_mask != 0 {
         s += &format!("<{}/{}", IpFmt(r.src), r.src_mask.count_ones());

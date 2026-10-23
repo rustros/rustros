@@ -5,7 +5,7 @@
 - 一张 raw 盘同时支持 **BIOS 和 UEFI** 启动（GRUB 2 + multiboot2）
 - 面向 KVM/VPS：**virtio-net**、**virtio-blk**，modern（1.0）和 legacy 设备都支持
 - **在线更新**：通过网络上传新内核写入备用槽，试启动一次，确认后才切换；不确认就自动回滚
-- **内核保持在 256 KiB 以内**：内核只做内存、中断、协议栈和模块加载；设备驱动（virtio-blk、virtio-net）、存储服务（分区、kvstore、A/B 槽、开机日志）、rescue、dhcp、updater 是随内核一起放在槽里的引导模块，文件系统驱动（ext4）、应用、WebAssembly 运行时都是可以在线安装和更新的模块
+- **内核保持在 256 KiB 以内**：内核只做内存、中断、包转发路径和模块加载；设备驱动（virtio-blk、virtio-net）、协议栈、存储服务（分区、kvstore、A/B 槽、开机日志）、rescue、dhcp、updater 是随内核一起放在槽里的引导模块，文件系统驱动（ext4）、应用、WebAssembly 运行时都是可以在线安装和更新的模块
 - unsafe 只出现在 `kernel/`（以及 `wasmhost` 的一处）；其余 crate 和应用都是 `#![forbid(unsafe_code)]`
 
 ## 目录结构
@@ -15,7 +15,7 @@ kernel/        HAL（启动、CPU、内存、控制台、PCI、virtio、看门�
 api/           rustros-api：应用接口 App/Sys、类型、错误码、WebAssembly ABI（无依赖）
 util/          rustros-util：给应用用的工具：Conn、地址和报文工具、SHA-256/HMAC
 devices/       设备接口：BlockDevice、NetDevice
-netstack/      协议栈：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发
+netstack/      协议栈（在引导模块里）：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发
 kvstore/       键值存储引擎（断电安全）
 storage/       存储服务（在引导模块里）：GPT 分区、kvstore、A/B 槽与 grubenv、开机日志、files 分区
 virtio/        virtio-pci 传输层、PCI 配置空间、virtio-blk 和 virtio-net 驱动（在引导模块里）
@@ -30,7 +30,8 @@ tools/         mkimg.py 生成 raw 盘；pack.py 把内核打成自解压 ELF（
 
 ```
 应用 ──► api + util
-kernel ──► netstack, storage, slots, wasmhost ──► api / util / devices
+kernel ──► api / util / devices / virtio::pci
+引导模块 ──► virtio, storage, netstack, rescue, dhcp, updater ──► api / util / devices
 ```
 
 除了 `kernel`，所有 crate 都是 `#![forbid(unsafe_code)]`，`wasmhost` 例外，它有一处 unsafe，用来在一次 guest 调用期间把 `Sys` 借给 host 函数。不碰硬件的服务（kvstore、slots、storage）都可以在宿主机上做单元测试：

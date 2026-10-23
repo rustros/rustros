@@ -443,7 +443,7 @@ fn set_slot(k: &mut Kernel, id: usize, name: &'static str, caps: Caps) {
     }
     k.names[id] = name;
     k.caps[id] = caps;
-    k.stack.owner_names = k.names.clone();
+    k.stack.set_owner_names(k.names.clone());
 }
 
 /// Apply queued installs, switches and removals.
