@@ -32,6 +32,7 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use rustros_api::{Module, Caps, Frame, HEADROOM, Offload, Verdict};
+use rustros_api::module::Storage;
 use devices::{BlockDevice, NetDevice};
 use netstack::Stack;
 use rustros_util::wire::{IpFmt, cmdline_get, parse_cidr, parse_ip};
@@ -56,7 +57,7 @@ impl<T> Global<T> {
 }
 
 /// Where `crash` records its reason: the boot disk, once it is known.
-static CRASH_SINK: Global<*mut sys::Boot> = Global::new(core::ptr::null_mut());
+static CRASH_SINK: Global<Option<*mut dyn Storage>> = Global::new(None);
 static CRASHING: AtomicBool = AtomicBool::new(false);
 const CRASH_TEXT_MAX: usize = 300;
 
@@ -96,18 +97,15 @@ pub fn crash(args: fmt::Arguments) -> ! {
         let _ = write!(msg, "up {}s: {}", arch::now_ms() / 1000, args);
         let text = core::str::from_utf8(&msg.buf[..msg.len]).unwrap_or("?");
         // Safety: we never return to whatever was using the boot disk.
-        let sink = unsafe { *CRASH_SINK.get() };
-        if let Some(b) = unsafe { sink.as_mut() } {
+        if let Some(b) = unsafe { (*CRASH_SINK.get()).and_then(|p| p.as_mut()) } {
             // a native module that crashes is switched off at the next boot
             let culprit = modules::current_native().unwrap_or("");
-            if b.upd.set_vars(&mut *b.disk, &[("last_panic", text), ("crash_app", culprit)]) {
+            if b.env_set(&[("last_panic", text), ("crash_app", culprit)]) {
                 kprintln!("crash recorded in grubenv{}", if culprit.is_empty() { "" } else { " (native app)" });
             }
             kprintln!("rebooting in 2 s");
             // the last words, for `log prev` after the reboot
-            if let Some(l) = b.log.as_mut() {
-                l.flush(&mut *b.disk);
-            }
+            klog::flush(b);
         } else {
             kprintln!("rebooting in 2 s");
         }
@@ -223,7 +221,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     kprintln!("cmdline: {}", shown.join(" "));
 
     // the boot modules: the drivers probe the devices, the apps start later
-    let (mut boot_apps, mut drivers) = (Vec::new(), Vec::new());
+    let (mut boot_apps, mut drivers, mut storage) = (Vec::new(), Vec::new(), None);
     match bootmods::bundle().map(bootmods::parse) {
         Some(Ok(mods)) => {
             for (name, img) in mods {
@@ -234,7 +232,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 match r {
                     Ok(mut m) => {
                         if let Some(e) = m.export.take() {
-                            bootmods::take(e, &mut boot_apps, &mut drivers);
+                            bootmods::take(e, &mut boot_apps, &mut drivers, &mut storage);
                         }
                         // its code serves them for good
                         Box::leak(Box::new(m));
@@ -256,59 +254,24 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             drivers::probe(&mut drivers, d, &mut disks);
         }
     });
-    let boot = match slots::Updater::new(&cmdline, disks) {
-        Ok((mut disk, upd)) => {
-            kprintln!("disk: running slot {}{}", upd.slot, if upd.trial { " (trial boot)" } else { "" });
-            if let Some(p) = upd.get("last_panic") {
-                kprintln!("disk: last crash: {}", p);
+    let disks: Vec<Box<dyn BlockDevice>> = disks.into_iter().map(|d| Box::new(d) as Box<dyn BlockDevice>).collect();
+    let mut boot = match storage {
+        Some(mut s) => match s.open(drivers::HW, &cmdline, disks, arch::rdtsc()) {
+            Ok(()) => Some(s),
+            Err(e) => {
+                kprintln!("disk: online update and storage disabled: {}", e);
+                None
             }
-            let store = match storage::open(&mut disk, arch::rdtsc()) {
-                Ok((store, part)) => {
-                    if part.moved_backup {
-                        kprintln!("storage: disk is {} MiB; moved the backup GPT to its end", disk.sectors() / 2048);
-                    }
-                    if part.created {
-                        kprintln!("storage: created data partition, {} MiB at {} MiB", part.sectors / 2048, part.start / 2048);
-                    }
-                    if let Some((start, n)) = part.cache {
-                        kprintln!("storage: cache partition {} MiB at {} MiB", n / 2048, start / 2048);
-                    }
-                    let (live, _, half) = store.usage();
-                    kprintln!(
-                        "storage: data partition {} MiB, store {} MiB, {} keys / {} bytes",
-                        part.sectors / 2048,
-                        half / 1024,
-                        store.keys("").count(),
-                        live
-                    );
-                    Some((store, part))
-                }
-                Err(e) => {
-                    kprintln!("storage: unavailable: {}", e);
-                    None
-                }
-            };
-            // the console log goes to the start of the cache partition
-            let mut log = store.as_ref().and_then(|(_, part)| part.cache).and_then(|(start, n)| klog::DiskLog::open(&mut disk, start, n));
-            match log.as_mut() {
-                Some(l) => {
-                    kprintln!("log: this is boot {}; the last {} boots' console logs are kept", l.seq, klog::SLOTS);
-                    l.flush(&mut disk);
-                }
-                None => kprintln!("log: no cache partition, the console log is not kept"),
-            }
-            // the files partition: its file system is a driver module's (mounted when it loads)
-            let files = store.as_ref().and_then(|(_, part)| part.files);
-            if let Some((_, n)) = files {
-                kprintln!("storage: files partition {} MiB", n >> 11);
-            }
-            Some(sys::Boot { disk: Box::new(disk), upd, store, log, files })
-        }
-        Err(e) => {
-            kprintln!("disk: online update and storage disabled: {}", e);
+        },
+        None => {
+            kprintln!("disk: no storage service (boot modules), online update and storage disabled");
             None
         }
     };
+    if let Some(b) = boot.as_deref_mut() {
+        // the console log so far
+        klog::flush(b);
+    }
 
     let (ip, mask) = cmdline_get(&cmdline, "ip").and_then(parse_cidr).unwrap_or((0, 0));
     let gw = cmdline_get(&cmdline, "gw").and_then(parse_ip).unwrap_or(0);
@@ -319,7 +282,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
     // NIC offloads (TSO / checksums) unless turned off: "offload=off" on the
     // command line or net_offload=off in grubenv
-    let offloads = cmdline_get(&cmdline, "offload").or_else(|| boot.as_ref().and_then(|b| b.upd.get("net_offload"))) != Some("off");
+    let offloads = cmdline_get(&cmdline, "offload").or_else(|| boot.as_ref().and_then(|b| b.env("net_offload"))) != Some("off");
     let nics: Vec<Box<dyn NetDevice>> = nets.iter().filter_map(|d| virtio_net::VirtioNet::new(d, offloads)).map(|n| Box::new(n) as Box<dyn NetDevice>).collect();
     if nics.is_empty() {
         kprintln!("no usable virtio-net device found ({} seen, messages above), halting", nets.len());
@@ -339,7 +302,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
     let mut ifmap: Vec<sys::IfMap> = (0..nics.len()).map(|phys| sys::IfMap { phys, vlan: None }).collect();
     // VLAN interfaces: "vlans=0.109,1.20" on the command line, else net_vlans in grubenv
-    let vlans = cmdline_get(&cmdline, "vlans").map(String::from).or_else(|| boot.as_ref().and_then(|b| b.upd.get("net_vlans")).map(String::from));
+    let vlans = cmdline_get(&cmdline, "vlans").map(String::from).or_else(|| boot.as_ref().and_then(|b| b.env("net_vlans")).map(String::from));
     for v in vlans.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()) {
         let parsed = v.split_once('.').and_then(|(p, id)| Some((p.parse::<usize>().ok()?, id.parse::<u16>().ok()?)));
         match parsed {
@@ -351,10 +314,10 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             _ => kprintln!("net: bad VLAN '{}' (want <nic>.<id>)", v),
         }
     }
-    net_config_extra(&mut stack, &cmdline, boot.as_ref().map(|b| &b.upd));
+    net_config_extra(&mut stack, &cmdline, boot.as_deref());
     // static routes: "routes=10.9.0.0/16>10.20.0.1,0.0.0.0/0>gw<10.20.0.1/32,..."
     // or net_routes in grubenv
-    let routes = cmdline_get(&cmdline, "routes").map(String::from).or_else(|| boot.as_ref().and_then(|b| b.upd.get("net_routes")).map(String::from));
+    let routes = cmdline_get(&cmdline, "routes").map(String::from).or_else(|| boot.as_ref().and_then(|b| b.env("net_routes")).map(String::from));
     for r in routes.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()) {
         match parse_route(r) {
             Some(rt) => {
@@ -369,11 +332,11 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     k.unstable_boots = cmdline_get(&k.cmdline, "rustros.boots").map_or(1, |b| b.len() as u32).max(1);
     k.safe_mode = k.unstable_boots >= SAFE_MODE_AT;
     if let Some(b) = k.boot.as_mut() {
-        if let Some(from) = b.upd.get("rolled_back").map(String::from) {
-            let to = b.upd.slot;
+        if let Some(from) = b.env("rolled_back").map(String::from) {
+            let to = b.slot().0;
             let why = format!("kernel slot {from} did not come up 4 times in a row; GRUB rolled back to slot {to}");
             kprintln!("boot: {}", why);
-            b.upd.set_vars(&mut *b.disk, &[("last_panic", &why), ("rolled_back", "")]);
+            b.env_set(&[("last_panic", &why), ("rolled_back", "")]);
         }
     }
     if k.unstable_boots > 1 {
@@ -381,7 +344,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
     if let Some(b) = k.boot.as_mut() {
         // Safety: `k` lives on this stack frame until reboot and never moves.
-        unsafe { *CRASH_SINK.get() = b as *mut sys::Boot };
+        unsafe { *CRASH_SINK.get() = Some(&mut **b as *mut dyn Storage) };
     }
     let mut hw_watchdog = watchdog::Esb::probe();
     match &hw_watchdog {
@@ -498,17 +461,15 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         if !stable && now >= STABLE_MS {
             stable = true;
             if let Some(b) = k.boot.as_mut() {
-                b.upd.set_vars(&mut *b.disk, &[("boot_count", "")]);
+                b.env_set(&[("boot_count", "")]);
             }
         }
         if now - status_at >= 1000 {
             status_at = now;
             modules::refresh_status(&mut k, &mut slots);
             k.perf.tick(&k.nics, &k.names);
-            if let Some(b) = k.boot.as_mut() {
-                if let Some(l) = b.log.as_mut() {
-                    l.flush(&mut *b.disk);
-                }
+            if let Some(b) = k.boot.as_deref_mut() {
+                klog::flush(b);
             }
         }
         if k.trial() {
@@ -550,11 +511,11 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
 /// other NICs, from the command line (`extra=`, `ip1=`, `gw1=`, `mtu1=`,
 /// `extra1=`, ...) or else from grubenv (`net_extra`, `net1_ip`, ...,
 /// written by `save`).
-fn net_config_extra(stack: &mut Stack, cmdline: &str, env: Option<&slots::Updater>) {
+fn net_config_extra(stack: &mut Stack, cmdline: &str, env: Option<&dyn Storage>) {
     for nic in 0..stack.ifs.0.len() {
         let (c, e) = if nic == 0 { (String::new(), String::from("net_")) } else { (format!("{nic}"), format!("net{nic}_")) };
         let get = |k: &str| -> Option<String> {
-            cmdline_get(cmdline, &format!("{k}{c}")).map(String::from).or_else(|| env.and_then(|u| u.get(&format!("{e}{k}"))).map(String::from))
+            cmdline_get(cmdline, &format!("{k}{c}")).map(String::from).or_else(|| env.and_then(|u| u.env(&format!("{e}{k}"))).map(String::from))
         };
         let f = &mut stack.ifs.0[nic];
         if nic > 0 {

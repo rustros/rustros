@@ -17,7 +17,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::sys::{KvError, Module};
+use crate::sys::{KvError, Module, StorageInfo};
 
 pub const ENTRY: &str = "rustros_module_init";
 
@@ -42,6 +42,8 @@ pub enum Export {
     Many(Vec<Export>),
     /// A device driver ("virtio-blk"): the kernel offers it the PCI functions.
     Driver(Box<dyn Driver>),
+    /// The boot disk's services (a boot module's).
+    Storage(Box<dyn Storage>),
     /// A file system driver ("ext4", "xfs", ...): the kernel mounts the
     /// files partition with the one that recognises it.
     Filesystem(Box<dyn Filesystem>),
@@ -92,6 +94,21 @@ pub trait Disk {
     }
 }
 
+impl<T: Disk + ?Sized> Disk for Box<T> {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        (**self).read(lba, buf)
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> bool {
+        (**self).write(lba, buf)
+    }
+    fn sectors(&self) -> u64 {
+        (**self).sectors()
+    }
+    fn read_only(&self) -> bool {
+        (**self).read_only()
+    }
+}
+
 /// A PCI function the kernel found.
 #[derive(Clone, Copy)]
 pub struct PciAddr {
@@ -118,6 +135,53 @@ pub trait Driver {
     fn name(&self) -> &'static str;
     /// Drive `dev` if it is this driver's kind of device.
     fn probe(&mut self, hw: &'static dyn Hw, dev: PciAddr) -> Option<Device>;
+}
+
+/// The boot disk's services: grubenv and the kernel slots, the system
+/// key-value store, the console log kept on disk, the files partition. A
+/// boot module provides it; the kernel calls it for the system calls.
+pub trait Storage {
+    /// Take the boot disk among `disks` (the one with the slots the command
+    /// line names) and open what is on it (progress to `hw.log`).
+    fn open(&mut self, hw: &'static dyn Hw, cmdline: &str, disks: Vec<Box<dyn Disk>>, seed: u64) -> Result<(), String>;
+
+    /// The slot running ('a' or 'b'), and whether this is its trial boot.
+    fn slot(&self) -> (char, bool);
+    /// How big a kernel image a slot takes.
+    fn slot_bytes(&self) -> u64;
+    /// grubenv
+    fn env(&self, key: &str) -> Option<&str>;
+    fn env_vars(&self) -> Vec<(String, String)>;
+    /// Set several (an empty value removes one) in one write.
+    fn env_set(&mut self, vars: &[(&str, &str)]) -> bool;
+    /// A new kernel into the other slot: begin, write the image in pieces,
+    /// commit (the next boot tries it); `confirm` keeps the slot on trial.
+    fn update_begin(&mut self) -> bool;
+    fn update_write(&mut self, data: &[u8]) -> bool;
+    fn update_commit(&mut self) -> bool;
+    fn confirm(&mut self) -> bool;
+
+    /// The system key-value store (full keys, with the app's prefix).
+    fn kv_get(&self, key: &str) -> Option<&[u8]>;
+    fn kv_keys(&self, prefix: &str) -> Vec<String>;
+    fn kv_put(&mut self, key: &str, value: &[u8]) -> Result<(), KvError>;
+    fn kv_delete(&mut self, key: &str) -> Result<bool, KvError>;
+    fn kv_info(&self) -> Option<StorageInfo>;
+
+    /// Console output for this boot's log on disk.
+    fn log_write(&mut self, text: &[u8]);
+    /// This boot's number in the log.
+    fn log_seq(&self) -> Option<u64>;
+    /// Boots with a log: (boot number, bytes).
+    fn log_list(&mut self) -> Vec<(u64, u64)>;
+    fn log_read(&mut self, seq: u64) -> Option<Vec<u8>>;
+
+    /// Call `f` with the files partition (false: there is none).
+    fn files(&mut self, f: &mut dyn FnMut(&mut dyn Disk)) -> bool;
+    /// Sectors of the ESP (only there) and of the boot area below 64 MiB.
+    fn esp_read(&mut self, lba: u64, sectors: usize) -> Option<Vec<u8>>;
+    fn esp_write(&mut self, lba: u64, data: &[u8]) -> bool;
+    fn boot_area_read(&mut self, lba: u64, buf: &mut [u8]) -> bool;
 }
 
 /// A device a driver drives.

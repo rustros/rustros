@@ -1,5 +1,5 @@
 //! Boot modules: the modules that come with the kernel (one binary with the
-//! disk driver, rescue, dhcp and the updater, LZ4-compressed), in its image
+//! disk driver, the storage service, rescue, dhcp and the updater, LZ4-compressed), in its image
 //! after the ELF. GRUB loads them with the kernel (tools/pack.py makes them
 //! a segment of it), so they are there before any disk is. They start before
 //! the installed modules, in safe mode too, and are updated and rolled back
@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustros_api::Module;
-use rustros_api::module::{Driver, Export};
+use rustros_api::module::{Driver, Export, Storage};
 use rustros_util::sha256::Sha256;
 
 const MAGIC: &[u8; 8] = b"RRSBNDL1";
@@ -59,13 +59,14 @@ pub fn parse(img: &[u8]) -> Result<Vec<(String, Vec<u8>)>, &'static str> {
     Ok(out)
 }
 
-/// Sort what a boot module exports into apps and drivers.
-pub fn take(e: Export, apps: &mut Vec<Box<dyn Module>>, drivers: &mut Vec<Box<dyn Driver>>) {
+/// Sort what a boot module exports into apps, drivers and the storage service.
+pub fn take(e: Export, apps: &mut Vec<Box<dyn Module>>, drivers: &mut Vec<Box<dyn Driver>>, storage: &mut Option<Box<dyn Storage>>) {
     match e {
         Export::Module(a) => apps.push(a),
         Export::Driver(d) => drivers.push(d),
-        Export::Many(v) => v.into_iter().for_each(|e| take(e, apps, drivers)),
-        _ => crate::kprintln!("modules: a boot module holds apps and drivers only"),
+        Export::Storage(s) => *storage = Some(s),
+        Export::Many(v) => v.into_iter().for_each(|e| take(e, apps, drivers, storage)),
+        _ => crate::kprintln!("modules: a boot module holds apps, drivers and storage only"),
     }
 }
 

@@ -103,6 +103,7 @@ dependencies = [
  "dhcp",
  "rescue",
  "rustros-module",
+ "storage",
  "updater",
  "virtio",
 ]
@@ -515,6 +516,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "kvstore"
+version = "0.1.0"
+dependencies = [
+ "devices",
 ]
 
 [[package]]
@@ -1018,6 +1026,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slots"
+version = "0.1.0"
+dependencies = [
+ "devices",
+ "rustros-util",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1037,6 +1053,17 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "storage"
+version = "0.1.0"
+dependencies = [
+ "devices",
+ "kvstore",
+ "rustros-api",
+ "rustros-util",
+ "slots",
 ]
 
 [[package]]

@@ -845,14 +845,11 @@ dependencies = [
  "dhcp",
  "echo",
  "httpd",
- "kvstore",
  "netstack",
  "rescue",
  "rustros-api",
  "rustros-util",
  "shell",
- "slots",
- "storage",
  "updater",
  "virtio",
 ]
@@ -966,6 +963,9 @@ version = "0.1.0"
 dependencies = [
  "devices",
  "kvstore",
+ "rustros-api",
+ "rustros-util",
+ "slots",
 ]
 
 [[package]]

@@ -23,6 +23,8 @@
 extern crate alloc;
 
 pub mod gpt;
+pub mod log;
+pub mod service;
 
 use devices::BlockDevice;
 use kvstore::Store;

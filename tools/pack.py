@@ -309,7 +309,10 @@ def boot_bundle(specs):
     entries, blobs, at = [], [], BUNDLE_HEAD // 512
     for spec in specs:
         name, path = spec.split("=", 1)
-        data = open(path, "rb").read()
+        # without symbols (the loader needs only the segments and .dynamic)
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["strip", "--strip-all", "-o", f"{tmp}/m", path], check=True)
+            data = open(f"{tmp}/m", "rb").read()
         packed = lz4_compress(data)
         assert lz4_decompress(packed) == data, "LZ4 round trip"
         entries.append(name.encode().ljust(32, b"\0") + struct.pack("<II", at, len(packed)) + hashlib.sha256(data).digest() + struct.pack("<II", len(data), 1))

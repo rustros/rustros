@@ -95,3 +95,12 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.boot-mod]
 opt-level = "z"
+# the boot module's storage service (cold paths, like in the kernel before)
+[profile.release.package.storage]
+opt-level = "z"
+[profile.release.package.kvstore]
+opt-level = "z"
+[profile.release.package.slots]
+opt-level = "z"
+[profile.release.package.virtio]
+opt-level = "z"

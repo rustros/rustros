@@ -21,9 +21,6 @@ rustros-util = { path = "../util" }
 netstack = { path = "../netstack" }
 devices = { path = "../devices" }
 virtio = { path = "../virtio" }
-slots = { path = "../slots" }
-storage = { path = "../storage" }
-kvstore = { path = "../kvstore" }
 rescue = { path = "../apps/rescue", optional = true }
 dhcp = { path = "../apps/dhcp", optional = true }
 shell = { path = "../apps/shell", optional = true }

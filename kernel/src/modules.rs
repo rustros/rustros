@@ -124,22 +124,23 @@ fn key(name: &str, part: &str) -> String {
 }
 
 fn get(k: &Kernel, key: &str) -> Option<Vec<u8>> {
-    k.store_ref().and_then(|s| s.get(key).map(|v| v.to_vec()))
+    k.boot.as_ref()?.kv_get(key).map(|v| v.to_vec())
 }
 
 fn put(k: &mut Kernel, key: &str, value: &[u8]) -> Result<(), String> {
-    let (s, d) = k.store().ok_or_else(|| String::from("no storage for applications"))?;
-    s.put(d, key, value).map_err(|e| format!("cannot store: {e:?}"))
+    let s = k.boot.as_mut().ok_or_else(|| String::from("no storage for applications"))?;
+    s.kv_put(key, value).map_err(|e| format!("cannot store: {e:?}"))
 }
 
 fn delete(k: &mut Kernel, key: &str) -> bool {
-    k.store().is_some_and(|(s, d)| s.delete(d, key).unwrap_or(false))
+    k.boot.as_mut().is_some_and(|s| s.kv_delete(key).unwrap_or(false))
 }
 
 fn installed(k: &Kernel) -> Vec<String> {
-    let Some(s) = k.store_ref() else { return Vec::new() };
+    let Some(s) = k.boot.as_ref() else { return Vec::new() };
     let mut names: Vec<String> = s
-        .keys(PREFIX)
+        .kv_keys(PREFIX)
+        .iter()
         .filter_map(|key| key[PREFIX.len()..].split_once('/').map(|(n, _)| String::from(n)))
         .collect();
     names.dedup();
@@ -269,18 +270,18 @@ pub fn list(k: &Kernel) -> Vec<ModuleInfo> {
 /// At boot: switch off a native module that crashed the last boot, move old
 /// WebAssembly modules to the new layout, then queue every installed app.
 pub fn boot(k: &mut Kernel) {
-    let crashed = k.boot.as_ref().and_then(|b| b.upd.get("crash_app")).map(String::from);
+    let crashed = k.boot.as_ref().and_then(|b| b.env("crash_app")).map(String::from);
     if let Some(name) = crashed {
-        let why = k.boot.as_ref().and_then(|b| b.upd.get("last_panic")).map(String::from).unwrap_or_default();
+        let why = k.boot.as_ref().and_then(|b| b.env("last_panic")).map(String::from).unwrap_or_default();
         if put(k, &key(&name, "native-off"), why.as_bytes()).is_ok() {
             kprintln!("modules: native {} crashed the last boot; switched off (its WebAssembly form runs instead, if installed)", name);
         }
         if let Some(b) = k.boot.as_mut() {
-            b.upd.set_vars(&mut *b.disk, &[("crash_app", "")]);
+            b.env_set(&[("crash_app", "")]);
         }
     }
-    let legacy: Vec<String> = match k.store_ref() {
-        Some(s) => s.keys(LEGACY_WASM).map(String::from).collect(),
+    let legacy: Vec<String> = match k.boot.as_ref() {
+        Some(s) => s.kv_keys(LEGACY_WASM),
         None => Vec::new(),
     };
     for old in legacy {
@@ -314,7 +315,7 @@ fn install_bundled(k: &mut Kernel) {
     const ENTRY: usize = 80;
     let Some(lba) = rustros_util::wire::cmdline_get(&k.cmdline, "rustros.bundle").and_then(|v| v.parse::<u64>().ok()) else { return };
     let mut head = alloc::vec![0u8; HEAD];
-    if !k.boot.as_mut().is_some_and(|b| b.disk.read(lba, &mut head)) || &head[..8] != MAGIC {
+    if !k.boot.as_mut().is_some_and(|b| b.boot_area_read(lba, &mut head)) || &head[..8] != MAGIC {
         kprintln!("modules: no bundle at LBA {}", lba);
         return;
     }
@@ -335,7 +336,7 @@ fn install_bundled(k: &mut Kernel) {
             continue;
         }
         let mut data = alloc::vec![0u8; len.div_ceil(512) * 512];
-        if !k.boot.as_mut().is_some_and(|b| b.disk.read(lba + at, &mut data)) {
+        if !k.boot.as_mut().is_some_and(|b| b.boot_area_read(lba + at, &mut data)) {
             kprintln!("modules: bundled {}: unreadable", name);
             continue;
         }
@@ -600,47 +601,44 @@ fn mount_files(k: &mut Kernel) {
         return;
     }
     let Some(b) = k.boot.as_mut() else { return };
-    let Some((start, sectors)) = b.files else { return };
     let now = arch::unix_time() as u32;
+    let filesystems = &mut k.filesystems;
     let mut found = None;
-    for (i, (name, m)) in k.filesystems.iter_mut().enumerate() {
-        let Some(Export::Filesystem(fs)) = m.export.as_mut() else { continue };
-        let mut d = crate::sys::PartDisk { disk: &mut *b.disk, start, sectors };
-        let before = set_current_native(Some(name));
-        let mine = fs.probe(&mut d);
-        set_current_native(before);
-        if mine {
-            found = Some(i);
-            break;
+    b.files(&mut |d| {
+        for (i, (name, m)) in filesystems.iter_mut().enumerate() {
+            let Some(Export::Filesystem(fs)) = m.export.as_mut() else { continue };
+            let before = set_current_native(Some(name));
+            let mine = fs.probe(d);
+            set_current_native(before);
+            if mine {
+                found = Some(i);
+                return;
+            }
         }
-    }
-    if found.is_none() {
         // nothing recognises it: made anew only if it holds nothing at all
         let mut head = vec![0u8; 128 * 1024];
-        if !b.disk.read(start, &mut head) || head.iter().any(|&x| x != 0) {
+        if !d.read(0, &mut head) || head.iter().any(|&x| x != 0) {
             kprintln!("storage: files partition: no installed file system driver recognises it (left alone)");
             return;
         }
-        let i = k.filesystems.iter().position(|(_, m)| matches!(m.export.as_ref(), Some(Export::Filesystem(fs)) if fs.name() == "ext4")).unwrap_or(0);
-        let (name, m) = &mut k.filesystems[i];
+        let i = filesystems.iter().position(|(_, m)| matches!(m.export.as_ref(), Some(Export::Filesystem(fs)) if fs.name() == "ext4")).unwrap_or(0);
+        let (name, m) = &mut filesystems[i];
         let Some(Export::Filesystem(fs)) = m.export.as_mut() else { return };
         let mut uuid = [0u8; 16];
         uuid[..8].copy_from_slice(&arch::rdtsc().to_le_bytes());
         uuid[8..].copy_from_slice(&arch::rdtsc().rotate_left(29).to_le_bytes());
-        let mut d = crate::sys::PartDisk { disk: &mut *b.disk, start, sectors };
         let before = set_current_native(Some(name));
-        let r = fs.format(&mut d, uuid, now);
+        let r = fs.format(d, uuid, now);
         set_current_native(before);
         match r {
-            Ok(()) => kprintln!("storage: files partition formatted ({})", fs.name()),
-            Err(e) => {
-                kprintln!("storage: files partition: cannot format: {}", e);
-                return;
+            Ok(()) => {
+                kprintln!("storage: files partition formatted ({})", fs.name());
+                found = Some(i);
             }
+            Err(e) => kprintln!("storage: files partition: cannot format: {}", e),
         }
-        found = Some(i);
-    }
-    let i = found.expect("found or made");
+    });
+    let Some(i) = found else { return };
     k.files_fs = Some(i);
     match k.with_files(|fs, d| fs.mount(d, now)) {
         Some(Ok(msg)) => {

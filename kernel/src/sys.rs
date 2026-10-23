@@ -8,15 +8,14 @@ use alloc::vec::Vec;
 
 use netstack::{Link, Stack};
 use rustros_util::wire::{Ip, IpFmt};
-use kvstore::Store;
 use rustros_api::{
     IfConf, NetConf, RouteConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetError, NetInfo, RawSocket, SocketAddr, StorageInfo, Sys, TcpListener, TcpStream,
     UdpSocket, UpdateInfo, Frame, Verdict,
 };
 
-use devices::{BlockDevice, NetDevice};
+use devices::NetDevice;
 
-use rustros_api::module::{Export, Filesystem, Runtime};
+use rustros_api::module::{Disk, Export, Filesystem, Runtime, Storage};
 
 use crate::{arch, console, kprintln, modules};
 
@@ -24,42 +23,6 @@ use crate::{arch, console, kprintln, modules};
 const INJECT_MAX: usize = 4096;
 /// Frames the stack sent, waiting for the egress hook, at most.
 const STACK_TX_MAX: usize = 4096;
-
-/// The boot disk with what lives on it.
-pub struct Boot {
-    pub disk: Box<dyn BlockDevice>,
-    pub upd: slots::Updater,
-    pub store: Option<(Store, storage::Info)>,
-    /// this boot's console log (cache partition)
-    pub log: Option<crate::klog::DiskLog>,
-    /// the files partition: (first sector, sectors); its file system is a module's
-    pub files: Option<(u64, u64)>,
-}
-
-/// The files partition, lent to a file system driver (LBAs from its start).
-pub struct PartDisk<'a> {
-    pub disk: &'a mut dyn BlockDevice,
-    pub start: u64,
-    pub sectors: u64,
-}
-
-impl PartDisk<'_> {
-    fn inside(&self, lba: u64, len: usize) -> bool {
-        len % 512 == 0 && lba.checked_add(len as u64 / 512).is_some_and(|end| end <= self.sectors)
-    }
-}
-
-impl rustros_api::module::Disk for PartDisk<'_> {
-    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
-        self.inside(lba, buf.len()) && self.disk.read(self.start + lba, buf)
-    }
-    fn write(&mut self, lba: u64, buf: &[u8]) -> bool {
-        self.inside(lba, buf.len()) && self.disk.write(self.start + lba, buf)
-    }
-    fn sectors(&self) -> u64 {
-        self.sectors
-    }
-}
 
 /// A logical interface: a NIC, or a VLAN on one. The NICs come first, so
 /// interface `i < nics.len()` is NIC `i`.
@@ -123,7 +86,7 @@ pub struct Kernel {
     pub nics: Vec<Box<dyn NetDevice>>,
     /// Logical interfaces (the stack's interfaces, `Frame::nic`).
     pub ifmap: Vec<IfMap>,
-    pub boot: Option<Boot>,
+    pub boot: Option<Box<dyn Storage>>,
     pub cmdline: String,
     pub stack: Stack,
     /// Module names by id ("" for a free slot).
@@ -161,7 +124,7 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    pub fn new(nics: Vec<Box<dyn NetDevice>>, ifmap: Vec<IfMap>, boot: Option<Boot>, cmdline: String, stack: Stack) -> Kernel {
+    pub fn new(nics: Vec<Box<dyn NetDevice>>, ifmap: Vec<IfMap>, boot: Option<Box<dyn Storage>>, cmdline: String, stack: Stack) -> Kernel {
         Kernel {
             nics,
             ifmap,
@@ -273,11 +236,9 @@ impl Kernel {
 
     /// A reboot or power off on purpose: not an unstable boot.
     pub fn planned_shutdown(&mut self) {
-        if let Some(b) = self.boot.as_mut() {
-            b.upd.set_vars(&mut *b.disk, &[("boot_count", "")]);
-            if let Some(l) = b.log.as_mut() {
-                l.flush(&mut *b.disk);
-            }
+        if let Some(b) = self.boot.as_deref_mut() {
+            b.env_set(&[("boot_count", "")]);
+            crate::klog::flush(b);
         }
         // the files partition marked clean (else the next mount just finds an empty log)
         self.with_files(|fs, d| fs.close(d));
@@ -285,17 +246,16 @@ impl Kernel {
 
     /// A call into the driver that has the files partition mounted (a crash
     /// in it is pinned on that module).
-    pub fn with_files<T>(&mut self, f: impl FnOnce(&mut dyn Filesystem, &mut PartDisk) -> T) -> Option<T> {
+    pub fn with_files<T>(&mut self, f: impl FnOnce(&mut dyn Filesystem, &mut dyn Disk) -> T) -> Option<T> {
         let i = self.files_fs?;
         let b = self.boot.as_mut()?;
-        let (start, sectors) = b.files?;
         let (name, m) = self.filesystems.get_mut(i)?;
         let Some(Export::Filesystem(fs)) = m.export.as_mut() else { return None };
-        let mut d = PartDisk { disk: &mut *b.disk, start, sectors };
         let before = modules::set_current_native(Some(name));
-        let r = f(fs.as_mut(), &mut d);
+        let (mut f, mut r) = (Some(f), None);
+        b.files(&mut |d| r = f.take().map(|f| f(fs.as_mut(), d)));
         modules::set_current_native(before);
-        Some(r)
+        r
     }
 
     pub fn runtime(&mut self) -> Option<&mut dyn Runtime> {
@@ -312,18 +272,8 @@ impl Kernel {
         }
     }
 
-    pub fn store_ref(&self) -> Option<&Store> {
-        self.boot.as_ref()?.store.as_ref().map(|(s, _)| s)
-    }
-
-    pub fn store(&mut self) -> Option<(&mut Store, &mut dyn BlockDevice)> {
-        let b = self.boot.as_mut()?;
-        let (store, _) = b.store.as_mut()?;
-        Some((store, &mut *b.disk))
-    }
-
     pub fn trial(&self) -> bool {
-        self.boot.as_ref().is_some_and(|b| b.upd.trial)
+        self.boot.as_ref().is_some_and(|b| b.slot().1)
     }
 
     /// The stack plus a link to transmit through.
@@ -386,14 +336,6 @@ impl Ctx<'_> {
     }
 }
 
-fn kv_err(e: kvstore::Error) -> KvError {
-    match e {
-        kvstore::Error::Io => KvError::Io,
-        kvstore::Error::TooLarge => KvError::TooLarge,
-        kvstore::Error::Full | kvstore::Error::TooSmall => KvError::Full,
-    }
-}
-
 impl Base for Ctx<'_> {
     fn now_ms(&self) -> u64 {
         arch::now_ms()
@@ -423,17 +365,18 @@ impl Sys for Ctx<'_> {
         self.k.names.iter().copied().filter(|n| !n.is_empty()).collect()
     }
     fn update_info(&self) -> Option<UpdateInfo> {
-        let u = &self.k.boot.as_ref()?.upd;
+        let b = self.k.boot.as_ref()?;
+        let (slot, trial) = b.slot();
         Some(UpdateInfo {
-            slot: u.slot,
-            trial: u.trial,
-            max_bytes: u.sectors * 512,
+            slot,
+            trial,
+            max_bytes: b.slot_bytes(),
             unstable_boots: self.k.unstable_boots,
             safe_mode: self.k.safe_mode,
         })
     }
     fn last_crash(&self) -> Option<String> {
-        self.k.boot.as_ref()?.upd.get("last_panic").map(String::from)
+        self.k.boot.as_ref()?.env("last_panic").map(String::from)
     }
     fn caps(&self) -> Caps {
         self.caps()
@@ -573,41 +516,29 @@ impl Ctx<'_> {
 
 impl Kv for Ctx<'_> {
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let (store, _) = self.k.boot.as_ref()?.store.as_ref()?;
-        store.get(&self.ns(key)).map(|v| v.to_vec())
+        self.k.boot.as_ref()?.kv_get(&self.ns(key)).map(|v| v.to_vec())
     }
     fn put(&mut self, key: &str, value: &[u8]) -> Result<(), KvError> {
         if key.is_empty() {
             return Err(KvError::TooLarge);
         }
         let k = self.ns(key);
-        let b = self.k.boot.as_mut().ok_or(KvError::NoStorage)?;
-        let (store, _) = b.store.as_mut().ok_or(KvError::NoStorage)?;
-        store.put(&mut *b.disk, &k, value).map_err(kv_err)
+        self.k.boot.as_mut().ok_or(KvError::NoStorage)?.kv_put(&k, value)
     }
     fn delete(&mut self, key: &str) -> Result<bool, KvError> {
         let k = self.ns(key);
-        let b = self.k.boot.as_mut().ok_or(KvError::NoStorage)?;
-        let (store, _) = b.store.as_mut().ok_or(KvError::NoStorage)?;
-        store.delete(&mut *b.disk, &k).map_err(kv_err)
+        self.k.boot.as_mut().ok_or(KvError::NoStorage)?.kv_delete(&k)
     }
     fn keys(&self, prefix: &str) -> Vec<String> {
         let ns = self.ns("");
         let full = self.ns(prefix);
-        match self.k.boot.as_ref().and_then(|b| b.store.as_ref()) {
-            Some((store, _)) => store.keys(&full).map(|k| String::from(&k[ns.len()..])).collect(),
+        match self.k.boot.as_ref() {
+            Some(b) => b.kv_keys(&full).into_iter().map(|k| String::from(&k[ns.len()..])).collect(),
             None => Vec::new(),
         }
     }
     fn storage_info(&self) -> Option<StorageInfo> {
-        let (store, part) = self.k.boot.as_ref()?.store.as_ref()?;
-        let (live, tail, half) = store.usage();
-        Some(StorageInfo {
-            partition_bytes: part.sectors * 512,
-            store_bytes: half * 2 * 512,
-            live_bytes: live as u64,
-            log_bytes: tail * 512,
-        })
+        self.k.boot.as_ref()?.kv_info()
     }
     fn file_put(&mut self, name: &str, data: &[u8]) -> Result<(), KvError> {
         let path = self.file_path(name).ok_or(KvError::TooLarge)?;
@@ -731,7 +662,7 @@ impl Admin for Ctx<'_> {
         arch::halt_forever()
     }
     fn clear_crash(&mut self) -> bool {
-        self.k.boot.as_mut().is_some_and(|b| b.upd.set_vars(&mut *b.disk, &[("last_panic", "")]))
+        self.k.boot.as_mut().is_some_and(|b| b.env_set(&[("last_panic", "")]))
     }
     fn net_config(&mut self, ip: Ip, mask: Ip, gw: Ip) {
         self.k.stack.config(ip, mask, gw);
@@ -741,22 +672,19 @@ impl Admin for Ctx<'_> {
     }
     fn boot_net(&self) -> Vec<(String, String)> {
         let Some(b) = self.k.boot.as_ref() else { return Vec::new() };
-        b.upd.vars().filter(|(k, _)| k.starts_with("net")).map(|(k, v)| (String::from(k), String::from(v))).collect()
+        b.env_vars().into_iter().filter(|(k, _)| k.starts_with("net")).collect()
     }
     fn boot_net_set(&mut self, key: &str, value: &str) -> bool {
         let ok = key.starts_with("net") && key.len() <= 32 && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
-        ok && self.k.boot.as_mut().is_some_and(|b| b.upd.set_vars(&mut *b.disk, &[(key, value)]))
+        ok && self.k.boot.as_mut().is_some_and(|b| b.env_set(&[(key, value)]))
     }
     fn net_running(&self) -> NetConf {
         self.k.net_running()
     }
     fn log_list(&mut self) -> Vec<(u64, u64)> {
-        let Some(b) = self.k.boot.as_mut() else { return Vec::new() };
-        let disk = &mut *b.disk;
-        b.log.as_mut().map(|l| {
-            l.flush(disk);
-            l.list(disk)
-        }).unwrap_or_default()
+        let Some(b) = self.k.boot.as_deref_mut() else { return Vec::new() };
+        crate::klog::flush(b);
+        b.log_list()
     }
     fn perf_report(&self) -> String {
         self.k.perf.report()
@@ -771,14 +699,12 @@ impl Admin for Ctx<'_> {
         self.k.nics.iter().map(|n| n.stats()).map(|s| (s.rx_bytes, s.tx_bytes)).collect()
     }
     fn log_this_boot(&self) -> Option<u64> {
-        self.k.boot.as_ref()?.log.as_ref().map(|l| l.seq)
+        self.k.boot.as_ref()?.log_seq()
     }
     fn log_read(&mut self, boot: u64) -> Option<Vec<u8>> {
-        let b = self.k.boot.as_mut()?;
-        let disk = &mut *b.disk;
-        let l = b.log.as_mut()?;
-        l.flush(disk);
-        l.read(disk, boot)
+        let b = self.k.boot.as_deref_mut()?;
+        crate::klog::flush(b);
+        b.log_read(boot)
     }
     fn net_set_running(&mut self, conf: &NetConf) -> Result<(), String> {
         self.k.net_set_running(conf)
@@ -819,15 +745,10 @@ impl Admin for Ctx<'_> {
         self.k.net_baseline.is_some() && self.k.net_running() != self.k.net_baseline.clone().unwrap_or_default()
     }
     fn esp_read(&mut self, lba: u64, sectors: usize) -> Option<Vec<u8>> {
-        let disk = &mut *self.k.boot.as_mut()?.disk;
-        esp_range(disk, lba, sectors as u64)?;
-        let mut buf = alloc::vec![0u8; sectors * 512];
-        disk.read(lba, &mut buf).then_some(buf)
+        self.k.boot.as_mut()?.esp_read(lba, sectors)
     }
     fn esp_write(&mut self, lba: u64, data: &[u8]) -> bool {
-        let Some(b) = self.k.boot.as_mut() else { return false };
-        let disk = &mut *b.disk;
-        data.len() % 512 == 0 && esp_range(disk, lba, (data.len() / 512) as u64).is_some() && disk.write(lba, data)
+        self.k.boot.as_mut().is_some_and(|b| b.esp_write(lba, data))
     }
     fn net_save(&mut self) -> bool {
         // saving what runs ends the apply/revert round
@@ -856,19 +777,19 @@ impl Admin for Ctx<'_> {
             vars.push((format!("{p}extra"), rustros_util::wire::fmt_ip_list(&f.extra)));
         }
         let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        self.k.boot.as_mut().is_some_and(|b| b.upd.set_vars(&mut *b.disk, &refs))
+        self.k.boot.as_mut().is_some_and(|b| b.env_set(&refs))
     }
     fn update_begin(&mut self) -> bool {
-        self.k.boot.as_mut().is_some_and(|b| b.upd.begin())
+        self.k.boot.as_mut().is_some_and(|b| b.update_begin())
     }
     fn update_write(&mut self, data: &[u8]) -> bool {
-        self.k.boot.as_mut().is_some_and(|b| b.upd.write(&mut *b.disk, data))
+        self.k.boot.as_mut().is_some_and(|b| b.update_write(data))
     }
     fn update_commit(&mut self) -> bool {
-        self.k.boot.as_mut().is_some_and(|b| b.upd.commit(&mut *b.disk))
+        self.k.boot.as_mut().is_some_and(|b| b.update_commit())
     }
     fn confirm_boot(&mut self) -> bool {
-        self.k.boot.as_mut().is_some_and(|b| b.upd.confirm(&mut *b.disk))
+        self.k.boot.as_mut().is_some_and(|b| b.confirm())
     }
     fn module_install(&mut self, name: &str, image: &[u8]) -> Result<ModuleKind, String> {
         modules::install(self.k, name, image)
@@ -884,10 +805,10 @@ impl Admin for Ctx<'_> {
     }
     fn module_config(&self, name: &str) -> Vec<(String, String)> {
         let prefix = format!("{name}/cfg/");
-        let Some(store) = self.k.store_ref() else { return Vec::new() };
-        store
-            .keys(&prefix)
-            .map(|k| (String::from(&k[prefix.len()..]), String::from_utf8_lossy(store.get(k).unwrap_or(b"")).into_owned()))
+        let Some(b) = self.k.boot.as_ref() else { return Vec::new() };
+        b.kv_keys(&prefix)
+            .into_iter()
+            .map(|k| (String::from(&k[prefix.len()..]), String::from_utf8_lossy(b.kv_get(&k).unwrap_or(b"")).into_owned()))
             .collect()
     }
     fn module_config_set(&mut self, name: &str, key: &str, value: Option<&str>) -> Result<(), String> {
@@ -896,19 +817,10 @@ impl Admin for Ctx<'_> {
             return Err(String::from("bad module or key name"));
         }
         let k = format!("{name}/cfg/{key}");
-        let (store, disk) = self.k.store().ok_or_else(|| String::from("no storage"))?;
+        let b = self.k.boot.as_mut().ok_or_else(|| String::from("no storage"))?;
         match value {
-            Some(v) => store.put(disk, &k, v.as_bytes()).map_err(|e| format!("{e:?}")),
-            None => store.delete(disk, &k).map(|_| ()).map_err(|e| format!("{e:?}")),
+            Some(v) => b.kv_put(&k, v.as_bytes()).map_err(|e| format!("{e:?}")),
+            None => b.kv_delete(&k).map(|_| ()).map_err(|e| format!("{e:?}")),
         }
     }
-}
-
-/// GPT type of the EFI system partition (C12A7328-F81F-11D2-BA4B-00A0C93EC93B, as stored).
-const ESP_TYPE: [u8; 16] = [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B];
-
-/// Some(()) if `n` sectors from `lba` lie inside the boot disk's ESP.
-fn esp_range(disk: &mut dyn devices::BlockDevice, lba: u64, n: u64) -> Option<()> {
-    let p = storage::gpt::Gpt::read(disk).ok()?.find(&ESP_TYPE)?;
-    (n > 0 && n <= 128 && lba >= p.first && lba.checked_add(n)? <= p.last + 1).then_some(())
 }

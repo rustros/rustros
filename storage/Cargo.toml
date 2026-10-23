@@ -9,3 +9,6 @@ bench = false
 [dependencies]
 devices = { path = "../devices" }
 kvstore = { path = "../kvstore" }
+slots = { path = "../slots" }
+rustros-api = { path = "../api" }
+rustros-util = { path = "../util" }
