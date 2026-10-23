@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Build an 8 MiB raw disk image for RustROS that boots on both BIOS and UEFI.
+"""Build a raw disk image for RustROS that boots on both BIOS and UEFI: 2 MiB
+by default (--size-mb for more).
 
-GPT layout (512-byte sectors):
+GPT layout (512-byte sectors) of the 2 MiB image:
   LBA 0            protective MBR, carrying GRUB's boot.img for BIOS
   LBA 1..33        GPT header + 128 partition entries
   LBA 64..575      partition 1: BIOS boot partition (GRUB core.img)
-  LBA 576..16350   partition 2: EFI System Partition, FAT16:
+  LBA 576..4062    partition 2: EFI System Partition, FAT12 (FAT16 from 4 MiB on):
                      /EFI/BOOT/BOOTX64.EFI   GRUB for UEFI
                      /boot/grub/grub.cfg
                      /boot/grub/grubenv      boot_slot / try_slot / saved network
-                     /boot/kernel-a.elf      kernel slot A (preallocated, contiguous, 1 MiB)
+                     /boot/kernel-a.elf      kernel slot A (preallocated, contiguous, 256 KiB)
                      /boot/kernel-b.elf      kernel slot B
-  LBA 16351..16383 backup GPT (the kernel moves it to the real end of the disk)
+  LBA 4063..4095   backup GPT (the kernel moves it to the real end of the disk)
 
-(Images made before were 2 MiB with a FAT12 ESP and 256 KiB slots; they
-keep working as they are.)
-
-Everything below 64 MiB is the boot area: images may grow up to there. On
+Everything below 64 MiB is the boot area: images may grow up to there, and
+a running machine's EFI partition can grow into it without losing anything
+(rustros-update.py esp-grow). On
 first boot the kernel creates a cache partition at 64 - 512 MiB and the
 system data partition at 512 MiB - 1 GiB; beyond 1 GiB the disk is left for
 a NAS. The kernel gets the slots' and
@@ -37,10 +37,9 @@ import zlib
 
 GRUB_LIB = "/usr/lib/grub"
 SECTOR = 512
-IMAGE_SECTORS = 16384          # 8 MiB
 BOOT_AREA_SECTORS = 64 * 2048  # images must stay below the data partition
 BIOS_FIRST, BIOS_LAST = 64, 575
-ESP_FIRST, ESP_LAST = 576, IMAGE_SECTORS - 34
+ESP_FIRST = 576
 ENTRIES = 128
 ENV_MAGIC = b"# GRUB Environment Block\n"
 
@@ -210,7 +209,8 @@ def main():
     ap.add_argument("--mtu", type=int, default=0, help="default interface MTU (default 1500)")
     ap.add_argument("--key", default="", help="online update key (empty: generate one)")
     ap.add_argument("--key-file", help="read/store the update key in this file")
-    ap.add_argument("--slot-kb", type=int, default=1024, help="size of each kernel slot in KiB")
+    ap.add_argument("--size-mb", type=int, default=2, help="image size in MiB (2 to 64; the EFI partition is all of it)")
+    ap.add_argument("--slot-kb", type=int, default=0, help="size of each kernel slot in KiB (default 256, 1024 from 8 MiB on)")
     ap.add_argument("--timeout", type=int, default=2, help="GRUB menu timeout in seconds")
     ap.add_argument("--bundle", action="append", default=[], metavar="NAME=FILE",
                     help="a module the image carries (installed at first boot), e.g. panel=build/modules/panel.mod")
@@ -219,7 +219,11 @@ def main():
                     help="an image for the installer: no key, network or panel in it; they come from its "
                          "grubenv (update_key, net_ip, net_gw, net_mtu, panel_url), the bundle after it is optional")
     a = ap.parse_args()
-    assert IMAGE_SECTORS <= BOOT_AREA_SECTORS, "the image must stay inside the 64 MiB boot area"
+    if not 2 <= a.size_mb <= 64:
+        sys.exit("mkimg: --size-mb is 2 to 64 (the boot area)")
+    IMAGE_SECTORS = a.size_mb * 2048
+    ESP_LAST = IMAGE_SECTORS - 34
+    a.slot_kb = a.slot_kb or (1024 if a.size_mb >= 8 else 256)
     bundle = make_bundle(a.bundle)
     assert IMAGE_SECTORS + len(bundle) // SECTOR <= BOOT_AREA_SECTORS, "the bundle must fit in the 64 MiB boot area"
 
@@ -265,7 +269,8 @@ def main():
         esp_sectors = ESP_LAST - ESP_FIRST + 1
         with open(esp, "wb") as f:
             f.truncate(esp_sectors * SECTOR)
-        run("mkfs.fat", "-F", "16", "-s", "1", "-n", "RUSTROS", esp)
+        # one sector per cluster: FAT12 up to about 2 MiB, FAT16 above
+        run("mkfs.fat", "-F", "12" if esp_sectors < 4000 else "16", "-s", "1", "-n", "RUSTROS", esp)
         open(t("kernel-a.elf"), "wb").write(slot_image)
         open(t("grubenv"), "wb").write(grubenv("a"))
         mt = ["-i", esp]

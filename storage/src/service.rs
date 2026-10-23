@@ -213,6 +213,39 @@ impl Storage for Service {
         let disk = &mut *b.disk;
         data.len() % 512 == 0 && esp_range(disk, lba, (data.len() / 512) as u64).is_some() && disk.write(lba, data)
     }
+    fn boot_area_write(&mut self, lba: u64, data: &[u8]) -> bool {
+        let Some(b) = self.b.as_mut() else { return false };
+        let n = data.len() as u64 / 512;
+        if data.len() % 512 != 0 || n == 0 || n > 128 || lba < 34 || lba + n > BOOT_AREA_END {
+            return false;
+        }
+        Gpt::read(&mut *b.disk).is_ok_and(|g| !g.overlaps(lba, lba + n - 1)) && b.disk.write(lba, data)
+    }
+    fn esp_move(&mut self, first: u64, last: u64) -> Result<(), String> {
+        let b = self.b.as_mut().ok_or("no boot disk")?;
+        if first < 34 || last < first || last >= BOOT_AREA_END {
+            return Err("not inside the boot area".into());
+        }
+        let mut gpt = Gpt::read(&mut *b.disk)?;
+        let esp = gpt.find(&ESP_TYPE).ok_or("no EFI partition")?;
+        if gpt.overlaps(first, last) {
+            return Err("the new place overlaps a partition".into());
+        }
+        // a FAT that fits the place
+        let mut boot = [0u8; 512];
+        if !b.disk.read(first, &mut boot) {
+            return Err("cannot read the new place".into());
+        }
+        let total = u16::from_le_bytes([boot[19], boot[20]]) as u64;
+        let total = if total == 0 { u32::from_le_bytes([boot[32], boot[33], boot[34], boot[35]]) as u64 } else { total };
+        if boot[510..512] != [0x55, 0xAA] || &boot[54..57] != b"FAT" || total == 0 || total > last - first + 1 {
+            return Err("no FAT boot sector there, or it does not fit".into());
+        }
+        gpt.set_range(esp.index, first, last);
+        let end = b.disk.sectors() - 1;
+        gpt.write(&mut *b.disk, end)?;
+        Ok(())
+    }
     fn boot_area_read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
         let Some(b) = self.b.as_mut() else { return false };
         buf.len() % 512 == 0 && lba.checked_add(buf.len() as u64 / 512).is_some_and(|end| end <= BOOT_AREA_END) && b.disk.read(lba, buf)

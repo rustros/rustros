@@ -576,6 +576,16 @@ pub trait Admin: Base {
     fn esp_read(&mut self, lba: u64, sectors: usize) -> Option<Vec<u8>>;
     /// Write whole sectors inside the EFI system partition.
     fn esp_write(&mut self, lba: u64, data: &[u8]) -> bool;
+    /// Sectors of the boot area (below 64 MiB: the partition table, the
+    /// BIOS boot and EFI partitions, the free space after them).
+    fn boot_read(&mut self, lba: u64, sectors: usize) -> Option<Vec<u8>>;
+    /// Write sectors of the boot area that no partition holds (a new EFI
+    /// partition is built there before `esp_move`).
+    fn boot_write(&mut self, lba: u64, data: &[u8]) -> bool;
+    /// Make `[first, last]` the EFI partition (only its GPT entry changes;
+    /// takes effect at the next boot: GRUB, the slots and grubenv are read
+    /// from there).
+    fn esp_move(&mut self, first: u64, last: u64) -> Result<(), String>;
 
     /// Start writing a new kernel image into the inactive slot.
     fn update_begin(&mut self) -> bool;

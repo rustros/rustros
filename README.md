@@ -143,10 +143,12 @@ tools/rustros-update.py HOST info     # 运行时长、槽位、地址、存储�
 
 流程如下：
 
-1. ESP 里有两个预分配、物理连续的槽位 `/boot/rustros-a.elf` 和 `/boot/rustros-b.elf`（各 8 MiB；内核目前约 1.8 MiB，大部分是 wasmi）。内核从启动参数得知它们的扇区号，更新时直接写扇区，不改动 FAT。
+1. ESP 里有两个预分配、物理连续的槽位 `/boot/kernel-a.elf` 和 `/boot/kernel-b.elf`（镜像默认 2 MiB，每个槽 256 KiB；内核连同引导模块约 245 KiB）。内核从启动参数得知它们的扇区号，更新时直接写扇区，不改动 FAT。
 2. 上传前先校验头部的 HMAC-SHA256（服务端每次连接下发随机 nonce，防止重放），通过后才写盘。整个镜像的 HMAC 校验通过后，才在 `grubenv` 里写 `try_slot`。
 3. GRUB 只会用 `try_slot` 启动一次，并且会先把它清掉。新内核必须在 5 分钟内确认（`confirm`），否则自动重启。如果新内核起不来，断电重启也会回到 `boot_slot`；加载失败时，GRUB 会走 fallback 菜单项。
 4. 试启动期间拒绝再次上传，避免覆盖用来回滚的旧内核。
+
+**无损扩容。** 槽不够大时，`rustros-update.py HOST esp-grow 8 1024` 把 ESP 在线扩到 8 MiB、槽扩到 1 MiB，数据分区不动：先在 ESP 后面的空闲启动区（64 MiB 以内）写好一份更大的新 ESP（GRUB、grub.cfg、grubenv、两个槽里的内核原样拷过去，只改 grub.cfg 里的扇区号），读回校验，再只改 GPT 里 ESP 那一项的位置，然后重启。切换之前断电，用的还是旧 ESP；切换之后断电，用的是已经校验过的新 ESP。分区编号和 GUID 不变，BIOS 和 UEFI 都照常找到它。
 
 ## 写自己的应用
 

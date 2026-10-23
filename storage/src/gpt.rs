@@ -108,6 +108,22 @@ impl Gpt {
         (0..self.count).filter(|&i| self.used(i)).map(|i| le64(self.entry(i), 40) + 1).max().unwrap_or(34)
     }
 
+    /// Whether `[first, last]` overlaps a partition.
+    pub fn overlaps(&self, first: u64, last: u64) -> bool {
+        (0..self.count).filter(|&i| self.used(i)).any(|i| {
+            let e = self.entry(i);
+            first <= le64(e, 40) && le64(e, 32) <= last
+        })
+    }
+
+    /// Move partition `i` (type, GUID and name stay).
+    pub fn set_range(&mut self, i: usize, first: u64, last: u64) {
+        let es = self.entry_size;
+        let e = &mut self.entries[i * es..(i + 1) * es];
+        set64(e, 32, first);
+        set64(e, 40, last);
+    }
+
     /// Add a partition in the first free entry.
     pub fn add(&mut self, ty: &[u8; 16], name: &str, guid: [u8; 16], first: u64, last: u64) -> Option<Part> {
         let i = (0..self.count).find(|&i| !self.used(i))?;

@@ -211,7 +211,7 @@ impl Session {
                         // authenticated ciphertext: decrypt, then run the inner command
                         keystream_xor(key, &self.nonce, &mut payload);
                         match payload.first() {
-                            Some(&c @ (b'K' | b'Q' | b'X' | b'S' | b'D' | b'B')) if payload.len() > 1 => {
+                            Some(&c @ (b'K' | b'Q' | b'X' | b'S' | b'D' | b'B' | b'd' | b'b' | b'M')) if payload.len() > 1 => {
                                 cmd = c;
                                 payload.remove(0);
                             }
@@ -291,27 +291,50 @@ impl Session {
                             return None;
                         }
                         // ESP sectors (encrypted only): 'D' lba(8) count(2) -> "OK <hex
-                        // of the sectors, encrypted for the reply>"; 'B' lba(8) data
-                        b'D' | b'B' => {
+                        // of the sectors, encrypted for the reply>"; 'B' lba(8) data.
+                        // The boot area likewise: 'd' reads any of it, 'b' writes
+                        // only where no partition is (esp-grow builds the new EFI
+                        // partition there)
+                        b'D' | b'B' | b'd' | b'b' => {
                             let lba = payload.get(..8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
                             let Some(admin) = sys.admin() else {
                                 self.finish("ERR not permitted\n");
                                 return None;
                             };
-                            let reply = if cmd == b'D' {
+                            let reply = if cmd == b'D' || cmd == b'd' {
                                 let n = payload.get(8..10).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize);
-                                match admin.esp_read(lba, n) {
+                                match if cmd == b'D' { admin.esp_read(lba, n) } else { admin.boot_read(lba, n) } {
                                     Some(mut data) => {
                                         keystream_xor(key, &[&self.nonce[..], b"R"].concat(), &mut data);
                                         alloc::format!("OK {}\n", data.iter().map(|b| alloc::format!("{b:02x}")).collect::<String>())
                                     }
-                                    None => String::from("ERR outside the EFI partition, or read failed\n"),
+                                    None => String::from("ERR outside the area, or read failed\n"),
+                                }
+                            } else if cmd == b'b' {
+                                if payload.len() > 8 && admin.boot_write(lba, &payload[8..]) {
+                                    String::from("OK\n")
+                                } else {
+                                    String::from("ERR not free space in the boot area, or write failed\n")
                                 }
                             } else if payload.len() > 8 && admin.esp_write(lba, &payload[8..]) {
                                 say!(sys, "updater: wrote {} sectors of the EFI partition at {}\n", (payload.len() - 8) / 512, lba);
                                 String::from("OK\n")
                             } else {
                                 String::from("ERR outside the EFI partition, or write failed\n")
+                            };
+                            self.finish(&reply);
+                            return None;
+                        }
+                        // move the EFI partition (encrypted only): 'M' first(8) last(8)
+                        b'M' => {
+                            let at = |o: usize| payload.get(o..o + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+                            let reply = match sys.admin().map(|a| a.esp_move(at(0), at(8))) {
+                                Some(Ok(())) => {
+                                    say!(sys, "updater: the EFI partition moves to sectors {}-{} (next boot)\n", at(0), at(8));
+                                    String::from("OK\n")
+                                }
+                                Some(Err(e)) => alloc::format!("ERR {e}\n"),
+                                None => String::from("ERR not permitted\n"),
                             };
                             self.finish(&reply);
                             return None;

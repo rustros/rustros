@@ -182,6 +182,11 @@ pub trait Storage {
     fn esp_read(&mut self, lba: u64, sectors: usize) -> Option<Vec<u8>>;
     fn esp_write(&mut self, lba: u64, data: &[u8]) -> bool;
     fn boot_area_read(&mut self, lba: u64, buf: &mut [u8]) -> bool;
+    /// Write sectors of the boot area that no partition holds.
+    fn boot_area_write(&mut self, lba: u64, data: &[u8]) -> bool;
+    /// Make `[first, last]` (free, in the boot area, starting with a FAT
+    /// boot sector) the EFI partition: the GPT entry is all that changes.
+    fn esp_move(&mut self, first: u64, last: u64) -> Result<(), String>;
 }
 
 /// A device a driver drives.

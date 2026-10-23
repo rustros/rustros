@@ -747,6 +747,20 @@ impl Admin for Ctx<'_> {
     fn esp_read(&mut self, lba: u64, sectors: usize) -> Option<Vec<u8>> {
         self.k.boot.as_mut()?.esp_read(lba, sectors)
     }
+    fn boot_read(&mut self, lba: u64, sectors: usize) -> Option<Vec<u8>> {
+        let mut buf = alloc::vec![0u8; sectors.min(128) * 512];
+        self.k.boot.as_mut()?.boot_area_read(lba, &mut buf).then_some(buf)
+    }
+    fn boot_write(&mut self, lba: u64, data: &[u8]) -> bool {
+        self.k.boot.as_mut().is_some_and(|b| b.boot_area_write(lba, data))
+    }
+    fn esp_move(&mut self, first: u64, last: u64) -> Result<(), String> {
+        let r = self.k.boot.as_mut().ok_or_else(|| String::from("no boot disk"))?.esp_move(first, last);
+        if r.is_ok() {
+            kprintln!("storage: the EFI partition is now sectors {}-{} (from the next boot)", first, last);
+        }
+        r
+    }
     fn esp_write(&mut self, lba: u64, data: &[u8]) -> bool {
         self.k.boot.as_mut().is_some_and(|b| b.esp_write(lba, data))
     }
