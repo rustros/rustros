@@ -14,6 +14,8 @@ MTU ?=
 KEY ?=
 # image size in MiB (default 2: 256 KiB kernel slots; a kernel with apps built in needs 8)
 SIZE_MB ?=
+# more kernel arguments in grub.cfg (test images: CMDLINE=rustros.stable=20)
+CMDLINE ?=
 # Modules built into the kernel (everything else is a loadable module, see modules/):
 # apps built into the kernel itself (none: rescue, dhcp and the updater are the boot module)
 APPS ?=
@@ -46,7 +48,7 @@ $(PACKED): kernel bootmods tools/pack.py
 	python3 tools/pack.py $(KERNEL) $@ $(foreach m,$(BOOT_MODULES),--boot=$(m)=build/modules/$(m).mod)
 
 $(IMG): $(PACKED) tools/mkimg.py
-	python3 tools/mkimg.py $(PACKED) $@ $(if $(IP),--ip $(IP)) $(if $(GW),--gw $(GW)) --key-file $(KEY_FILE) $(if $(MTU),--mtu $(MTU)) $(if $(KEY),--key $(KEY)) $(if $(SIZE_MB),--size-mb $(SIZE_MB))
+	python3 tools/mkimg.py $(PACKED) $@ $(if $(IP),--ip $(IP)) $(if $(GW),--gw $(GW)) --key-file $(KEY_FILE) $(if $(MTU),--mtu $(MTU)) $(if $(KEY),--key $(KEY)) $(if $(SIZE_MB),--size-mb $(SIZE_MB)) $(if $(CMDLINE),--cmdline "$(CMDLINE)")
 
 wasm:
 	cd wasm && cargo build --release

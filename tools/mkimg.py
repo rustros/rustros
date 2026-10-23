@@ -215,6 +215,7 @@ def main():
     ap.add_argument("--bundle", action="append", default=[], metavar="NAME=FILE",
                     help="a module the image carries (installed at first boot), e.g. panel=build/modules/panel.mod")
     ap.add_argument("--panel", default="", help="the panel this image's machines connect to (rustros.panel=)")
+    ap.add_argument("--cmdline", default="", help="more kernel arguments (e.g. rustros.stable=5 for test images)")
     ap.add_argument("--template", action="store_true",
                     help="an image for the installer: no key, network or panel in it; they come from its "
                          "grubenv (update_key, net_ip, net_gw, net_mtu, panel_url), the bundle after it is optional")
@@ -295,6 +296,8 @@ def main():
             disk += f" rustros.panel={a.panel}"
         if a.template:
             disk += " $panelarg"
+        if a.cmdline:
+            disk += " " + a.cmdline
         net = f"$netargs key={key}"
         defaults = "".join(
             f'if [ -z "$net_{k}" ]; then set net_{k}={v}; fi\n'

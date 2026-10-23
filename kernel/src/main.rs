@@ -153,7 +153,8 @@ pub fn watchdog_expired(samples: [u64; 8], rip: u64) -> ! {
     }
 }
 
-/// Running this long counts as a stable boot (clears grubenv's boot_count).
+/// Running this long counts as a stable boot (clears grubenv's boot_count);
+/// `rustros.stable=<seconds>` on the command line sets another (test images).
 const STABLE_MS: u64 = 120_000;
 /// Unstable boots in a row before safe mode (GRUB falls back to the other
 /// kernel slot at the next one).
@@ -362,6 +363,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
     let mut force_rescue = false;
     let mut stable = false;
+    let stable_ms = cmdline_get(&k.cmdline, "rustros.stable").and_then(|s| s.parse::<u64>().ok()).map_or(STABLE_MS, |s| s * 1000);
     let mut shown_owner = None;
     loop {
         arch::heartbeat();
@@ -430,7 +432,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             poweroff();
         }
         let now = arch::now_ms();
-        if !stable && now >= STABLE_MS {
+        if !stable && now >= stable_ms {
             stable = true;
             if let Some(b) = k.boot.as_mut() {
                 b.env_set(&[("boot_count", "")]);
