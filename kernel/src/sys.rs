@@ -638,7 +638,7 @@ impl Packet for Ctx<'_> {
             f.offload = rustros_api::Offload::default();
             return true;
         }
-        for p in crate::offload::plain(f.data(), f.offload) {
+        for p in devices::plain(f.data(), f.offload) {
             self.k.injected.push_back((f.nic, after_order, p, rustros_api::Offload::default()));
         }
         f.verdict = Verdict::Consumed;

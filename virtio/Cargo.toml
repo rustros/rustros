@@ -9,3 +9,5 @@ bench = false
 
 [dependencies]
 rustros-api = { path = "../api" }
+devices = { path = "../devices" }
+rustros-util = { path = "../util" }

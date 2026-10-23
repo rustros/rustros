@@ -242,6 +242,7 @@ name = "devices"
 version = "0.1.0"
 dependencies = [
  "rustros-api",
+ "rustros-util",
 ]
 
 [[package]]
@@ -1054,7 +1055,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "virtio"
 version = "0.1.0"
 dependencies = [
+ "devices",
  "rustros-api",
+ "rustros-util",
 ]
 
 [[package]]

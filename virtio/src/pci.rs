@@ -128,7 +128,7 @@ pub fn scan(mut f: impl FnMut(PciDev)) {
     for bus in 0..=255u8 {
         for dev in 0..32u8 {
             for func in 0..8u8 {
-                let d = PciDev { bus, dev, func, vendor: 0, device: 0 };
+                let d = PciDev { bus, dev, func, vendor: 0, device: 0, class: 0 };
                 let id = d.read32(0);
                 if id & 0xFFFF == 0xFFFF {
                     if func == 0 {
@@ -136,7 +136,7 @@ pub fn scan(mut f: impl FnMut(PciDev)) {
                     }
                     continue;
                 }
-                f(PciDev { vendor: id as u16, device: (id >> 16) as u16, ..d });
+                f(PciDev { vendor: id as u16, device: (id >> 16) as u16, class: d.read8(0x0B), ..d });
                 if func == 0 && d.read8(0x0E) & 0x80 == 0 {
                     break; // not multi-function
                 }

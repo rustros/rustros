@@ -8,7 +8,6 @@ extern crate alloc;
 mod bootmods;
 mod drivers;
 mod modules;
-mod offload;
 mod klog;
 mod perf;
 mod acpi;
@@ -20,7 +19,6 @@ mod loader;
 mod mem;
 mod multiboot;
 mod sys;
-mod virtio_net;
 mod watchdog;
 
 use alloc::boxed::Box;
@@ -245,15 +243,15 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         None => kprintln!("modules: the kernel image carries no boot modules"),
     }
 
-    let mut nets = Vec::new();
+    // the drivers take their devices: disks now, NICs once grubenv is readable
+    let mut pci = Vec::new();
+    virtio::pci::scan(|d| pci.push(d));
     let mut disks = Vec::new();
-    virtio::pci::scan(|d| {
-        if virtio_net::is_net(&d) {
-            nets.push(d);
-        } else {
-            drivers::probe(&mut drivers, d, &mut disks);
+    for d in pci.iter().filter(|d| d.class != 2) {
+        if let Some((rustros_api::module::Device::Block(dev), driver)) = drivers::probe(&mut drivers, *d, "") {
+            disks.push(drivers::Disk { dev, driver });
         }
-    });
+    }
     let disks: Vec<Box<dyn BlockDevice>> = disks.into_iter().map(|d| Box::new(d) as Box<dyn BlockDevice>).collect();
     let mut boot = match storage {
         Some(mut s) => match s.open(drivers::HW, &cmdline, disks, arch::rdtsc()) {
@@ -283,9 +281,15 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // NIC offloads (TSO / checksums) unless turned off: "offload=off" on the
     // command line or net_offload=off in grubenv
     let offloads = cmdline_get(&cmdline, "offload").or_else(|| boot.as_ref().and_then(|b| b.env("net_offload"))) != Some("off");
-    let nics: Vec<Box<dyn NetDevice>> = nets.iter().filter_map(|d| virtio_net::VirtioNet::new(d, offloads)).map(|n| Box::new(n) as Box<dyn NetDevice>).collect();
+    let options = if offloads { "" } else { "offload=off" };
+    let mut nics: Vec<Box<dyn NetDevice>> = Vec::new();
+    for d in pci.iter().filter(|d| d.class == 2) {
+        if let Some((rustros_api::module::Device::Net(n), _)) = drivers::probe(&mut drivers, *d, options) {
+            nics.push(n);
+        }
+    }
     if nics.is_empty() {
-        kprintln!("no usable virtio-net device found ({} seen, messages above), halting", nets.len());
+        kprintln!("no usable NIC found ({} network devices seen, messages above), halting", pci.iter().filter(|d| d.class == 2).count());
         arch::halt_forever();
     }
     for (i, n) in nics.iter().enumerate() {
@@ -676,7 +680,7 @@ fn plain_for(k: &mut Kernel, frames: &mut [Frame], live: usize, after: i32) -> u
     }
     for f in frames[first..live].iter_mut() {
         if f.offload.gso_size > 0 {
-            for p in offload::plain(f.data(), f.offload) {
+            for p in devices::plain(f.data(), f.offload) {
                 k.injected.push_back((f.nic, after, p, Offload::default()));
             }
         } else {
@@ -759,7 +763,7 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
                     // with every frame behind the first big one (in order)
                     if let Some(first) = frames[live..t].iter().position(|f| f.verdict == Verdict::Transmit && f.offload.gso_size > 0) {
                         for f in frames[live + first..t].iter_mut().filter(|f| f.verdict == Verdict::Transmit) {
-                            for p in offload::plain(f.data(), f.offload) {
+                            for p in devices::plain(f.data(), f.offload) {
                                 k.injected.push_back((f.nic, i32::MAX, p, Offload::default()));
                             }
                             f.verdict = Verdict::Consumed;
@@ -797,7 +801,7 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
     for f in frames[..live].iter_mut() {
         // the stack takes plain packets
         if f.offload.gso_size > 0 {
-            for p in offload::plain(f.data(), f.offload) {
+            for p in devices::plain(f.data(), f.offload) {
                 st.input(&mut link, f.nic as usize, &p);
             }
             continue;

@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod blk;
+pub mod net;
 pub mod pci;
 
 use alloc::alloc::{Layout, alloc_zeroed};
@@ -531,24 +532,4 @@ impl Queue {
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum Isr {
-    Mmio(usize),
-    Port(u16),
-}
-
-impl Isr {
-    /// Read the ISR status register: acknowledges a legacy interrupt.
-    pub fn ack(self) {
-        unsafe {
-            match self {
-                Isr::Mmio(a) => {
-                    rd::<u8>(a);
-                }
-                Isr::Port(p) => {
-                    inb(p);
-                }
-            }
-        }
-    }
-}
+pub use rustros_api::module::IrqAck as Isr;

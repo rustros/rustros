@@ -17,13 +17,21 @@
 //! forwarded frame's buffer goes onto the TX ring as it is, a spare one
 //! going back; each queue keeps the same number of buffers.
 
+use alloc::boxed::Box;
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use devices::{BUF_SIZE, Buf, HEADROOM, Offload, new_buf};
+use rustros_api::module::{Device, Driver, Hw};
 
-use virtio::pci::{Config, PciDev};
-use virtio::{D_NEXT, D_WRITE, Isr, Queue, Virtio};
+use crate::pci::{Config, PciDev};
+use crate::{D_NEXT, D_WRITE, Queue, Virtio};
+
+fn rdtsc() -> u64 {
+    // Safety: reads the time stamp counter, nothing else.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
 
 const F_CSUM: u64 = 1 << 0;
 const F_GUEST_CSUM: u64 = 1 << 1;
@@ -78,7 +86,7 @@ impl TxQ {
     }
 
     /// A free descriptor, waiting a little for one if the ring is full.
-    fn slot(&mut self, stats: &mut devices::DevStats) -> Option<u16> {
+    fn slot(&mut self, stats: &mut devices::DevStats, tsc_per_ms: u64) -> Option<u16> {
         self.reclaim();
         if self.free.is_empty() {
             // full: make sure the device is draining it, and give it a moment
@@ -86,13 +94,13 @@ impl TxQ {
             self.q.notify();
             self.kick = 0;
             stats.tx_wait += 1;
-            let until = crate::arch::rdtsc() + crate::arch::tsc_per_ms() * TX_WAIT_US / 1000;
+            let until = rdtsc() + tsc_per_ms * TX_WAIT_US / 1000;
             loop {
                 self.reclaim();
                 if !self.free.is_empty() {
                     break;
                 }
-                if crate::arch::rdtsc() > until {
+                if rdtsc() > until {
                     stats.tx_full += 1;
                     return None;
                 }
@@ -133,6 +141,7 @@ pub struct VirtioNet {
     /// legacy interrupt routed (else the timer wakes us)
     pub irq: bool,
     stats: devices::DevStats,
+    tsc_per_ms: u64,
 }
 
 pub fn is_net(d: &PciDev) -> bool {
@@ -168,8 +177,8 @@ fn flow_hash(f: &[u8]) -> u32 {
 }
 
 impl VirtioNet {
-    pub fn new(pci: &PciDev, offloads: bool) -> Option<VirtioNet> {
-        let mut dev = Virtio::probe(crate::drivers::HW, pci)?;
+    pub fn new(hw: &'static dyn Hw, pci: &PciDev, offloads: bool) -> Option<VirtioNet> {
+        let mut dev = Virtio::probe(hw, pci)?;
         let offered = dev.offered();
         // whether the device is driven the modern way, decided by `begin`
         let mut modern = dev.is_modern();
@@ -182,7 +191,7 @@ impl VirtioNet {
             want |= F_CSUM | F_HOST_TSO4 | F_HOST_ECN;
         }
         // interrupts by message where the device can: some hosts give no line
-        let msix = crate::arch::lapic_init().is_some_and(|apic| dev.enable_msix(pci, apic, crate::arch::MSI_VECTOR));
+        let msix = hw.msi().is_some_and(|(apic, vector)| dev.enable_msix(pci, apic, vector));
         let mut feat = dev.begin(want)?;
         if !dev.is_modern() && modern {
             // fell back to legacy: none of the modern-only features
@@ -245,46 +254,45 @@ impl VirtioNet {
             mac,
             irq: false,
             stats: devices::DevStats::default(),
+            tsc_per_ms: hw.tsc_per_ms(),
         };
 
         // more queue pairs: the device uses only the first until told
         if pairs > 1 && !n.ctrl(4, 0, &pairs.to_le_bytes()) {
-            crate::kprintln!("net: the host refused {} queue pairs, using one", pairs);
+            hw.log(&format!("net: the host refused {} queue pairs, using one", pairs));
             n.rx.truncate(1);
             n.tx.truncate(1);
         }
         // let the host drop unicast for other MACs (and multicast)
         let filtered = feat & F_CTRL_RX != 0 && n.ctrl(0, 0, &[0]) && n.ctrl(0, 1, &[0]);
-        crate::kprintln!(
-            "net: {} queue pair{} (rings rx {} tx {}), host MAC filter {}",
+        hw.log(&format!("net: {} queue pair{} (rings rx {} tx {}), host MAC filter {}",
             n.rx.len(),
             if n.rx.len() == 1 { "" } else { "s" },
             n.rx[0].q.size,
             n.tx[0].q.size,
             if filtered { "on" } else { "off" }
-        );
+        ));
         n.describe_host();
         if offloads && modern {
             let on = |f: u64| feat & f == f;
-            crate::kprintln!(
-                "net: offloads: receive {}, send {}",
+            hw.log(&format!("net: offloads: receive {}, send {}",
                 if on(F_GUEST_TSO4 | F_MRG_RXBUF) { "big segments + partial checksums" } else if on(F_GUEST_CSUM) { "partial checksums" } else { "none" },
                 if tx_offload { "big segments + partial checksums" } else { "none" }
-            );
+            ));
         }
         let line = pci.read8(0x3C);
         if msix && n.dev.msix_ok() {
             n.irq = true;
-            crate::kprintln!("net: interrupts by MSI-X");
+            hw.log(&format!("net: interrupts by MSI-X"));
         } else if msix {
             // with MSI-X on, the line stays quiet too
-            crate::kprintln!("net: the device refused an MSI-X vector, the timer paces receiving");
+            hw.log(&format!("net: the device refused an MSI-X vector, the timer paces receiving"));
         } else {
-            n.irq = n.dev.isr().is_some_and(|isr| register_irq(line, isr));
+            n.irq = n.dev.isr().is_some_and(|isr| hw.route_irq(line, isr));
             if n.irq {
                 pci.enable_intx();
             } else {
-                crate::kprintln!("net: no usable interrupt line ({}), the timer paces receiving", line);
+                hw.log(&format!("net: no usable interrupt line ({}), the timer paces receiving", line));
             }
         }
         Some(n)
@@ -320,7 +328,7 @@ impl VirtioNet {
         if off & F_MQ != 0 {
             list += &alloc::format!(" (max {} queue pairs)", self.dev.config16(8));
         }
-        crate::kprintln!("net: host offers{}", list);
+        self.dev.hw.log(&format!("net: host offers{}", list));
     }
 
     /// A control command; true if the device acknowledged it.
@@ -336,9 +344,9 @@ impl VirtioNet {
         q.set_desc(1, a + ACK as u64, 1, D_WRITE, 0);
         q.push(0);
         q.notify();
-        let until = crate::arch::rdtsc() + crate::arch::tsc_per_ms() * 100;
+        let until = rdtsc() + self.tsc_per_ms * 100;
         while q.pop().is_none() {
-            if crate::arch::rdtsc() > until {
+            if rdtsc() > until {
                 return false;
             }
             core::hint::spin_loop();
@@ -361,7 +369,7 @@ impl devices::NetDevice for VirtioNet {
         let n = self.tx.len();
         let len = frame.len().min(BUF_SIZE - HEADROOM);
         let t = &mut self.tx[if n > 1 { flow_hash(frame) as usize % n } else { 0 }];
-        let Some(id) = t.slot(&mut self.stats) else { return false };
+        let Some(id) = t.slot(&mut self.stats, self.tsc_per_ms) else { return false };
         // a copy into a spare buffer (frames built by the system's stack)
         let mut b = t.spare.pop().expect("one spare per free slot");
         b[HEADROOM - self.hdr..HEADROOM].fill(0);
@@ -379,14 +387,14 @@ impl devices::NetDevice for VirtioNet {
         };
         // what the host cannot finish: done here
         if !off.is_none() && (!self.tx_offload || off.gso_size > 0 && !self.tx_ecn && tcp_cwr(&buf[start..start + len])) {
-            return crate::offload::send_plain(self, &mut buf[start..start + len], off);
+            return devices::send_plain(self, &mut buf[start..start + len], off);
         }
         if start < self.hdr || start + len > buf.len() {
             return self.send(&buf[start..(start + len).min(buf.len())]); // no room for the header
         }
         let n = self.tx.len();
         let t = &mut self.tx[if n > 1 { flow_hash(&buf[start..start + len]) as usize % n } else { 0 }];
-        let Some(id) = t.slot(&mut self.stats) else { return false };
+        let Some(id) = t.slot(&mut self.stats, self.tsc_per_ms) else { return false };
         buf[start - self.hdr..start].fill(0);
         if !off.is_none() {
             let f = &buf[start..start + len];
@@ -532,35 +540,18 @@ impl devices::NetDevice for VirtioNet {
     }
 }
 
-const MAX_ISRS: usize = 8;
+/// The virtio-net driver (a boot module's).
+pub struct NetDriver;
 
-/// Interrupt lines and the ISR registers of the virtio devices on them.
-static ISRS: crate::Global<([(u8, Isr); MAX_ISRS], usize)> = crate::Global::new(([(0, Isr::Port(0)); MAX_ISRS], 0));
-
-/// Route a device's legacy interrupt `line` through the PIC; false if the
-/// line is unusable (then only the timer wakes the CPU).
-fn register_irq(line: u8, isr: Isr) -> bool {
-    if line == 0 || line == 2 || line >= 16 {
-        return false;
+impl Driver for NetDriver {
+    fn name(&self) -> &'static str {
+        "virtio-net"
     }
-    // Safety: boot time, single core, before the line is unmasked.
-    let r = unsafe { ISRS.get() };
-    if r.1 == MAX_ISRS {
-        return false;
-    }
-    r.0[r.1] = (line, isr);
-    r.1 += 1;
-    crate::arch::unmask_irq(line);
-    true
-}
-
-/// Interrupt on `line`: acknowledge every device on it (level-triggered).
-pub fn ack_irq(line: u8) {
-    // Safety: written only before the lines were unmasked.
-    let r = unsafe { ISRS.get() };
-    for &(l, isr) in &r.0[..r.1] {
-        if l == line {
-            isr.ack();
+    fn probe(&mut self, hw: &'static dyn Hw, dev: PciDev, options: &str) -> Option<Device> {
+        if !is_net(&dev) {
+            return None;
         }
+        let offloads = rustros_util::wire::cmdline_get(options, "offload") != Some("off");
+        Some(Device::Net(Box::new(VirtioNet::new(hw, &dev, offloads)?)))
     }
 }

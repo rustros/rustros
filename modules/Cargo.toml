@@ -103,4 +103,4 @@ opt-level = "z"
 [profile.release.package.slots]
 opt-level = "z"
 [profile.release.package.virtio]
-opt-level = "z"
+opt-level = 3

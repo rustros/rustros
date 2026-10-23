@@ -117,6 +117,16 @@ pub struct PciAddr {
     pub func: u8,
     pub vendor: u16,
     pub device: u16,
+    /// base class (1 mass storage, 2 network, ...)
+    pub class: u8,
+}
+
+/// Where a device's interrupt status register is: reading it acknowledges
+/// a legacy interrupt.
+#[derive(Clone, Copy)]
+pub enum IrqAck {
+    Mmio(usize),
+    Port(u16),
 }
 
 /// What a driver needs from the kernel besides the device itself (port I/O
@@ -125,16 +135,26 @@ pub trait Hw: Sync {
     /// Map a device's registers (uncached); false if they cannot be.
     fn map_device(&self, phys: u64, len: u64) -> bool;
     fn now_ms(&self) -> u64;
+    /// TSC ticks per millisecond (short waits by `rdtsc`).
+    fn tsc_per_ms(&self) -> u64;
     /// A line for the console.
     fn log(&self, line: &str);
+    /// (local APIC id, vector) for message-signalled interrupts that wake
+    /// the CPU, if it has an APIC.
+    fn msi(&self) -> Option<(u8, u8)>;
+    /// Wake the CPU on legacy interrupt `line`, acknowledged by reading
+    /// `ack`; false if the line is unusable.
+    fn route_irq(&self, line: u8, ack: IrqAck) -> bool;
 }
 
 /// A device driver. Drivers come with the kernel (boot modules) and are
-/// offered the PCI functions at boot, before anything uses a disk.
+/// offered the PCI functions at boot: disks first (before the storage
+/// service opens), NICs after it (their settings may be in grubenv).
 pub trait Driver {
     fn name(&self) -> &'static str;
-    /// Drive `dev` if it is this driver's kind of device.
-    fn probe(&mut self, hw: &'static dyn Hw, dev: PciAddr) -> Option<Device>;
+    /// Drive `dev` if it is this driver's kind of device. `options`: settings
+    /// as on the command line ("offload=off").
+    fn probe(&mut self, hw: &'static dyn Hw, dev: PciAddr, options: &str) -> Option<Device>;
 }
 
 /// The boot disk's services: grubenv and the kernel slots, the system
@@ -192,7 +212,87 @@ pub trait Storage {
 /// A device a driver drives.
 pub enum Device {
     Block(Box<dyn Disk>),
+    Net(Box<dyn NetDevice>),
 }
+
+// ---------------------------------------------------------------- network devices
+
+use crate::{HEADROOM, Offload};
+
+/// A packet buffer: HEADROOM, then up to 2048 bytes of frame.
+pub const BUF_SIZE: usize = HEADROOM + 2048;
+/// Packet buffers are handed between the kernel and the drivers instead of
+/// copying what is in them. Most are BUF_SIZE; one holding a big segment
+/// (offloads) is as big as that, and only lives while it is in flight.
+pub type Buf = alloc::boxed::Box<[u8]>;
+
+pub fn new_buf() -> Buf {
+    alloc::vec![0u8; BUF_SIZE].into_boxed_slice()
+}
+
+/// A buffer for a frame of `len` bytes (HEADROOM in front).
+pub fn buf_for(len: usize) -> Buf {
+    alloc::vec![0u8; (HEADROOM + len).max(BUF_SIZE)].into_boxed_slice()
+}
+
+/// Counters of a NIC, kept by its driver (all traffic, forwarded too).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DevStats {
+    pub rx_pkts: u64,
+    pub rx_bytes: u64,
+    pub tx_pkts: u64,
+    pub tx_bytes: u64,
+    /// frames not sent: the TX ring stayed full
+    pub tx_full: u64,
+    /// times the TX ring was full and the driver waited for room
+    pub tx_wait: u64,
+    /// times the RX ring was found completely full (the host drops then)
+    pub rx_full: u64,
+    /// unicast frames for other MACs, dropped on arrival
+    pub rx_foreign: u64,
+}
+
+/// An Ethernet interface.
+pub trait NetDevice {
+    fn stats(&self) -> DevStats {
+        DevStats::default()
+    }
+    fn mac(&self) -> [u8; 6];
+    /// Transmit one frame (without FCS). False if the device is busy.
+    fn send(&mut self, frame: &[u8]) -> bool;
+    /// Copy the next received frame into `buf`; returns its length.
+    fn recv(&mut self, buf: &mut [u8]) -> Option<usize>;
+    /// Short description for the boot log.
+    fn kind(&self) -> &'static str;
+    /// Zero-copy receive: the next frame ends up in `buf` (at HEADROOM;
+    /// its length and pending offloads are returned) and the driver keeps
+    /// the buffer that was there.
+    fn recv_swap(&mut self, buf: &mut Buf) -> Option<(usize, Offload)> {
+        self.recv(&mut buf[HEADROOM..]).map(|n| (n, Offload::default()))
+    }
+    /// Zero-copy send of `buf[start..start + len]`: the driver keeps the
+    /// buffer until the device is done with it and leaves a spare one in
+    /// `buf`. False if the device is busy (`buf` is then unchanged).
+    /// `offload` only if `tx_offloads()`.
+    fn send_swap(&mut self, buf: &mut Buf, start: usize, len: usize, _offload: Offload) -> bool {
+        self.send(&buf[start..start + len])
+    }
+    /// The device completes partial checksums and cuts big TCP segments.
+    fn tx_offloads(&self) -> bool {
+        false
+    }
+    /// Tell the device about frames sent and buffers returned since the last
+    /// flush (`send`/`recv` batch their notifications, which are expensive
+    /// under a hypervisor). Call after each batch.
+    fn flush(&mut self) {}
+    /// A received frame is waiting.
+    fn rx_pending(&self) -> bool {
+        false
+    }
+    /// Interrupt on received frames (before sleeping) or not (while polling).
+    fn rx_interrupts(&mut self, _on: bool) {}
+}
+
 
 /// An application runtime: turns application images of its format into apps.
 pub trait Runtime {

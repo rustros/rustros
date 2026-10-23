@@ -178,7 +178,7 @@ extern "C" fn isr_handler(f: &mut Frame) {
                 }
             }
             if (33..48).contains(&v) {
-                crate::virtio_net::ack_irq((v - 32) as u8);
+                crate::drivers::ack_irq((v - 32) as u8);
             }
             unsafe {
                 if v >= 40 {

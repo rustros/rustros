@@ -183,7 +183,7 @@ impl Driver for BlkDriver {
     fn name(&self) -> &'static str {
         "virtio-blk"
     }
-    fn probe(&mut self, hw: &'static dyn Hw, dev: PciDev) -> Option<Device> {
+    fn probe(&mut self, hw: &'static dyn Hw, dev: PciDev, _options: &str) -> Option<Device> {
         if !is_blk(&dev) {
             return None;
         }
