@@ -19,3 +19,4 @@ updater = { path = "../../apps/updater" }
 virtio = { path = "../../virtio" }
 storage = { path = "../../storage" }
 netstack = { path = "../../netstack" }
+modman = { path = "../../modman" }

@@ -606,10 +606,10 @@ pub trait Admin: Base {
     /// Run the other stored form (also re-enables a native form that was
     /// switched off after a crash).
     fn module_switch(&mut self, name: &str, kind: ModuleKind) -> Result<(), String>;
-    fn module_list(&self) -> Vec<ModuleInfo>;
+    fn module_list(&mut self) -> Vec<ModuleInfo>;
     /// A module's settings: the keys under `cfg/` in its own store namespace
     /// (the module reads them with `Kv::get("cfg/<key>")`).
-    fn module_config(&self, name: &str) -> Vec<(String, String)>;
+    fn module_config(&mut self, name: &str) -> Vec<(String, String)>;
     /// Set (or with None remove) one setting of a module.
     fn module_config_set(&mut self, name: &str, key: &str, value: Option<&str>) -> Result<(), String>;
 }

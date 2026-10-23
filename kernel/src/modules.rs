@@ -1,11 +1,8 @@
-//! Installed applications: native modules and runtime-hosted (WebAssembly)
-//! instances, next to the built-in apps.
-//!
-//! An installed app may be stored in both forms under `sys/app/<name>/`:
-//! `native` (module ELF), `wasm`, `prefer` (which form to run) and
-//! `native-off` (the native form crashed the system; set at boot from the
-//! crash record, so the app falls back to its WebAssembly form). Changes are
-//! queued and applied by the main loop between passes.
+//! The modules the kernel runs: the built-in and boot apps, installed native
+//! modules and runtime-hosted (WebAssembly) instances, the runtime and the
+//! file system drivers. What is installed and which form runs is the module
+//! manager's (a boot module's, `rustros_api::module::ModManager`); the main
+//! loop applies the operations it queues, between passes.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -13,18 +10,12 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use rustros_api::module::Export;
-use rustros_api::{Module, ModuleInfo, ModuleKind, Caps};
+use rustros_api::module::{Export, ModHost, ModManager, ModOp, RUNTIME, Storage};
+use rustros_api::{Caps, Module, ModuleInfo, ModuleKind};
 
 use crate::loader;
 use crate::sys::{Ctx, Kernel};
 use crate::{Global, arch, kprintln};
-
-const PREFIX: &str = "sys/app/";
-/// The WebAssembly runtime is the native module installed under this name.
-pub const RUNTIME: &str = "wasm";
-/// Old location of WebAssembly modules (before native modules existed).
-const LEGACY_WASM: &str = "sys/wasm/";
 
 /// An entry of the app table; the index is the app id.
 pub enum Slot {
@@ -56,12 +47,6 @@ impl Slot {
             _ => None,
         }
     }
-}
-
-pub enum ModuleOp {
-    /// (Re)start the app in its preferred available form.
-    Start(String),
-    Stop(String),
 }
 
 /// Kept by the main loop for `module_list`.
@@ -117,241 +102,80 @@ fn after_call(k: &mut Kernel, slot: &mut Slot, id: usize) {
     }
 }
 
-// ---------------------------------------------------------------- storage
+// ---------------------------------------------------------------- the module manager
 
-fn key(name: &str, part: &str) -> String {
-    format!("{PREFIX}{name}/{part}")
+/// What the module manager gets from the kernel.
+struct Host<'a> {
+    k: &'a mut Kernel,
 }
 
-fn get(k: &Kernel, key: &str) -> Option<Vec<u8>> {
-    k.boot.as_ref()?.kv_get(key).map(|v| v.to_vec())
+impl ModHost for Host<'_> {
+    fn store(&mut self) -> Option<&mut dyn Storage> {
+        Some(&mut **self.k.boot.as_mut()?)
+    }
+    fn cmdline(&self) -> &str {
+        &self.k.cmdline
+    }
+    fn log(&mut self, line: &str) {
+        kprintln!("{}", line);
+    }
+    fn check(&self, image: &[u8]) -> Result<ModuleKind, String> {
+        if image.starts_with(b"\x7fELF") {
+            loader::check(image)?;
+            Ok(ModuleKind::Native)
+        } else if let Some(rt) = self.k.runtime_ref().filter(|r| r.accepts(image)) {
+            rt.validate(image)?;
+            Ok(ModuleKind::Wasm)
+        } else if image.starts_with(b"\0asm") {
+            Err(String::from("no WebAssembly runtime in this system"))
+        } else {
+            Err(String::from("unknown image format (expected a native module ELF or WebAssembly)"))
+        }
+    }
+    fn has_runtime(&self) -> bool {
+        self.k.runtime_ref().is_some()
+    }
+    fn is_builtin(&self, name: &str) -> bool {
+        self.k.builtin_names.contains(&name)
+    }
+    fn is_running(&self, name: &str) -> bool {
+        self.k.names.contains(&name)
+    }
 }
 
-fn put(k: &mut Kernel, key: &str, value: &[u8]) -> Result<(), String> {
-    let s = k.boot.as_mut().ok_or_else(|| String::from("no storage for applications"))?;
-    s.kv_put(key, value).map_err(|e| format!("cannot store: {e:?}"))
+/// Call the module manager; None if the boot modules have none.
+pub fn manager<T>(k: &mut Kernel, f: impl FnOnce(&mut dyn ModManager, &mut dyn ModHost) -> T) -> Option<T> {
+    let mut m = k.manager.take()?;
+    let r = f(&mut *m, &mut Host { k: &mut *k });
+    k.manager = Some(m);
+    Some(r)
 }
 
-fn delete(k: &mut Kernel, key: &str) -> bool {
-    k.boot.as_mut().is_some_and(|s| s.kv_delete(key).unwrap_or(false))
-}
-
-fn installed(k: &Kernel) -> Vec<String> {
-    let Some(s) = k.boot.as_ref() else { return Vec::new() };
-    let mut names: Vec<String> = s
-        .kv_keys(PREFIX)
+/// The running installed modules, for `module_list`.
+pub fn running(k: &Kernel) -> Vec<ModuleInfo> {
+    k.app_status
         .iter()
-        .filter_map(|key| key[PREFIX.len()..].split_once('/').map(|(n, _)| String::from(n)))
-        .collect();
-    names.dedup();
-    names
-}
-
-fn image_key(kind: ModuleKind) -> &'static str {
-    kind.as_str()
-}
-
-fn other(kind: ModuleKind) -> ModuleKind {
-    match kind {
-        ModuleKind::Native => ModuleKind::Wasm,
-        ModuleKind::Wasm => ModuleKind::Native,
-    }
-}
-
-fn preferred(k: &Kernel, name: &str) -> ModuleKind {
-    get(k, &key(name, "prefer")).and_then(|p| ModuleKind::parse(core::str::from_utf8(&p).ok()?)).unwrap_or(ModuleKind::Native)
-}
-
-fn check_name(k: &Kernel, name: &str) -> Result<(), String> {
-    let valid = (1..=32).contains(&name.len())
-        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
-        && name != "sys";
-    if !valid {
-        return Err(String::from("name must be 1-32 chars of a-z 0-9 - _ (and not \"sys\")"));
-    }
-    if k.builtin_names.contains(&name) {
-        return Err(format!("\"{name}\" is a built-in app"));
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------- admin operations
-
-pub fn install(k: &mut Kernel, name: &str, image: &[u8]) -> Result<ModuleKind, String> {
-    check_name(k, name)?;
-    let kind = if image.starts_with(b"\x7fELF") {
-        loader::check(image)?;
-        ModuleKind::Native
-    } else if let Some(rt) = k.runtime_ref().filter(|r| r.accepts(image)) {
-        rt.validate(image)?;
-        ModuleKind::Wasm
-    } else if image.starts_with(b"\0asm") {
-        return Err(String::from("no WebAssembly runtime in this system"));
-    } else {
-        return Err(String::from("unknown image format (expected a native module ELF or WebAssembly)"));
-    };
-    put(k, &key(name, image_key(kind)), image)?;
-    put(k, &key(name, "prefer"), kind.as_str().as_bytes())?;
-    if kind == ModuleKind::Native {
-        delete(k, &key(name, "native-off"));
-    }
-    k.app_ops.push(ModuleOp::Start(String::from(name)));
-    Ok(kind)
-}
-
-pub fn remove(k: &mut Kernel, name: &str, kind: Option<ModuleKind>) -> bool {
-    match kind {
-        None => {
-            let mut existed = false;
-            for part in ["native", "wasm", "prefer", "native-off"] {
-                existed |= delete(k, &key(name, part));
-            }
-            if existed {
-                k.app_ops.push(ModuleOp::Stop(String::from(name)));
-            }
-            existed
-        }
-        Some(kind) => {
-            if !delete(k, &key(name, image_key(kind))) {
-                return false;
-            }
-            if kind == ModuleKind::Native {
-                delete(k, &key(name, "native-off"));
-            }
-            if preferred(k, name) == kind {
-                let _ = put(k, &key(name, "prefer"), other(kind).as_str().as_bytes());
-            }
-            // keeps running in the other form, if there is one
-            k.app_ops.push(ModuleOp::Start(String::from(name)));
-            true
-        }
-    }
-}
-
-pub fn switch(k: &mut Kernel, name: &str, kind: ModuleKind) -> Result<(), String> {
-    if get(k, &key(name, image_key(kind))).is_none() {
-        return Err(format!("no {} image of \"{name}\" is installed", kind.as_str()));
-    }
-    put(k, &key(name, "prefer"), kind.as_str().as_bytes())?;
-    if kind == ModuleKind::Native {
-        delete(k, &key(name, "native-off"));
-    }
-    k.app_ops.push(ModuleOp::Start(String::from(name)));
-    Ok(())
-}
-
-pub fn list(k: &Kernel) -> Vec<ModuleInfo> {
-    installed(k)
-        .into_iter()
-        .map(|name| {
-            let size = |k: &Kernel, part| get(k, &key(&name, part)).map(|v| v.len());
-            let (native_bytes, wasm_bytes) = (size(k, "native"), size(k, "wasm"));
-            let preferred = preferred(k, &name);
-            let native_off = get(k, &key(&name, "native-off")).map(|v| String::from_utf8_lossy(&v).into_owned());
-            let st = k.app_status.iter().find(|s| s.name == name);
-            ModuleInfo {
-                running: st.map(|s| s.kind),
-                state: st.map_or_else(|| String::from("not running"), |s| s.state.clone()),
-                restarts: st.map_or(0, |s| s.restarts),
-                name,
-                native_bytes,
-                wasm_bytes,
-                preferred,
-                native_off,
-                params: st.map_or_else(Vec::new, |s| s.params.clone()),
-                version: String::from(st.map_or("", |s| s.version)),
-            }
+        .map(|s| ModuleInfo {
+            name: String::from(s.name),
+            native_bytes: None,
+            wasm_bytes: None,
+            preferred: ModuleKind::Native,
+            running: Some(s.kind),
+            state: s.state.clone(),
+            restarts: s.restarts,
+            native_off: None,
+            params: s.params.clone(),
+            version: String::from(s.version),
         })
         .collect()
 }
 
 // ---------------------------------------------------------------- main loop side
 
-/// At boot: switch off a native module that crashed the last boot, move old
-/// WebAssembly modules to the new layout, then queue every installed app.
+/// At boot: the manager queues every installed module.
 pub fn boot(k: &mut Kernel) {
-    let crashed = k.boot.as_ref().and_then(|b| b.env("crash_app")).map(String::from);
-    if let Some(name) = crashed {
-        let why = k.boot.as_ref().and_then(|b| b.env("last_panic")).map(String::from).unwrap_or_default();
-        if put(k, &key(&name, "native-off"), why.as_bytes()).is_ok() {
-            kprintln!("modules: native {} crashed the last boot; switched off (its WebAssembly form runs instead, if installed)", name);
-        }
-        if let Some(b) = k.boot.as_mut() {
-            b.env_set(&[("crash_app", "")]);
-        }
-    }
-    let legacy: Vec<String> = match k.boot.as_ref() {
-        Some(s) => s.kv_keys(LEGACY_WASM),
-        None => Vec::new(),
-    };
-    for old in legacy {
-        let name = &old[LEGACY_WASM.len()..];
-        if let Some(image) = get(k, &old) {
-            if put(k, &key(name, "wasm"), &image).is_ok() && put(k, &key(name, "prefer"), b"wasm").is_ok() {
-                delete(k, &old);
-            }
-        }
-    }
-    // file system drivers first (apps find their files mounted), then the
-    // runtime (WebAssembly modules need it)
-    let mut names = installed(k);
-    let fs: Vec<bool> = names.iter().map(|n| get(k, &key(n, ROLE)).as_deref() == Some(ROLE_FS)).collect();
-    let mut order: Vec<(bool, bool, String)> = names.drain(..).zip(fs).map(|(n, fs)| (!fs, n != RUNTIME, n)).collect();
-    rustros_util::sort::sort(&mut order);
-    let names: Vec<String> = order.into_iter().map(|(_, _, n)| n).collect();
-    for name in names {
-        k.app_ops.push(ModuleOp::Start(name));
-    }
-    install_bundled(k);
-}
-
-/// The modules the boot image carries (`rustros.bundle=<lba>`, written by
-/// mkimg after the image): each installed once, at the first boot that
-/// finds it neither installed nor installed from the bundle before (so one
-/// the owner removed stays removed).
-fn install_bundled(k: &mut Kernel) {
-    const MAGIC: &[u8; 8] = b"RRSBNDL1";
-    const HEAD: usize = 4096;
-    const ENTRY: usize = 80;
-    let Some(lba) = rustros_util::wire::cmdline_get(&k.cmdline, "rustros.bundle").and_then(|v| v.parse::<u64>().ok()) else { return };
-    let mut head = alloc::vec![0u8; HEAD];
-    if !k.boot.as_mut().is_some_and(|b| b.boot_area_read(lba, &mut head)) || &head[..8] != MAGIC {
-        kprintln!("modules: no bundle at LBA {}", lba);
-        return;
-    }
-    let count = (u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize).min((HEAD - 16) / ENTRY);
-    let have = installed(k);
-    for i in 0..count {
-        let e = &head[16 + i * ENTRY..16 + (i + 1) * ENTRY];
-        let name = String::from(String::from_utf8_lossy(&e[..32]).trim_end_matches('\0'));
-        let at = u32::from_le_bytes([e[32], e[33], e[34], e[35]]) as u64;
-        let len = u32::from_le_bytes([e[36], e[37], e[38], e[39]]) as usize;
-        let sha: [u8; 32] = e[40..72].try_into().unwrap_or([0; 32]);
-        let marker = format!("sys/bundle/{name}");
-        if name.is_empty() || get(k, &marker).is_some() {
-            continue;
-        }
-        if have.contains(&name) {
-            let _ = put(k, &marker, &sha);
-            continue;
-        }
-        let mut data = alloc::vec![0u8; len.div_ceil(512) * 512];
-        if !k.boot.as_mut().is_some_and(|b| b.boot_area_read(lba + at, &mut data)) {
-            kprintln!("modules: bundled {}: unreadable", name);
-            continue;
-        }
-        data.truncate(len);
-        if rustros_util::sha256::Sha256::digest(&data) != sha {
-            kprintln!("modules: bundled {}: damaged (SHA-256), not installed", name);
-            continue;
-        }
-        match install(k, &name, &data) {
-            Ok(kind) => {
-                let _ = put(k, &marker, &sha);
-                kprintln!("modules: installed {} from the boot image ({}, {} KiB)", name, kind.as_str(), len / 1024);
-            }
-            Err(e) => kprintln!("modules: bundled {}: {}", name, e),
-        }
+    if manager(k, |m, h| m.boot(h)).is_none() {
+        kprintln!("modules: no module manager (boot modules), installed modules are not started");
     }
 }
 
@@ -374,19 +198,14 @@ fn stop_hosted(k: &mut Kernel, slots: &mut [Slot]) -> Vec<String> {
 
 /// (Re)load or drop the runtime. The WebAssembly modules are restarted on
 /// the new one (or fall back to their native form).
-fn apply_runtime(k: &mut Kernel, slots: &mut [Slot], start: bool, pending: &[String]) {
-    let mut restart = stop_hosted(k, slots);
+fn apply_runtime(k: &mut Kernel, slots: &mut [Slot], start: bool) {
+    let stopped = stop_hosted(k, slots);
     if k.runtime_module.take().is_some() {
         k.app_status.retain(|s| s.name != RUNTIME);
         kprintln!("modules: {} runtime stopped", RUNTIME);
     }
     if start {
-        let image = if get(k, &key(RUNTIME, "native-off")).is_some() {
-            kprintln!("modules: the {} runtime is switched off after a crash", RUNTIME);
-            None
-        } else {
-            get(k, &key(RUNTIME, image_key(ModuleKind::Native)))
-        };
+        let image = manager(k, |m, h| m.choose(h, RUNTIME)).flatten().map(|(_, image)| image);
         if let Some(image) = image {
             unsafe { *CURRENT_NATIVE.get() = Some(RUNTIME) };
             let r = loader::load(&image);
@@ -409,31 +228,7 @@ fn apply_runtime(k: &mut Kernel, slots: &mut [Slot], start: bool, pending: &[Str
             }
         }
     }
-    // every installed module that is not running (and not about to be
-    // started anyway) gets another chance on the new runtime
-    restart.extend(installed(k).into_iter().filter(|n| n != RUNTIME && !k.names.iter().any(|r| r == n)));
-    restart.retain(|n| !pending.contains(n));
-    rustros_util::sort::sort(&mut restart);
-    restart.dedup();
-    k.app_ops.extend(restart.into_iter().map(ModuleOp::Start));
-}
-
-/// The form to run: the preferred one if stored (and, for native, not
-/// switched off), else the other.
-fn choose(k: &mut Kernel, name: &str) -> Option<(ModuleKind, Vec<u8>)> {
-    let first = preferred(k, name);
-    for kind in [first, other(first)] {
-        if kind == ModuleKind::Native && get(k, &key(name, "native-off")).is_some() {
-            continue;
-        }
-        if kind == ModuleKind::Wasm && (k.runtime_ref().is_none() || name == RUNTIME) {
-            continue;
-        }
-        if let Some(image) = get(k, &key(name, image_key(kind))) {
-            return Some((kind, image));
-        }
-    }
-    None
+    manager(k, |m, h| m.runtime_changed(h, stopped));
 }
 
 fn set_slot(k: &mut Kernel, id: usize, name: &'static str, caps: Caps) {
@@ -448,23 +243,16 @@ fn set_slot(k: &mut Kernel, id: usize, name: &'static str, caps: Caps) {
 
 /// Apply queued installs, switches and removals.
 pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
-    let ops = core::mem::take(&mut k.app_ops);
-    for (i, op) in ops.iter().enumerate() {
-        let (ModuleOp::Start(name) | ModuleOp::Stop(name)) = op;
+    while let Some(op) = manager(k, |m, _| m.next_op()).flatten() {
+        let (ModOp::Start(name) | ModOp::Stop(name)) = &op;
         let name = name.as_str();
         if name == RUNTIME {
-            let pending: Vec<String> = ops[i + 1..]
-                .iter()
-                .map(|o| match o {
-                    ModuleOp::Start(n) | ModuleOp::Stop(n) => n.clone(),
-                })
-                .collect();
-            apply_runtime(k, slots, matches!(op, ModuleOp::Start(_)), &pending);
+            apply_runtime(k, slots, matches!(op, ModOp::Start(_)));
             continue;
         }
         // a file system driver of that name goes (unmounting what it had)
         let was_fs = drop_filesystem(k, name);
-        if was_fs && matches!(op, ModuleOp::Stop(_)) {
+        if was_fs && matches!(op, ModOp::Stop(_)) {
             kprintln!("modules: {} stopped", name);
             continue;
         }
@@ -477,13 +265,13 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
             set_slot(k, id, "", Caps::NONE);
             k.app_status.retain(|s| s.name != name);
         }
-        if let ModuleOp::Stop(_) = op {
+        if let ModOp::Stop(_) = op {
             if existing.is_some() {
                 kprintln!("modules: {} stopped", name);
             }
             continue;
         }
-        let Some((kind, image)) = choose(k, name) else {
+        let Some((kind, image)) = manager(k, |m, h| m.choose(h, name)).flatten() else {
             kprintln!("modules: {}: nothing runnable installed", name);
             continue;
         };
@@ -559,18 +347,12 @@ pub fn refresh_status(k: &mut Kernel, slots: &mut [Slot]) {
 
 // ---------------------------------------------------------------- file system drivers
 
-/// The kv mark a file system driver gets once loaded (so it starts first later).
-const ROLE: &str = "role";
-const ROLE_FS: &[u8] = b"fs";
-
 /// A file system driver loaded: kept, and the files partition mounted with
 /// it if it is the one for it.
 fn add_filesystem(k: &mut Kernel, name: &'static str, m: crate::loader::Module, size: usize) {
     let Some(Export::Filesystem(fs)) = m.export.as_ref() else { return };
     let (fs_name, version) = (fs.name(), fs.version());
-    if get(k, &key(name, ROLE)).as_deref() != Some(ROLE_FS) {
-        let _ = put(k, &key(name, ROLE), ROLE_FS);
-    }
+    manager(k, |m, h| m.is_filesystem(h, name));
     k.filesystems.push((name, m));
     kprintln!("modules: {} started (file system {}, {} KiB)", name, fs_name, size / 1024);
     k.app_status.push(ModuleStatus { name, kind: ModuleKind::Native, state: format!("file system {fs_name}"), restarts: 0, params: Vec::new(), version });

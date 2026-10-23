@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustros_api::Module;
-use rustros_api::module::{Driver, Export, NetStack, Storage};
+use rustros_api::module::{Driver, Export, ModManager, NetStack, Storage};
 use rustros_util::sha256::Sha256;
 
 const MAGIC: &[u8; 8] = b"RRSBNDL1";
@@ -66,6 +66,7 @@ pub struct Boot {
     pub drivers: Vec<Box<dyn Driver>>,
     pub storage: Option<Box<dyn Storage>>,
     pub netstack: Option<Box<dyn NetStack>>,
+    pub manager: Option<Box<dyn ModManager>>,
 }
 
 impl Boot {
@@ -76,6 +77,7 @@ impl Boot {
             Export::Driver(d) => self.drivers.push(d),
             Export::Storage(s) => self.storage = Some(s),
             Export::NetStack(n) => self.netstack = Some(n),
+            Export::Manager(m) => self.manager = Some(m),
             Export::Many(v) => v.into_iter().for_each(|e| self.take(e)),
             _ => crate::kprintln!("modules: a boot module holds apps, drivers, storage and the network stack only"),
         }

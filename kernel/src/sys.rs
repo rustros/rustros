@@ -22,6 +22,7 @@ use crate::{arch, console, kprintln, modules};
 const INJECT_MAX: usize = 4096;
 /// Frames the stack sent, waiting for the egress hook, at most.
 const STACK_TX_MAX: usize = 4096;
+const NO_MANAGER: &str = "no module manager in this system";
 
 /// A logical interface: a NIC, or a VLAN on one. The NICs come first, so
 /// interface `i < nics.len()` is NIC `i`.
@@ -100,8 +101,8 @@ pub struct Kernel {
     pub filesystems: Vec<(&'static str, crate::loader::Module)>,
     /// the driver that has the files partition mounted
     pub files_fs: Option<usize>,
-    /// Requested installs/switches/removals, applied by the main loop.
-    pub app_ops: Vec<modules::ModuleOp>,
+    /// The installed modules' bookkeeping (the boot module's).
+    pub manager: Option<Box<dyn rustros_api::module::ModManager>>,
     pub app_status: Vec<modules::ModuleStatus>,
     /// Boots in a row that did not run stable (from grubenv via GRUB).
     pub unstable_boots: u32,
@@ -137,7 +138,7 @@ impl Kernel {
             runtime_module: None,
             filesystems: Vec::new(),
             files_fs: None,
-            app_ops: Vec::new(),
+            manager: None,
             app_status: Vec::new(),
             unstable_boots: 1,
             safe_mode: false,
@@ -780,35 +781,22 @@ impl Admin for Ctx<'_> {
         self.k.boot.as_mut().is_some_and(|b| b.confirm())
     }
     fn module_install(&mut self, name: &str, image: &[u8]) -> Result<ModuleKind, String> {
-        modules::install(self.k, name, image)
+        modules::manager(self.k, |m, h| m.install(h, name, image)).unwrap_or_else(|| Err(String::from(NO_MANAGER)))
     }
     fn module_remove(&mut self, name: &str, kind: Option<ModuleKind>) -> bool {
-        modules::remove(self.k, name, kind)
+        modules::manager(self.k, |m, h| m.remove(h, name, kind)).unwrap_or(false)
     }
     fn module_switch(&mut self, name: &str, kind: ModuleKind) -> Result<(), String> {
-        modules::switch(self.k, name, kind)
+        modules::manager(self.k, |m, h| m.switch(h, name, kind)).unwrap_or_else(|| Err(String::from(NO_MANAGER)))
     }
-    fn module_list(&self) -> Vec<ModuleInfo> {
-        modules::list(self.k)
+    fn module_list(&mut self) -> Vec<ModuleInfo> {
+        let running = modules::running(self.k);
+        modules::manager(self.k, |m, h| m.list(h, running)).unwrap_or_default()
     }
-    fn module_config(&self, name: &str) -> Vec<(String, String)> {
-        let prefix = format!("{name}/cfg/");
-        let Some(b) = self.k.boot.as_ref() else { return Vec::new() };
-        b.kv_keys(&prefix)
-            .into_iter()
-            .map(|k| (String::from(&k[prefix.len()..]), String::from_utf8_lossy(b.kv_get(&k).unwrap_or(b"")).into_owned()))
-            .collect()
+    fn module_config(&mut self, name: &str) -> Vec<(String, String)> {
+        modules::manager(self.k, |m, h| m.config(h, name)).unwrap_or_default()
     }
     fn module_config_set(&mut self, name: &str, key: &str, value: Option<&str>) -> Result<(), String> {
-        let ok = |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_graphic() && c != b'/');
-        if !ok(name) || !ok(key) {
-            return Err(String::from("bad module or key name"));
-        }
-        let k = format!("{name}/cfg/{key}");
-        let b = self.k.boot.as_mut().ok_or_else(|| String::from("no storage"))?;
-        match value {
-            Some(v) => b.kv_put(&k, v.as_bytes()).map_err(|e| format!("{e:?}")),
-            None => b.kv_delete(&k).map(|_| ()).map_err(|e| format!("{e:?}")),
-        }
+        modules::manager(self.k, |m, h| m.config_set(h, name, key, value)).unwrap_or_else(|| Err(String::from(NO_MANAGER)))
     }
 }

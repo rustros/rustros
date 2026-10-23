@@ -49,6 +49,8 @@ pub enum Export {
     Filesystem(Box<dyn Filesystem>),
     /// The system's network stack (a boot module's).
     NetStack(Box<dyn NetStack>),
+    /// The installed modules' bookkeeping (a boot module's).
+    Manager(Box<dyn ModManager>),
 }
 
 /// A file system driver, a module of its own. The kernel lends it the files
@@ -388,4 +390,60 @@ pub trait NetStack {
     fn raw_recv(&mut self, owner: usize, s: RawSocket, buf: &mut [u8]) -> Result<(usize, Ip, u8), NetError>;
     fn raw_send(&mut self, owner: usize, link: &mut dyn Link, s: RawSocket, dst: Ip, payload: &[u8]) -> Result<(), NetError>;
     fn raw_close(&mut self, owner: usize, s: RawSocket);
+}
+
+// ---------------------------------------------------------------- module manager
+
+use crate::sys::{ModuleInfo, ModuleKind};
+
+/// The WebAssembly runtime is the native module installed under this name.
+pub const RUNTIME: &str = "wasm";
+
+/// What the module manager asks the kernel to do with a module.
+pub enum ModOp {
+    /// (Re)start it in its preferred available form (`ModManager::choose`).
+    Start(String),
+    Stop(String),
+}
+
+/// What the module manager gets from the kernel.
+pub trait ModHost {
+    /// The boot disk's services (the store the modules are kept in).
+    fn store(&mut self) -> Option<&mut dyn Storage>;
+    fn cmdline(&self) -> &str;
+    /// A line for the console and the boot log.
+    fn log(&mut self, line: &str);
+    /// What `image` is, if the system can run it: a native module, or a
+    /// format the runtime takes (checked by it).
+    fn check(&self, image: &[u8]) -> Result<ModuleKind, String>;
+    fn has_runtime(&self) -> bool;
+    fn is_builtin(&self, name: &str) -> bool;
+    fn is_running(&self, name: &str) -> bool;
+}
+
+/// The installed modules: how they are stored, which form runs, what starts
+/// at boot. The kernel runs them (loading, the app table, crash attribution)
+/// and applies the operations queued here between main loop passes.
+pub trait ModManager {
+    fn install(&mut self, host: &mut dyn ModHost, name: &str, image: &[u8]) -> Result<ModuleKind, String>;
+    /// Both forms (`kind` None) or one.
+    fn remove(&mut self, host: &mut dyn ModHost, name: &str, kind: Option<ModuleKind>) -> bool;
+    fn switch(&mut self, host: &mut dyn ModHost, name: &str, kind: ModuleKind) -> Result<(), String>;
+    /// The installed modules, with what `running` (the kernel's) says of
+    /// those that run.
+    fn list(&self, host: &mut dyn ModHost, running: Vec<ModuleInfo>) -> Vec<ModuleInfo>;
+    /// A module's settings (`cfg <module> <key> <value>`).
+    fn config(&self, host: &mut dyn ModHost, name: &str) -> Vec<(String, String)>;
+    fn config_set(&mut self, host: &mut dyn ModHost, name: &str, key: &str, value: Option<&str>) -> Result<(), String>;
+    /// At boot (not in safe mode): queue every installed module.
+    fn boot(&mut self, host: &mut dyn ModHost);
+    /// The next queued operation.
+    fn next_op(&mut self) -> Option<ModOp>;
+    /// The form to run `name` in, and its image (`RUNTIME`: native only).
+    fn choose(&mut self, host: &mut dyn ModHost, name: &str) -> Option<(ModuleKind, Vec<u8>)>;
+    /// `name` turned out to be a file system driver (it starts first from now on).
+    fn is_filesystem(&mut self, host: &mut dyn ModHost, name: &str);
+    /// The runtime changed: `stopped` (its instances) and every installed
+    /// module not running get another chance.
+    fn runtime_changed(&mut self, host: &mut dyn ModHost, stopped: Vec<String>);
 }

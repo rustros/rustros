@@ -104,6 +104,8 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.slots]
 opt-level = "z"
+[profile.release.package.modman]
+opt-level = "z"
 [profile.release.package.virtio]
 opt-level = 3
 # the boot module's network stack: the data path, as in the kernel before

@@ -1,0 +1,13 @@
+[package]
+name = "modman"
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[lib]
+bench = false
+
+[dependencies]
+rustros-api = { path = "../api" }
+rustros-util = { path = "../util" }

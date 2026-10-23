@@ -334,6 +334,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // boot modules get what they ask for
     k.caps = slots.iter_mut().map(|s| s.app().map_or(Caps::NONE, |a| a.caps())).collect();
     k.builtin_names = k.names.clone();
+    k.manager = bm.manager.take();
     k.stack.set_owner_names(k.names.clone());
     kprintln!("modules: {} (boot modules)", k.names.join(", "));
     for id in 0..slots.len() {
@@ -416,9 +417,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 }
             }
         }
-        if !k.app_ops.is_empty() {
-            modules::apply(&mut k, &mut slots);
-        }
+        modules::apply(&mut k, &mut slots);
         if k.net_deadline.is_some_and(|t| arch::now_ms() >= t) && k.net_revert() {
             kprintln!("net: apply not confirmed in time, previous configuration restored (the candidate is kept)");
         }
