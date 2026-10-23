@@ -7,14 +7,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustros_util::wire::Ip;
-use rustros_api::{
-    IfConf, NetConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetError, NetInfo, RawSocket, SocketAddr, StorageInfo, Sys, TcpListener, TcpStream,
-    UdpSocket, UpdateInfo, Frame, Verdict,
-};
+use rustros_api::{IfConf, NetConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetInfo, StorageInfo, Sys, UpdateInfo, Frame, Verdict};
 
 use devices::NetDevice;
 
 use rustros_api::module::{Disk, Export, Filesystem, Link, NetStack, Runtime, Storage};
+use rustros_api::socket::{Epoll, EpollEvent, SockAddr, SockResult, Socket};
 
 use crate::{arch, console, kprintln, modules};
 
@@ -254,6 +252,11 @@ impl Link for NicLink<'_> {
     fn random(&mut self) -> u64 {
         next_random(self.seed)
     }
+    fn notify(&mut self, _owner: usize, _sock: Socket, _events: u32) {
+        // Nothing sleeps on a socket yet: apps are polled, and their epoll
+        // instances are the stack's. The process layer's wait queues (blocked
+        // calls, epoll over all descriptors) hook in here.
+    }
 }
 
 /// What an application sees as `&mut dyn Sys`.
@@ -355,85 +358,78 @@ impl Net for Ctx<'_> {
     fn tcp_connections(&self) -> Vec<ConnInfo> {
         self.k.stack.connections()
     }
-    fn udp_bind(&mut self, port: u16) -> Result<UdpSocket, NetError> {
+    fn socket(&mut self, domain: i32, ty: i32, protocol: i32) -> SockResult<Socket> {
+        self.k.stack.socket(self.id, domain, ty, protocol)
+    }
+    fn bind(&mut self, s: Socket, addr: &SockAddr) -> SockResult<()> {
         let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.udp_bind(id, &mut l, port)
+        let (st, mut link) = self.k.net();
+        st.bind(id, &mut link, s, addr)
     }
-    fn udp_local_port(&self, s: UdpSocket) -> Result<u16, NetError> {
-        self.k.stack.udp_local_port(self.id, s)
-    }
-    fn udp_send_to(&mut self, s: UdpSocket, to: SocketAddr, data: &[u8]) -> Result<(), NetError> {
+    fn listen(&mut self, s: Socket, backlog: i32) -> SockResult<()> {
         let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.udp_send_to(id, &mut l, s, to, data)
+        let (st, mut link) = self.k.net();
+        st.listen(id, &mut link, s, backlog)
     }
-    fn udp_recv_from(&mut self, s: UdpSocket, buf: &mut [u8]) -> Result<(usize, SocketAddr), NetError> {
-        self.k.stack.udp_recv_from(self.id, s, buf)
-    }
-    fn udp_close(&mut self, s: UdpSocket) {
-        self.k.stack.udp_close(self.id, s);
-    }
-    fn tcp_listen(&mut self, port: u16) -> Result<TcpListener, NetError> {
-        self.k.stack.tcp_listen(self.id, port)
-    }
-    fn tcp_unlisten(&mut self, lst: TcpListener) {
+    fn accept(&mut self, s: Socket, flags: i32) -> SockResult<(Socket, SockAddr)> {
         let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.tcp_unlisten(id, &mut l, lst);
+        let (st, mut link) = self.k.net();
+        st.accept(id, &mut link, s, flags)
     }
-    fn tcp_accept(&mut self, lst: TcpListener) -> Result<(TcpStream, SocketAddr), NetError> {
-        self.k.stack.tcp_accept(self.id, lst)
-    }
-    fn tcp_connect(&mut self, to: SocketAddr) -> Result<TcpStream, NetError> {
+    fn connect(&mut self, s: Socket, addr: &SockAddr) -> SockResult<()> {
         let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.tcp_connect_from(id, &mut l, 0, to)
+        let (st, mut link) = self.k.net();
+        st.connect(id, &mut link, s, addr)
     }
-    fn tcp_connect_from(&mut self, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError> {
+    fn sendto(&mut self, s: Socket, data: &[u8], flags: i32, to: Option<&SockAddr>) -> SockResult<usize> {
         let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.tcp_connect_from(id, &mut l, src, to)
+        let (st, mut link) = self.k.net();
+        st.sendto(id, &mut link, s, data, flags, to)
     }
-    fn tcp_local_addr(&self, s: TcpStream) -> Result<SocketAddr, NetError> {
-        self.k.stack.tcp_local_addr(self.id, s)
-    }
-    fn tcp_is_connected(&self, s: TcpStream) -> Result<bool, NetError> {
-        self.k.stack.tcp_is_connected(self.id, s)
-    }
-    fn tcp_read(&mut self, s: TcpStream, buf: &mut [u8]) -> Result<usize, NetError> {
+    fn recvfrom(&mut self, s: Socket, buf: &mut [u8], flags: i32) -> SockResult<(usize, Option<SockAddr>)> {
         let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.tcp_read(id, &mut l, s, buf)
+        let (st, mut link) = self.k.net();
+        st.recvfrom(id, &mut link, s, buf, flags)
     }
-    fn tcp_write(&mut self, s: TcpStream, data: &[u8]) -> Result<usize, NetError> {
+    fn shutdown(&mut self, s: Socket, how: i32) -> SockResult<()> {
         let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.tcp_write(id, &mut l, s, data)
+        let (st, mut link) = self.k.net();
+        st.shutdown(id, &mut link, s, how)
     }
-    fn tcp_close(&mut self, s: TcpStream) {
+    fn close(&mut self, s: Socket) -> SockResult<()> {
         let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.tcp_close(id, &mut l, s);
+        let (st, mut link) = self.k.net();
+        st.close(id, &mut link, s)
     }
-    fn tcp_abort(&mut self, s: TcpStream) {
-        let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.tcp_abort(id, &mut l, s);
+    fn getsockname(&self, s: Socket) -> SockResult<SockAddr> {
+        self.k.stack.getsockname(self.id, s)
     }
-    fn raw_open(&mut self, proto: u8) -> Result<RawSocket, NetError> {
-        self.k.stack.raw_open(self.id, proto)
+    fn getpeername(&self, s: Socket) -> SockResult<SockAddr> {
+        self.k.stack.getpeername(self.id, s)
     }
-    fn raw_recv(&mut self, s: RawSocket, buf: &mut [u8]) -> Result<(usize, Ip, u8), NetError> {
-        self.k.stack.raw_recv(self.id, s, buf)
+    fn setsockopt(&mut self, s: Socket, level: i32, name: i32, value: &[u8]) -> SockResult<()> {
+        self.k.stack.setsockopt(self.id, s, level, name, value)
     }
-    fn raw_send(&mut self, s: RawSocket, dst: Ip, payload: &[u8]) -> Result<(), NetError> {
-        let id = self.id;
-        let (st, mut l) = self.k.net();
-        st.raw_send(id, &mut l, s, dst, payload)
+    fn getsockopt(&mut self, s: Socket, level: i32, name: i32, value: &mut [u8]) -> SockResult<usize> {
+        self.k.stack.getsockopt(self.id, s, level, name, value)
     }
-    fn raw_close(&mut self, s: RawSocket) {
-        self.k.stack.raw_close(self.id, s);
+    fn ioctl(&mut self, s: Socket, request: u32, arg: u64) -> SockResult<u64> {
+        self.k.stack.ioctl(self.id, s, request, arg)
+    }
+    fn sock_poll(&self, s: Socket) -> SockResult<(u32, u64)> {
+        self.k.stack.sock_poll(self.id, s)
+    }
+    fn epoll_create(&mut self) -> SockResult<Epoll> {
+        self.k.stack.epoll_create(self.id)
+    }
+    fn epoll_ctl(&mut self, ep: Epoll, op: i32, s: Socket, events: u32, data: u64) -> SockResult<()> {
+        self.k.stack.epoll_ctl(self.id, ep, op, s, events, data)
+    }
+    fn epoll_wait(&mut self, ep: Epoll, out: &mut [EpollEvent]) -> SockResult<usize> {
+        self.k.stack.epoll_wait(self.id, ep, out)
+    }
+    fn epoll_close(&mut self, ep: Epoll) -> SockResult<()> {
+        self.k.stack.epoll_close(self.id, ep)
     }
 }
 

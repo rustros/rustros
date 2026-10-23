@@ -48,11 +48,8 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub(crate) fn to_raw(self) -> u64 {
+    pub fn to_raw(self) -> u64 {
         (self.idx as u64) << 32 | self.generation as u64
-    }
-    pub(crate) fn from_raw(raw: u64) -> Handle {
-        Handle { idx: (raw >> 32) as usize, generation: raw as u32 }
     }
 }
 
@@ -91,10 +88,38 @@ struct Slot {
     sock: Option<Sock>,
 }
 
+/// What happened to a connection (for the socket layer's notifications).
+pub const EV_DATA: u8 = 1;
+/// Send space freed (data acknowledged).
+pub const EV_SPACE: u8 = 2;
+/// An outgoing connection is established.
+pub const EV_CONNECTED: u8 = 4;
+/// The peer sent FIN.
+pub const EV_FIN: u8 = 8;
+
+/// Why a connection went away.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Gone {
+    /// Both sides closed (FIN handshake done, TIME-WAIT over).
+    Done,
+    Refused,
+    Reset,
+    TimedOut,
+}
+
+pub enum Event {
+    Conn(Handle, u8),
+    Gone(Handle, Gone),
+    /// A connection on this port is ready to be accepted.
+    Accept(u16),
+}
+
 pub struct Tcp {
     slots: Vec<Slot>,
     listening: Vec<u16>,
     max_conns: usize,
+    /// What happened since the socket layer last looked (`take_events`).
+    events: Vec<Event>,
 }
 
 /// Our MSS: what fits in one IP packet on the interface towards `rip`.
@@ -226,7 +251,7 @@ impl Sock {
 
 impl Tcp {
     pub fn new(max_conns: usize) -> Tcp {
-        Tcp { slots: Vec::new(), listening: Vec::new(), max_conns }
+        Tcp { slots: Vec::new(), listening: Vec::new(), max_conns, events: Vec::new() }
     }
 
     pub fn listen(&mut self, port: u16) {
@@ -273,6 +298,49 @@ impl Tcp {
     fn free(&mut self, idx: usize) {
         self.slots[idx].sock = None;
         self.slots[idx].generation = self.slots[idx].generation.wrapping_add(1);
+    }
+
+    /// Free a connection that went away by itself, telling the socket layer why.
+    fn gone(&mut self, idx: usize, why: Gone) {
+        let h = Handle { idx, generation: self.slots[idx].generation };
+        self.events.push(Event::Gone(h, why));
+        self.free(idx);
+    }
+
+    fn event(&mut self, idx: usize, ev: u8) {
+        let h = Handle { idx, generation: self.slots[idx].generation };
+        match self.events.last_mut() {
+            Some(Event::Conn(last, bits)) if *last == h => *bits |= ev,
+            _ => self.events.push(Event::Conn(h, ev)),
+        }
+    }
+
+    pub fn take_events(&mut self) -> Vec<Event> {
+        core::mem::take(&mut self.events)
+    }
+
+    /// A connection on `port` is waiting to be accepted.
+    pub fn acceptable(&self, port: u16) -> bool {
+        self.connections().any(|s| !s.accepted && s.lport == port && s.state != State::SynRcvd)
+    }
+
+    /// Bytes received and not yet read; bytes not yet acknowledged.
+    pub fn queued(&self, h: Handle) -> (usize, usize) {
+        self.get(h).map_or((0, 0), |s| (s.rx.len(), s.tx.len()))
+    }
+
+    pub fn mss(&self, h: Handle) -> usize {
+        self.get(h).map_or(536, |s| s.mss)
+    }
+
+    /// shutdown(SHUT_WR): FIN after the queued data; receiving goes on.
+    pub fn shutdown_write(&mut self, iface: &mut Ifaces, link: &mut dyn Link, h: Handle) {
+        let Some(s) = self.get_mut(h) else { return };
+        if s.state == State::SynSent || s.state == State::SynRcvd {
+            return;
+        }
+        s.fin_queued = true;
+        s.output(iface, link);
     }
 
     pub fn sock(&self, h: Handle) -> Option<&Sock> {
@@ -351,21 +419,9 @@ impl Tcp {
         self.listening.contains(&port) || self.connections().any(|s| s.lport == port)
     }
 
-    /// Handshake finished (false while an outgoing connect is pending).
-    pub fn is_established(&self, h: Handle) -> Option<bool> {
-        self.get(h).map(|s| s.state != State::SynSent)
-    }
-
-    /// True once the connection is gone (closed, reset or timed out).
-    pub fn is_closed(&self, h: Handle) -> bool {
-        self.get(h).is_none()
-    }
-
-    /// The peer has sent FIN and all its data has been read.
-    pub fn peer_done(&self, h: Handle) -> bool {
-        self.get(h).is_none_or(|s| {
-            s.rx.is_empty() && matches!(s.state, State::CloseWait | State::LastAck | State::Closing | State::TimeWait)
-        })
+    /// The peer has sent FIN (there may still be data to read).
+    pub fn fin_received(&self, h: Handle) -> bool {
+        self.get(h).is_some_and(|s| matches!(s.state, State::CloseWait | State::LastAck | State::Closing | State::TimeWait))
     }
 
     /// Received data, not yet consumed.
@@ -374,6 +430,7 @@ impl Tcp {
     }
 
     /// Drop `n` bytes of received data; may send a window update.
+    #[inline(never)]
     pub fn consume(&mut self, iface: &mut Ifaces, link: &mut dyn Link, h: Handle, n: usize) {
         let Some(s) = self.get_mut(h) else { return };
         let before = s.wnd() as usize;
@@ -383,20 +440,13 @@ impl Tcp {
         }
     }
 
-    pub fn recv(&mut self, iface: &mut Ifaces, link: &mut dyn Link, h: Handle, buf: &mut [u8]) -> usize {
-        let data = self.peek(h);
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        self.consume(iface, link, h, n);
-        n
-    }
-
     /// Free space in the send buffer.
     pub fn send_space(&self, h: Handle) -> usize {
         self.get(h).map_or(0, |s| if s.fin_queued { 0 } else { TX_CAP - s.tx.len() })
     }
 
     /// Queue data for sending; returns how many bytes were accepted.
+    #[inline(never)]
     pub fn send(&mut self, iface: &mut Ifaces, link: &mut dyn Link, h: Handle, data: &[u8]) -> usize {
         let space = self.send_space(h);
         let Some(s) = self.get_mut(h) else { return 0 };
@@ -439,6 +489,7 @@ impl Tcp {
     /// `open`: new connections and resets for unknown ones (an interface's
     /// own address); otherwise only existing connections (an extra address
     /// a connection was made from).
+    #[inline(never)]
     pub fn input(&mut self, iface: &mut Ifaces, link: &mut dyn Link, pkt: &IpPkt, open: bool) {
         let seg = pkt.payload;
         if seg.len() < 20 || checksum(seg, pseudo(pkt.src, pkt.dst, PROTO_TCP, seg.len())) != 0 {
@@ -500,6 +551,7 @@ impl Tcp {
         };
 
         let s = self.slots[idx].sock.as_mut().unwrap();
+        let mut ev = 0;
         if s.state == State::SynSent {
             // only a SYN-ACK for our SYN (or a RST refusing it) is acceptable
             if flags & ACK != 0 && ack != s.snd_nxt {
@@ -510,7 +562,7 @@ impl Tcp {
             }
             if flags & RST != 0 {
                 if flags & ACK != 0 {
-                    self.free(idx); // connection refused
+                    self.gone(idx, Gone::Refused);
                 }
                 return;
             }
@@ -527,12 +579,13 @@ impl Tcp {
             s.retries = 0;
             s.seg(iface, link, s.snd_nxt, ACK, &[]);
             s.output(iface, link);
+            self.event(idx, EV_CONNECTED);
             return;
         }
         if flags & RST != 0 {
             let in_wnd = seq.wrapping_sub(s.rcv_nxt) <= s.wnd() as u32;
             if in_wnd {
-                self.free(idx);
+                self.gone(idx, Gone::Reset);
             }
             return;
         }
@@ -558,9 +611,16 @@ impl Tcp {
             s.rtx_at = 0;
             s.rto = RTO_INIT;
             s.retries = 0;
+            if !s.accepted {
+                let port = s.lport;
+                self.events.push(Event::Accept(port));
+            }
         } else if lt(s.snd_una, ack) && le(ack, s.snd_max) {
             let n = ack.wrapping_sub(s.snd_una) as usize;
             let fin_acked = s.fin_queued && n == s.tx.len() + 1;
+            if n > 0 && !s.tx.is_empty() {
+                ev |= EV_SPACE;
+            }
             s.tx.drain(..n.min(s.tx.len()));
             s.snd_una = ack;
             if lt(s.snd_nxt, ack) {
@@ -580,7 +640,7 @@ impl Tcp {
                         s.deadline = now + TIME_WAIT_MS;
                     }
                     State::LastAck => {
-                        self.free(idx);
+                        self.gone(idx, Gone::Done);
                         return;
                     }
                     _ => {}
@@ -598,11 +658,15 @@ impl Tcp {
                 let take = part.len().min(RX_CAP - s.rx.len());
                 s.rx.extend_from_slice(&part[..take]);
                 s.rcv_nxt = s.rcv_nxt.wrapping_add(take as u32);
+                if take > 0 {
+                    ev |= EV_DATA;
+                }
             }
         }
         if flags & FIN != 0 {
             let fin_seq = seq.wrapping_add(data.len() as u32);
             if fin_seq == s.rcv_nxt && s.state != State::SynRcvd {
+                ev |= EV_FIN;
                 s.rcv_nxt = s.rcv_nxt.wrapping_add(1);
                 s.state = match s.state {
                     State::Established => State::CloseWait,
@@ -621,15 +685,19 @@ impl Tcp {
             s.seg(iface, link, s.snd_nxt, ACK, &[]);
         }
         s.output(iface, link);
+        if ev != 0 {
+            self.event(idx, ev);
+        }
     }
 
     /// Retransmissions and timeouts; call regularly.
+    #[inline(never)]
     pub fn poll(&mut self, iface: &mut Ifaces, link: &mut dyn Link) {
         let now = link.now_ms();
         for idx in 0..self.slots.len() {
             let Some(s) = self.slots[idx].sock.as_mut() else { continue };
             if matches!(s.state, State::TimeWait | State::FinWait2) && now >= s.deadline {
-                self.free(idx);
+                self.gone(idx, Gone::Done);
                 continue;
             }
             if s.rtx_at == 0 || now < s.rtx_at {
@@ -637,12 +705,12 @@ impl Tcp {
             }
             s.retries += 1;
             if s.state == State::SynSent && s.retries > SYN_RETRIES {
-                self.free(idx); // connect timed out
+                self.gone(idx, Gone::TimedOut); // connect timed out
                 continue;
             }
             if s.retries > MAX_RETRIES {
                 s.seg(iface, link, s.snd_nxt, RST | ACK, &[]);
-                self.free(idx);
+                self.gone(idx, Gone::TimedOut);
                 continue;
             }
             s.rto = (s.rto * 2).min(RTO_MAX);

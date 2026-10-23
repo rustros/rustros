@@ -151,6 +151,7 @@ impl Iface {
     /// here; other IPv4 packets for us are returned to the caller.
     /// `elsewhere(ip)`: an address of another interface (pings to those are
     /// answered too, as on Linux).
+    #[inline(never)]
     pub fn handle<'a>(&mut self, link: &mut dyn Link, frame: &'a [u8], elsewhere: &dyn Fn(Ip) -> bool) -> Option<IpPkt<'a>> {
         self.stats.rx += 1;
         if frame.len() < 14 {
@@ -294,6 +295,7 @@ impl Iface {
     }
 
     /// Expire stale ARP entries and unanswered pending packets.
+    #[inline(never)]
     pub fn poll(&mut self, link: &mut dyn Link) {
         let now = link.now_ms();
         let before = self.pending.iter().filter(|q| !q.1.is_empty()).count();
@@ -405,6 +407,7 @@ impl Ifaces {
 
     /// Send from our address `src` (0: the outgoing interface's), routed
     /// for that source.
+    #[inline(never)]
     pub fn send_ip_from(&mut self, link: &mut dyn Link, src: Ip, dst: Ip, proto: u8, payload: &[u8]) -> bool {
         if dst == BROADCAST {
             return self.0[0].send_ip(link, dst, proto, payload);
@@ -440,6 +443,7 @@ impl Ifaces {
         self.send_udp_from(link, 0, dst, sport, dport, data)
     }
 
+    #[inline(never)]
     pub fn send_udp_from(&mut self, link: &mut dyn Link, src: Ip, dst: Ip, sport: u16, dport: u16, data: &[u8]) -> bool {
         if dst == BROADCAST {
             return self.0[0].send_udp(link, dst, sport, dport, data);

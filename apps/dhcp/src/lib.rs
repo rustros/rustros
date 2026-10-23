@@ -11,7 +11,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Module, SocketAddr, Sys, UdpSocket, say};
+use rustros_api::socket::{SockAddr, Socket};
+use rustros_api::{Caps, Module, Sys, say};
 use rustros_util::wire::{BROADCAST, Ip, IpFmt};
 
 const CLIENT_PORT: u16 = 68;
@@ -143,7 +144,7 @@ enum State {
 }
 
 pub struct Dhcp {
-    sock: Option<UdpSocket>,
+    sock: Option<Socket>,
     state: State,
     xid: u32,
     mac: [u8; 6],
@@ -164,7 +165,7 @@ impl Dhcp {
     fn send(&mut self, sys: &mut dyn Sys, to: Ip, kind: u8, ciaddr: Ip, requested: Ip, server: Ip) {
         let pkt = build(kind, self.xid, self.mac, ciaddr, requested, server, &self.hostname);
         let (Some(sock), Some(net)) = (self.sock, sys.net()) else { return };
-        let _ = net.udp_send_to(sock, SocketAddr { ip: to, port: SERVER_PORT }, &pkt);
+        let _ = net.sendto(sock, &pkt, 0, Some(&SockAddr::v4(to, SERVER_PORT)));
     }
 
     fn discover(&mut self, sys: &mut dyn Sys, backoff: u64) {
@@ -283,7 +284,7 @@ impl Module for Dhcp {
         }
         self.mac = info.mac;
         self.hostname = alloc::format!("rustros-{:02x}{:02x}{:02x}", info.mac[3], info.mac[4], info.mac[5]).into_bytes();
-        match net.udp_bind(CLIENT_PORT) {
+        match rustros_util::sock::udp_bind(net, CLIENT_PORT) {
             Ok(s) => self.sock = Some(s),
             Err(e) => {
                 say!(sys, "dhcp: cannot bind port {}: {:?}\n", CLIENT_PORT, e);
@@ -307,15 +308,15 @@ impl Module for Dhcp {
         if current != 0 && current != ours {
             say!(sys, "dhcp: address set by hand ({}), stopping\n", IpFmt(current));
             if let (Some(s), Some(net)) = (self.sock.take(), sys.net()) {
-                net.udp_close(s);
+                let _ = net.close(s);
             }
             self.state = State::Off;
             return;
         }
         let mut buf = [0u8; 1500];
         while let (Some(sock), Some(net)) = (self.sock, sys.net()) {
-            let Ok((n, from)) = net.udp_recv_from(sock, &mut buf) else { break };
-            if from.port != SERVER_PORT {
+            let Ok((n, from)) = net.recvfrom(sock, &mut buf, 0) else { break };
+            if from.map(|a| a.port()) != Some(SERVER_PORT) {
                 continue;
             }
             if let Some(r) = parse(&buf[..n], self.xid, self.mac) {

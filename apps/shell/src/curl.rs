@@ -12,7 +12,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::{SocketAddr, Sys, UdpSocket, say};
+use rustros_api::socket::{SockAddr, Socket};
+use rustros_api::{Sys, say};
 use rustros_util::conn::Conn;
 use rustros_util::dns;
 use rustros_util::wire::{Ip, IpFmt, parse_ip};
@@ -27,7 +28,7 @@ const SHOW_MAX: usize = 64 * 1024;
 enum Phase {
     /// connect to this address on the next poll
     Start(Ip),
-    Resolve { sock: UdpSocket, id: u16, server: Ip, sent: u64, tries: u8 },
+    Resolve { sock: Socket, id: u16, server: Ip, sent: u64, tries: u8 },
     Fetch { conn: Conn, tls: Option<Tls>, connected: bool, head: Vec<u8>, header_done: bool, shown: usize },
 }
 
@@ -251,7 +252,7 @@ impl Curl {
                     .or_else(|| sys.kv().and_then(|k| k.get("cfg/dns")).and_then(|v| parse_ip(core::str::from_utf8(&v).ok()?.trim())))
                     .unwrap_or(DNS_DEFAULT);
                 let net = sys.net().ok_or_else(|| String::from("curl: no network\n"))?;
-                let sock = net.udp_bind(0).map_err(|e| format!("curl: {e:?}\n"))?;
+                let sock = rustros_util::sock::udp_bind(net, 0).map_err(|e| format!("curl: {e:?}\n"))?;
                 let id = sys.random() as u16;
                 c.phase = Phase::Resolve { sock, id, server, sent: 0, tries: 0 };
             }
@@ -260,9 +261,9 @@ impl Curl {
     }
 
     fn connect(&mut self, sys: &mut dyn Sys, ip: Ip) -> Result<(), String> {
-        let to = SocketAddr { ip, port: self.port };
+        let to = SockAddr::v4(ip, self.port);
         let net = sys.net().ok_or_else(|| String::from("curl: no network\n"))?;
-        let s = if self.src != 0 { net.tcp_connect_from(self.src, to) } else { net.tcp_connect(to) }.map_err(|e| format!("curl: cannot connect to {to}: {e:?}\n"))?;
+        let s = if self.src != 0 { rustros_util::sock::tcp_connect(net, &to, self.src) } else { rustros_util::sock::tcp_connect(net, &to, 0) }.map_err(|e| format!("curl: cannot connect to {to}: {e:?}\n"))?;
         let mut conn = Conn::new(s, to);
         let default_port = if self.https { 443 } else { 80 };
         let host = if self.port == default_port { self.host.clone() } else { format!("{}:{}", self.host, self.port) };
@@ -337,13 +338,13 @@ impl Curl {
                 let (sock, id, server) = (*sock, *id, *server);
                 let Some(net) = sys.net() else { return true };
                 let mut buf = [0u8; 1500];
-                while let Ok((n, from)) = net.udp_recv_from(sock, &mut buf) {
-                    if from.ip != server {
+                while let Ok((n, from)) = net.recvfrom(sock, &mut buf, 0) {
+                    if from.and_then(|a| a.ipv4()) != Some(server) {
                         continue;
                     }
                     match dns::answer(&buf[..n], id) {
                         Some(Ok(ip)) => {
-                            net.udp_close(sock);
+                            let _ = net.close(sock);
                             if self.verbose {
                                 say!(sys, "* {} is {}\n", self.host, IpFmt(ip));
                             }
@@ -356,7 +357,7 @@ impl Curl {
                             };
                         }
                         Some(Err(())) => {
-                            net.udp_close(sock);
+                            let _ = net.close(sock);
                             self.fail(sys, format!("curl: (6) Could not resolve host: {}\n", self.host));
                             return true;
                         }
@@ -365,16 +366,16 @@ impl Curl {
                 }
                 if *sent == 0 || now - *sent >= DNS_RETRY_MS {
                     if *tries >= DNS_TRIES {
-                        net.udp_close(sock);
+                        let _ = net.close(sock);
                         self.fail(sys, format!("curl: (6) no answer from DNS server {}\n", IpFmt(server)));
                         return true;
                     }
                     *tries += 1;
                     *sent = now;
                     if let Some(q) = dns::query(id, &self.host) {
-                        let _ = net.udp_send_to(sock, SocketAddr { ip: server, port: 53 }, &q);
+                        let _ = net.sendto(sock, &q, 0, Some(&SockAddr::v4(server, 53)));
                     } else {
-                        net.udp_close(sock);
+                        let _ = net.close(sock);
                         self.fail(sys, format!("curl: (3) bad host name '{}'\n", self.host));
                         return true;
                     }
@@ -383,7 +384,7 @@ impl Curl {
             }
             Phase::Fetch { conn, tls, connected, head, header_done, shown } => {
                 let Some(net) = sys.net() else { return true };
-                let up = net.tcp_is_connected(conn.stream) == Ok(true);
+                let up = rustros_util::sock::connected(net, conn.stream) == Ok(true);
                 if let Some(t) = tls.as_mut() {
                     let out = t.take_outgoing();
                     conn.write(&out);
@@ -475,7 +476,7 @@ impl Curl {
                 }
                 if done {
                     if let (true, Some(net)) = (alive, sys.net()) {
-                        conn.close();
+                        let _ = conn.close();
                         conn.pump(net, 0);
                     }
                     let (connected, header_done) = (*connected, *header_done);
@@ -508,7 +509,9 @@ impl Curl {
         let Some(net) = sys.net() else { return };
         match &mut self.phase {
             Phase::Start(_) => {}
-            Phase::Resolve { sock, .. } => net.udp_close(*sock),
+            Phase::Resolve { sock, .. } => {
+                let _ = net.close(*sock);
+            }
             Phase::Fetch { conn, .. } => conn.abort(net),
         }
     }

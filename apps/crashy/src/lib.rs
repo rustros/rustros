@@ -20,13 +20,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use rustros_util::conn::Conn;
-use rustros_api::{Caps, Frame, Module, Sys, TcpListener, say};
+use rustros_api::socket::Socket;
+use rustros_api::{Caps, Frame, Module, Sys, say};
 
 const PORT: u16 = 7001;
 
 #[derive(Default)]
 pub struct Crashy {
-    listener: Option<TcpListener>,
+    listener: Option<Socket>,
     conns: Vec<Conn>,
     starts: u64,
     probe: Option<fn() -> i32>,
@@ -94,13 +95,13 @@ impl Module for Crashy {
         let n = kv.get("starts").map_or(0, |v| String::from_utf8_lossy(&v).parse().unwrap_or(0)) + 1;
         let _ = kv.put("starts", n.to_string().as_bytes());
         self.starts = n;
-        self.listener = sys.net().and_then(|net| net.tcp_listen(PORT).ok());
+        self.listener = sys.net().and_then(|net| rustros_util::sock::tcp_listen(net, PORT).ok());
         say!(sys, "crashy: listening on {} (start #{})\n", PORT, n);
     }
 
     fn poll(&mut self, sys: &mut dyn Sys) {
         if let Some(l) = self.listener {
-            while let Some(Ok((s, peer))) = sys.net().map(|n| n.tcp_accept(l)) {
+            while let Some(Ok((s, peer))) = sys.net().map(|n| n.accept(l, 0)) {
                 self.conns.push(Conn::new(s, peer));
             }
         }
@@ -115,7 +116,7 @@ impl Module for Crashy {
                 c.write(reply.as_bytes());
             }
             if c.eof {
-                c.close();
+                let _ = c.close();
             }
             c.pump(sys.net().unwrap(), 4096)
         });

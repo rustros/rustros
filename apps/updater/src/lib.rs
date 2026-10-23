@@ -39,7 +39,8 @@ use rustros_util::conn::Conn;
 use rustros_util::netcmd;
 use rustros_util::sha256::{Hmac, ct_eq};
 use rustros_util::wire::{IpFmt, cmdline_get};
-use rustros_api::{Caps, Module, ModuleInfo, ModuleKind, Sys, TcpListener, say};
+use rustros_api::socket::Socket;
+use rustros_api::{Caps, Module, ModuleInfo, ModuleKind, Sys, say};
 
 const PORT: u16 = 9000;
 const CHUNK: usize = 64 * 1024;
@@ -71,7 +72,7 @@ struct Session {
 #[derive(Default)]
 pub struct Updater {
     key: Vec<u8>,
-    listener: Option<TcpListener>,
+    listener: Option<Socket>,
     sessions: Vec<Session>,
     /// (when, power off instead of reboot)
     reboot_at: Option<(u64, bool)>,
@@ -86,7 +87,7 @@ impl Updater {
 impl Session {
     fn finish(&mut self, msg: &str) {
         self.conn.write(msg.as_bytes());
-        self.conn.close();
+        let _ = self.conn.close();
         self.phase = Phase::Done;
     }
 
@@ -106,7 +107,7 @@ impl Session {
                 Phase::Header => {
                     if input.len() < 37 {
                         if self.conn.eof {
-                            self.conn.close();
+                            let _ = self.conn.close();
                             self.phase = Phase::Done;
                         }
                         return None;
@@ -164,7 +165,7 @@ impl Session {
                 Phase::Body { cmd, left, mac, first, buf } => {
                     if input.is_empty() {
                         if self.conn.eof {
-                            self.conn.close();
+                            let _ = self.conn.close();
                             self.phase = Phase::Done;
                         }
                         return None;
@@ -195,7 +196,7 @@ impl Session {
                 Phase::Mac { cmd, mac, payload } => {
                     if input.len() < 32 {
                         if self.conn.eof {
-                            self.conn.close();
+                            let _ = self.conn.close();
                             self.phase = Phase::Done;
                         }
                         return None;
@@ -500,7 +501,7 @@ impl Module for Updater {
             return;
         }
         let Some(net) = sys.net() else { return };
-        match net.tcp_listen(PORT) {
+        match rustros_util::sock::tcp_listen(net, PORT) {
             Ok(l) => self.listener = Some(l),
             Err(e) => say!(sys, "updater: cannot listen on {}: {:?}\n", PORT, e),
         }
@@ -518,10 +519,10 @@ impl Module for Updater {
             }
         }
         let Some(l) = self.listener else { return };
-        while let Some(Ok((s, peer))) = sys.net().map(|n| n.tcp_accept(l)) {
+        while let Some(Ok((s, peer))) = sys.net().map(|n| n.accept(l, 0)) {
             if self.sessions.len() >= MAX_SESSIONS {
                 if let Some(n) = sys.net() {
-                    n.tcp_abort(s);
+                    rustros_util::sock::abort(n, s);
                 }
                 continue;
             }

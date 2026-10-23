@@ -7,15 +7,16 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use rustros_util::conn::Conn;
-use rustros_api::{Module, Sys, TcpListener, UdpSocket, say};
+use rustros_api::socket::Socket;
+use rustros_api::{Module, Sys, say};
 
 const PORT: u16 = 7;
 const LIMIT: usize = 64 * 1024;
 
 #[derive(Default)]
 pub struct Echo {
-    tcp: Option<TcpListener>,
-    udp: Option<UdpSocket>,
+    tcp: Option<Socket>,
+    udp: Option<Socket>,
     conns: Vec<Conn>,
 }
 
@@ -32,7 +33,7 @@ impl Module for Echo {
 
     fn start(&mut self, sys: &mut dyn Sys) {
         let Some(net) = sys.net() else { return };
-        match (net.tcp_listen(PORT), net.udp_bind(PORT)) {
+        match (rustros_util::sock::tcp_listen(net, PORT), rustros_util::sock::udp_bind(net, PORT)) {
             (Ok(t), Ok(u)) => {
                 self.tcp = Some(t);
                 self.udp = Some(u);
@@ -45,12 +46,12 @@ impl Module for Echo {
         let Some(net) = sys.net() else { return };
         if let Some(u) = self.udp {
             let mut buf = [0u8; 1500];
-            while let Ok((n, from)) = net.udp_recv_from(u, &mut buf) {
-                let _ = net.udp_send_to(u, from, &buf[..n]);
+            while let Ok((n, from)) = net.recvfrom(u, &mut buf, 0) {
+                let _ = net.sendto(u, &buf[..n], 0, from.as_ref());
             }
         }
         if let Some(l) = self.tcp {
-            while let Ok((s, peer)) = net.tcp_accept(l) {
+            while let Ok((s, peer)) = net.accept(l, 0) {
                 self.conns.push(Conn::new(s, peer));
             }
         }
@@ -64,7 +65,7 @@ impl Module for Echo {
                 c.pump(net, LIMIT);
             }
             if c.eof && c.inbuf.is_empty() {
-                c.close();
+                let _ = c.close();
             }
             true
         });

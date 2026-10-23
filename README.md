@@ -16,6 +16,7 @@ api/           rustros-api：应用接口 App/Sys、类型、错误码、WebAsse
 util/          rustros-util：给应用用的工具：Conn、地址和报文工具、SHA-256/HMAC
 devices/       设备接口：BlockDevice、NetDevice
 netstack/      协议栈（在引导模块里）：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发；网络配置：生效、候选、apply/确认/超时回滚，读取与保存（命令行/grubenv，util::netconf）
+tcpip/         协议栈里每个包都要经过的部分：IPv4 接口（以太网、ARP、IP、ICMP、路由）和 TCP，按 -O3 编译；netstack 的其余部分按 -Os 编译，让启动镜像放得进 256 KiB 的槽
 kvstore/       键值存储引擎（断电安全）
 storage/       存储服务（在引导模块里）：GPT 分区、kvstore、A/B 槽与 grubenv、开机日志、files 分区
 modman/        模块管理（在引导模块里）：已装模块的存放（sys/app/<名>/）、安装/删除/切换、选择原生或 WebAssembly 形式、开机顺序、崩溃后关掉原生形式、镜像自带模块；内核只负责加载和运行
@@ -167,43 +168,69 @@ pub trait App {
 ```
 
 `Sys` 提供的能力：
-- **socket：**
-  - UDP：`udp_bind`、`udp_send_to`、`udp_recv_from`
-  - TCP：`tcp_listen`、`tcp_accept`、`tcp_connect`、`tcp_is_connected`、`tcp_read`、`tcp_write`、`tcp_close`
-  - raw IP：`raw_open`、`raw_send`、`raw_recv`
+- **socket（Linux 语义，`rustros_api::socket`）：** `socket`、`bind`、`listen`、`accept`（带 accept4 的标志）、`connect`、`sendto`/`recvfrom`、`shutdown`、`close`、`getsockname`/`getpeername`、`setsockopt`/`getsockopt`、`ioctl`（`FIONREAD`、`SIOCOUTQ`、`FIONBIO`）。
+  - 常量、标志、选项名和错误码都用 Linux（x86_64）的值，将来的 Linux 兼容层可以原样传递。
+  - 地址是带地址族的 `SockAddr`，留了 IPv6 的位置。`AF_INET6` 在协议栈支持 IPv6 之前返回 `EAFNOSUPPORT`。
+  - **不包括 Unix 域套接字**（`AF_UNIX`）：它属于以后的 VFS / 进程层，现在返回 `EAFNOSUPPORT`。
+  - 常用的组合（监听端口、发起连接、绑定 UDP 端口、连接是否已建立）在 `rustros_util::sock` 里。
+- **就绪通知：** 协议栈在 socket 状态变化的那一刻主动通知，不靠上层轮询。
+  - `epoll_create`、`epoll_ctl`（支持 `EPOLLET`、`EPOLLONESHOT`）、`epoll_wait`。
+  - `sock_poll` 返回当前就绪状态和这个 socket 的事件计数。
+  - 以后的阻塞调用和进程层的 epoll 挂在同一个通知点（`Link::notify`）上。
 - **持久存储：** `kv_get`、`kv_put`、`kv_delete`、`kv_keys`、`storage_info`。每个应用只能访问自己的命名空间；调用返回时，数据已经写入磁盘。
 - **网络配置和查询：** `net_info`、`net_config`、`arp_table`、`tcp_connections`
 - **原始帧：** `send_frame`
 - **其他：** 时间、启动参数、打印、随机数、重启、更新槽、上次崩溃原因
 
 接口说明：
-- 所有 socket 调用都是非阻塞的，没数据时返回 `NetError::WouldBlock`。
-- 端口冲突时返回 `AddrInUse`。
+- 所有 socket 调用都是非阻塞的：没数据时返回 `EAGAIN`，`connect` 返回 `EINPROGRESS`，结果由 `EPOLLOUT`/`EPOLLERR` 和 `SO_ERROR` 给出。阻塞、超时和 `SIGPIPE` 是以后进程层的事，协议栈只返回 `EPIPE`（`MSG_NOSIGNAL` 照收）。
+- 端口冲突时返回 `EADDRINUSE`；`SO_REUSEPORT` 接口已留，暂未实现（`ENOPROTOOPT`）。
+- 暂未实现：TCP 只监听某一个本机地址（现在所有地址都接受）、UDP 用 `AF_UNSPEC` 解除 connect、已 connect 的 UDP 收到 ICMP 不可达时报 `ECONNREFUSED`。
 - 每个 socket 只能由创建它的应用使用。
 - TCP 应用可以用 `rustros_util::conn::Conn`，它帮你处理部分写入和关闭前刷完数据。
 - NAT、交换、隧道这类按包处理的应用，用 `on_frame` 直接处理原始帧，不经过 socket 层。
 
 ## 长期目标
 
-**纯 Rust 极致转发流量 + Linux 兼容模块跑 Docker/Go/PostgreSQL 业务。**
+**纯 Rust 极致转发流量 + 自己的容器运行时跑 Go/PostgreSQL 等业务，几乎所有更新都不需要重启。**
 
-- **数据面（Data Plane）留在 RustROS 的内核里**：路由、NAT、VPN、代理这类网络流量，由纯 Rust 的高性能内核直接处理，追求极致转发性能。
-- **业务跑在容器里**：一个可选的 **Linux 兼容模块**（参考 Asterinas 的思路，在系统调用层兼容 Linux）运行标准的 Docker 守护进程，再由它运行任意 Linux 容器，包括 Go 写的平台和 PostgreSQL。
+- **数据面（Data Plane）由 RustROS 负责**：路由、NAT、VPN、代理这类网络流量，由纯 Rust 的高性能数据面直接处理，追求极致转发性能。
+- **业务跑在容器里**：容器运行时由我们用 Rust 从零写成 RustROS 的原生组件（不使用、也不参照 Docker 的代码）。
+  - 用法与 Docker 一致，兼容 compose 文件（`compose.yaml`、`docker-compose.yml`）和 OCI 镜像格式；内部测试阶段命令叫 `docker`，对外发布前改用自己的名字。
+  - 一个 **Linux 兼容层**只负责运行容器里的 Linux 程序。它按手册页、POSIX 规范、实际行为和 LTP 测试实现，不照着 Linux 内核源码翻译。
+  - 隔离（独立根目录、独立进程编号空间）用 RustROS 自己的机制实现；只有容器里的程序自己调用时，才需要模拟命名空间相关的系统调用。
+  - 初期只用 host 网络；镜像层解包到 ext4 上。
+  - 第一个目标：`docker compose up -d` 启动一个 Debian 13 容器，`docker exec -it` 进去能 `apt install`、能用 curl 上网。
 - 不走虚拟化（VMX）这条路：云主机（例如阿里云 ECS）通常不提供嵌套虚拟化。也不靠 WebAssembly：PostgreSQL 这类软件搬不过去。
 
-为此要铺的路（大致按顺序）：
+**热更新：几乎所有更新都在运行中完成，不需要重启。**
 
-1. **ext4**：做到 PostgreSQL 能放心使用的程度。
-   - 按偏移读写，truncate、fsync，原子 rename，硬链接和符号链接，权限、属主和时间；
-   - jbd2 日志，保证掉电安全，且和 Linux 互通；
-   - metadata_csum 和 64bit 特性，能写 Linux 格式化出来的盘。
-2. **内核演进**：进程和用户态（ring 3）、每个进程独立的地址空间、多核调度，以及 VFS 层。
-3. **Linux 兼容模块**：
-   - 系统调用：clone、futex、mmap、epoll、信号……
-   - 容器需要的内核机制：namespaces、cgroups、overlayfs、veth/bridge、netfilter；
-   - 目标是 dockerd、containerd、runc 原样运行。
-4. **业务和网络的衔接**：容器的网络接到 RustROS 的数据面上，转发路径不经过兼容层。
-5. **硬件驱动全部用 Rust 写（纯血 Rust）**：Linux 兼容模块只兼容系统调用层，不搬 Linux 的内核驱动。物理机需要的驱动用 Rust 写成驱动模块（`Driver` 接口），先做 NVMe 和 Intel 网卡（e1000e、ixgbe、i40e），RAID 用 Rust 的软 RAID（硬件 RAID 卡设成直通）。
+模块可以在运行中替换，内核只能靠重启更换，所以内核里的每一行代码都是"改了就得重启"的代码。衡量内核的标准是"多久需要改一次"，而不只是字节数。
+
+1. **内核只放机制，不放策略和功能**：
+   - 留在内核：内存管理、中断、调度核心、系统调用入口和分发、模块加载与替换、数据包路径最底层的收发。
+   - 做成可热替换的模块：协议栈、网络配置、驱动、存储、文件系统（VFS、ext4）、Linux 兼容层、容器运行时、控制台、各种应用，以及具体的包处理逻辑（包处理模块）。
+   - 继续瘦身是日常收敛的一部分，优先把将来会经常改动的代码移出内核。
+2. **系统调用**：内核里只做入口和分发，Linux 系统调用的具体实现放在可热更新的兼容层模块里，它会是以后改动最频繁的部分。
+3. **有状态的模块要有热更新策略**，在设计接口时就定下来：
+   - 无状态的直接替换；
+   - 把状态交接给新版本（例如替换协议栈时，已有的 TCP 连接不断）；
+   - 或者等它空闲（排空）后再替换。
+4. **热更新要有回归测试**：例如替换协议栈模块时已有 TCP 连接不断，替换兼容层时运行中的容器不受影响。
+
+现状：协议栈、网络配置、驱动、存储服务、模块管理已经移出内核，但它们在**引导模块**里，开机加载一次后不能替换，更新它们仍然需要重启。让它们能在运行中替换（替换机制加状态交接）是这条目标要补的工作。安装的模块（应用、ext4、WebAssembly 运行时）现在已经可以在线替换。
+
+**启动镜像保持最小、不变**：原始启动镜像（256 KiB 的内核槽）不扩容，只保留启动、联网、拉取模块和救援所需的部分。其他组件，包括将来兼容 Linux 的完整版本（兼容层、VFS、容器运行时等），一律作为模块缓存在磁盘上、开机从磁盘加载、通过网络更新，或随离线安装包写到磁盘上。
+
+为此要铺的路（详细里程碑和验收标准见项目笔记）：
+
+1. **socket 接口按 Linux 语义重做**：就绪主动通知（epoll、边沿触发），地址留 IPv6 的位置。
+2. **进程和用户态**：ring 3、每个进程独立的地址空间、系统调用入口、抢占式调度（数据面优先）；以后再做多核。
+3. **VFS 和 POSIX 级的 ext4**（做成模块）：按偏移读写、truncate、fsync、原子 rename、硬链接和符号链接、权限、属主和时间、jbd2 日志；/tmp、/dev、/proc。
+4. **Linux 兼容层模块**：系统调用（clone、futex、mmap、epoll、信号……）、伪终端、网络系统调用。
+5. **容器运行时**：导入镜像、compose、`run/exec/ps/stop/rm/logs`。
+6. **业务和网络的衔接**：容器的网络接到 RustROS 的数据面上，转发路径不经过兼容层和容器运行时。
+7. **硬件驱动全部用 Rust 写（纯血 Rust）**：兼容层只兼容系统调用层，不搬 Linux 的内核驱动。物理机需要的驱动用 Rust 写成驱动模块（`Driver` 接口），先做 NVMe 和 Intel 网卡（e1000e、ixgbe、i40e），RAID 用 Rust 的软 RAID（硬件 RAID 卡设成直通）。
 
 ## 现状与限制
 

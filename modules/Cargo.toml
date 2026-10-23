@@ -108,6 +108,11 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.virtio]
 opt-level = 3
-# the boot module's network stack: the data path, as in the kernel before
-[profile.release.package.netstack]
+# the boot module's network stack (our applications' own traffic; forwarding
+# does not pass through it): the per-packet part for speed, the rest (socket
+# table, configuration) for size, so the kernel image with its boot modules
+# fits the deployed boxes' 256 KiB kernel slots
+[profile.release.package.tcpip]
 opt-level = 3
+[profile.release.package.netstack]
+opt-level = "s"

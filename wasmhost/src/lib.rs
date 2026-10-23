@@ -22,9 +22,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use rustros_api::abi::*;
-use rustros_api::Ip;
 use rustros_api::module::Runtime;
-use rustros_api::{Caps, Frame, HEADROOM, Kv, Net, Packet, RawSocket, SocketAddr, Sys, TcpListener, TcpStream, UdpSocket, Verdict};
+use rustros_api::socket::{Epoll, EpollEvent, Errno, SockAddr, SockResult, Socket};
+use rustros_api::{Caps, Frame, HEADROOM, Kv, Net, Packet, Sys, Verdict};
 use wasmi::{Caller, Config, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc};
 pub use wasmi::Engine;
 
@@ -401,18 +401,31 @@ fn give(c: &mut C<'_>, ptr: i32, cap: i32, data: &[u8]) -> i32 {
     data.len() as i32
 }
 
-fn handle<T>(r: Result<T, rustros_api::NetError>, raw: impl Fn(T) -> u64) -> i64 {
-    match r {
-        Ok(h) => raw(h) as i64,
-        Err(e) => net_err(e) as i64,
-    }
+// The socket imports answer -errno; these are theirs.
+const NEG_EFAULT: i32 = -Errno::EFAULT.0;
+const NEG_EPERM: i32 = -Errno::EPERM.0;
+
+/// The Net view for a socket import; without the capability, -EPERM.
+macro_rules! sock_net {
+    ($c:expr) => {
+        match net(&$c) {
+            Some(n) => n,
+            None => return NEG_EPERM.into(),
+        }
+    };
 }
 
-fn status(r: Result<(), rustros_api::NetError>) -> i32 {
-    match r {
-        Ok(()) => 0,
-        Err(e) => net_err(e),
-    }
+fn sock32(r: SockResult<i32>) -> i32 {
+    r.unwrap_or_else(|e| -e.0)
+}
+
+fn sock64(r: SockResult<u64>) -> i64 {
+    r.map_or_else(|e| -(e.0 as i64), |v| v as i64)
+}
+
+fn read_addr(c: &C<'_>, ptr: i32) -> Option<SockAddr> {
+    let b: [u8; SOCKADDR] = read(c, ptr, SOCKADDR as i32)?.try_into().ok()?;
+    sockaddr_from(&b)
 }
 
 fn linker(engine: &Engine) -> Linker<HostState> {
@@ -471,101 +484,109 @@ fn linker(engine: &Engine) -> Linker<HostState> {
     l.func_wrap(m, "tcp_connections", |mut c: C, p: i32, cap: i32| {
         let mut s = String::new();
         for x in net!(c).tcp_connections() {
-            s += &format!("{} {} {} {} {}\n", x.local_port, x.remote.ip, x.remote.port, x.state, x.owner.unwrap_or("-"));
+            s += &format!("{} {} {} {} {}\n", x.local_port, x.remote.ipv4().unwrap_or(0), x.remote.port(), x.state, x.owner.unwrap_or("-"));
         }
         give(&mut c, p, cap, s.as_bytes())
     })
     .unwrap();
-    // UDP
-    l.func_wrap(m, "udp_bind", |c: C, port: i32| handle(net!(c).udp_bind(port as u16), UdpSocket::to_raw)).unwrap();
-    l.func_wrap(m, "udp_local_port", |c: C, h: i64| match net!(c).udp_local_port(UdpSocket::from_raw(h as u64)) {
-        Ok(p) => p as i32,
-        Err(e) => net_err(e),
+    // sockets: handles and counts, or -errno (Linux's numbers)
+    l.func_wrap(m, "sock_socket", |c: C, domain: i32, ty: i32, proto: i32| sock64(sock_net!(c).socket(domain, ty, proto).map(|s| s.to_raw()))).unwrap();
+    l.func_wrap(m, "sock_bind", |c: C, h: i64, a: i32| {
+        let Some(addr) = read_addr(&c, a) else { return NEG_EFAULT };
+        sock32(sock_net!(c).bind(Socket::from_raw(h as u64), &addr).map(|()| 0))
     })
     .unwrap();
-    l.func_wrap(m, "udp_send_to", |c: C, h: i64, ip: i32, port: i32, p: i32, n: i32| {
-        let Some(data) = read(&c, p, n) else { return E_FAULT };
-        let to = SocketAddr { ip: ip as u32, port: port as u16 };
-        status(net!(c).udp_send_to(UdpSocket::from_raw(h as u64), to, &data))
+    l.func_wrap(m, "sock_listen", |c: C, h: i64, backlog: i32| sock32(sock_net!(c).listen(Socket::from_raw(h as u64), backlog).map(|()| 0))).unwrap();
+    l.func_wrap(m, "sock_accept", |mut c: C, h: i64, flags: i32, a: i32| match sock_net!(c).accept(Socket::from_raw(h as u64), flags) {
+        Ok((s, peer)) => {
+            if write(&mut c, a, &sockaddr_bytes(&peer)) { s.to_raw() as i64 } else { NEG_EFAULT as i64 }
+        }
+        Err(e) => -(e.0 as i64),
     })
     .unwrap();
-    l.func_wrap(m, "udp_recv_from", |mut c: C, h: i64, p: i32, cap: i32, from: i32| {
+    l.func_wrap(m, "sock_connect", |c: C, h: i64, a: i32| {
+        let Some(addr) = read_addr(&c, a) else { return NEG_EFAULT };
+        sock32(sock_net!(c).connect(Socket::from_raw(h as u64), &addr).map(|()| 0))
+    })
+    .unwrap();
+    // `a` -1: no address (send)
+    l.func_wrap(m, "sock_sendto", |c: C, h: i64, p: i32, n: i32, flags: i32, a: i32| {
+        let Some(data) = read(&c, p, n) else { return NEG_EFAULT };
+        let to = if a == -1 { None } else { Some(match read_addr(&c, a) { Some(x) => x, None => return NEG_EFAULT }) };
+        sock32(sock_net!(c).sendto(Socket::from_raw(h as u64), &data, flags, to.as_ref()).map(|n| n as i32))
+    })
+    .unwrap();
+    // the sender goes to `a` (family 0: none)
+    l.func_wrap(m, "sock_recvfrom", |mut c: C, h: i64, p: i32, cap: i32, flags: i32, a: i32| {
         let mut buf = vec![0u8; cap.clamp(0, 65536) as usize];
-        match net!(c).udp_recv_from(UdpSocket::from_raw(h as u64), &mut buf) {
-            Ok((n, a)) => {
-                let mut addr = [0u8; 8];
-                addr[..4].copy_from_slice(&a.ip.to_le_bytes());
-                addr[4..6].copy_from_slice(&a.port.to_le_bytes());
-                if write(&mut c, p, &buf[..n]) && write(&mut c, from, &addr) { n as i32 } else { E_FAULT }
+        match sock_net!(c).recvfrom(Socket::from_raw(h as u64), &mut buf, flags) {
+            Ok((n, from)) => {
+                let addr = from.map_or([0u8; SOCKADDR], |f| sockaddr_bytes(&f));
+                if write(&mut c, p, &buf[..n.min(buf.len())]) && write(&mut c, a, &addr) { n as i32 } else { NEG_EFAULT }
             }
-            Err(e) => net_err(e),
+            Err(e) => -e.0,
         }
     })
     .unwrap();
-    l.func_wrap(m, "udp_close", |c: C, h: i64| net!(c).udp_close(UdpSocket::from_raw(h as u64))).unwrap();
-    // TCP
-    l.func_wrap(m, "tcp_listen", |c: C, port: i32| handle(net!(c).tcp_listen(port as u16), TcpListener::to_raw)).unwrap();
-    l.func_wrap(m, "tcp_unlisten", |c: C, h: i64| net!(c).tcp_unlisten(TcpListener::from_raw(h as u64))).unwrap();
-    l.func_wrap(m, "tcp_accept", |mut c: C, h: i64, peer: i32| match net!(c).tcp_accept(TcpListener::from_raw(h as u64)) {
-        Ok((s, a)) => {
-            let mut addr = [0u8; 8];
-            addr[..4].copy_from_slice(&a.ip.to_le_bytes());
-            addr[4..6].copy_from_slice(&a.port.to_le_bytes());
-            if write(&mut c, peer, &addr) { s.to_raw() as i64 } else { E_FAULT as i64 }
+    l.func_wrap(m, "sock_shutdown", |c: C, h: i64, how: i32| sock32(sock_net!(c).shutdown(Socket::from_raw(h as u64), how).map(|()| 0))).unwrap();
+    l.func_wrap(m, "sock_close", |c: C, h: i64| sock32(sock_net!(c).close(Socket::from_raw(h as u64)).map(|()| 0))).unwrap();
+    l.func_wrap(m, "sock_getsockname", |mut c: C, h: i64, a: i32| match sock_net!(c).getsockname(Socket::from_raw(h as u64)) {
+        Ok(x) => if write(&mut c, a, &sockaddr_bytes(&x)) { 0 } else { NEG_EFAULT },
+        Err(e) => -e.0,
+    })
+    .unwrap();
+    l.func_wrap(m, "sock_getpeername", |mut c: C, h: i64, a: i32| match sock_net!(c).getpeername(Socket::from_raw(h as u64)) {
+        Ok(x) => if write(&mut c, a, &sockaddr_bytes(&x)) { 0 } else { NEG_EFAULT },
+        Err(e) => -e.0,
+    })
+    .unwrap();
+    l.func_wrap(m, "sock_setsockopt", |c: C, h: i64, level: i32, name: i32, p: i32, n: i32| {
+        let Some(v) = read(&c, p, n) else { return NEG_EFAULT };
+        sock32(sock_net!(c).setsockopt(Socket::from_raw(h as u64), level, name, &v).map(|()| 0))
+    })
+    .unwrap();
+    l.func_wrap(m, "sock_getsockopt", |mut c: C, h: i64, level: i32, name: i32, p: i32, cap: i32| {
+        let mut v = vec![0u8; cap.clamp(0, 256) as usize];
+        match sock_net!(c).getsockopt(Socket::from_raw(h as u64), level, name, &mut v) {
+            Ok(n) => if write(&mut c, p, &v[..n]) { n as i32 } else { NEG_EFAULT },
+            Err(e) => -e.0,
         }
-        Err(e) => net_err(e) as i64,
     })
     .unwrap();
-    l.func_wrap(m, "tcp_connect", |c: C, ip: i32, port: i32| {
-        handle(net!(c).tcp_connect(SocketAddr { ip: ip as u32, port: port as u16 }), TcpStream::to_raw)
+    l.func_wrap(m, "sock_ioctl", |c: C, h: i64, req: i32, arg: i64| sock64(sock_net!(c).ioctl(Socket::from_raw(h as u64), req as u32, arg as u64))).unwrap();
+    // readiness (u32) and event counter (u64) to `p`
+    l.func_wrap(m, "sock_poll", |mut c: C, h: i64, p: i32| match sock_net!(c).sock_poll(Socket::from_raw(h as u64)) {
+        Ok((ev, seq)) => {
+            let mut b = [0u8; 12];
+            b[..4].copy_from_slice(&ev.to_le_bytes());
+            b[4..].copy_from_slice(&seq.to_le_bytes());
+            if write(&mut c, p, &b) { 0 } else { NEG_EFAULT }
+        }
+        Err(e) => -e.0,
     })
     .unwrap();
-    l.func_wrap(m, "tcp_is_connected", |c: C, h: i64| match net!(c).tcp_is_connected(TcpStream::from_raw(h as u64)) {
-        Ok(b) => b as i32,
-        Err(e) => net_err(e),
+    l.func_wrap(m, "epoll_create", |c: C| sock64(sock_net!(c).epoll_create().map(|e| e.to_raw()))).unwrap();
+    l.func_wrap(m, "epoll_ctl", |c: C, ep: i64, op: i32, h: i64, events: i32, data: i64| {
+        sock32(sock_net!(c).epoll_ctl(Epoll::from_raw(ep as u64), op, Socket::from_raw(h as u64), events as u32, data as u64).map(|()| 0))
     })
     .unwrap();
-    l.func_wrap(m, "tcp_read", |mut c: C, h: i64, p: i32, cap: i32| {
-        let mut buf = vec![0u8; cap.clamp(0, 65536) as usize];
-        match net!(c).tcp_read(TcpStream::from_raw(h as u64), &mut buf) {
+    // entries of 12 bytes: events (u32), data (u64)
+    l.func_wrap(m, "epoll_wait", |mut c: C, ep: i64, p: i32, max: i32| {
+        let mut out = vec![EpollEvent::default(); max.clamp(0, 256) as usize];
+        match sock_net!(c).epoll_wait(Epoll::from_raw(ep as u64), &mut out) {
             Ok(n) => {
-                if write(&mut c, p, &buf[..n]) { n as i32 } else { E_FAULT }
+                let mut b = Vec::with_capacity(n * 12);
+                for e in &out[..n] {
+                    b.extend_from_slice(&e.events.to_le_bytes());
+                    b.extend_from_slice(&e.data.to_le_bytes());
+                }
+                if write(&mut c, p, &b) { n as i32 } else { NEG_EFAULT }
             }
-            Err(e) => net_err(e),
+            Err(e) => -e.0,
         }
     })
     .unwrap();
-    l.func_wrap(m, "tcp_write", |c: C, h: i64, p: i32, n: i32| {
-        let Some(data) = read(&c, p, n) else { return E_FAULT };
-        match net!(c).tcp_write(TcpStream::from_raw(h as u64), &data) {
-            Ok(n) => n as i32,
-            Err(e) => net_err(e),
-        }
-    })
-    .unwrap();
-    l.func_wrap(m, "tcp_close", |c: C, h: i64| net!(c).tcp_close(TcpStream::from_raw(h as u64))).unwrap();
-    l.func_wrap(m, "tcp_abort", |c: C, h: i64| net!(c).tcp_abort(TcpStream::from_raw(h as u64))).unwrap();
-    // raw IP
-    l.func_wrap(m, "raw_open", |c: C, proto: i32| handle(net!(c).raw_open(proto as u8), RawSocket::to_raw)).unwrap();
-    l.func_wrap(m, "raw_recv", |mut c: C, h: i64, p: i32, cap: i32, src: i32| {
-        let mut buf = vec![0u8; cap.clamp(0, 65536) as usize];
-        match net!(c).raw_recv(RawSocket::from_raw(h as u64), &mut buf) {
-            Ok((n, ip, ttl)) => {
-                let mut meta = [0u8; 8];
-                meta[..4].copy_from_slice(&ip.to_le_bytes());
-                meta[4] = ttl;
-                if write(&mut c, p, &buf[..n]) && write(&mut c, src, &meta) { n as i32 } else { E_FAULT }
-            }
-            Err(e) => net_err(e),
-        }
-    })
-    .unwrap();
-    l.func_wrap(m, "raw_send", |c: C, h: i64, ip: i32, p: i32, n: i32| {
-        let Some(data) = read(&c, p, n) else { return E_FAULT };
-        status(net!(c).raw_send(RawSocket::from_raw(h as u64), ip as Ip, &data))
-    })
-    .unwrap();
-    l.func_wrap(m, "raw_close", |c: C, h: i64| net!(c).raw_close(RawSocket::from_raw(h as u64))).unwrap();
+    l.func_wrap(m, "epoll_close", |c: C, ep: i64| sock32(sock_net!(c).epoll_close(Epoll::from_raw(ep as u64)).map(|()| 0))).unwrap();
     // Ethernet
     l.func_wrap(m, "mac", |mut c: C, p: i32| {
         let mac = packet!(c).mac();

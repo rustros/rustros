@@ -2,7 +2,7 @@
 //!
 //! Several applications run side by side. The system owns the network stack
 //! and hands out non-blocking sockets; there are no threads, so every call
-//! returns immediately (`Err(NetError::WouldBlock)` when there is nothing to do)
+//! returns immediately (`EAGAIN` when there is nothing to do)
 //! and applications are polled state machines.
 
 use alloc::string::String;
@@ -10,56 +10,10 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 
 use crate::frame::{Frame, Offload};
+use crate::socket::{Epoll, EpollEvent, SockAddr, SockResult, Socket};
 
 /// IPv4 address in host byte order.
 pub type Ip = u32;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SocketAddr {
-    pub ip: Ip,
-    pub port: u16,
-}
-
-impl fmt::Display for SocketAddr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let b = self.ip.to_be_bytes();
-        write!(f, "{}.{}.{}.{}:{}", b[0], b[1], b[2], b[3], self.port)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum NetError {
-    /// Nothing to receive / no buffer space right now; try again later.
-    WouldBlock,
-    /// Port already bound or listened on.
-    AddrInUse,
-    /// Unknown handle, or one that belongs to another application.
-    BadHandle,
-    /// The connection is gone (reset, timed out or closed by us).
-    Closed,
-    /// Datagram larger than one Ethernet frame.
-    TooLarge,
-    /// No address configured or no route to the destination.
-    NoRoute,
-}
-
-/// Socket handles: opaque values issued by the system. A forged value is
-/// harmless; the system checks every handle against its owner.
-macro_rules! handle {
-    ($($name:ident),*) => {$(
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        pub struct $name(u64);
-        impl $name {
-            pub fn to_raw(self) -> u64 {
-                self.0
-            }
-            pub fn from_raw(raw: u64) -> Self {
-                $name(raw)
-            }
-        }
-    )*};
-}
-handle!(UdpSocket, TcpListener, TcpStream, RawSocket);
 
 /// The two forms an installed application can take; the same code builds as
 /// either.
@@ -198,7 +152,7 @@ impl IfConf {
 
 pub struct ConnInfo {
     pub local_port: u16,
-    pub remote: SocketAddr,
+    pub remote: SockAddr,
     pub state: &'static str,
     pub owner: Option<&'static str>,
 }
@@ -338,55 +292,47 @@ pub trait Sys: Base {
     fn admin(&mut self) -> Option<&mut dyn Admin>;
 }
 
-/// Sockets on the system's network stack, shared by all apps; every handle
-/// belongs to the app that created it. Calls never block: they return
-/// `Err(NetError::WouldBlock)` when there is nothing to do.
+/// Sockets on the system's network stack, shared by all apps, with Linux
+/// semantics (crate::socket); every socket belongs to the app that created it.
+/// Calls never block: they return `EAGAIN` when there is nothing to do.
 pub trait Net: Base {
     fn net_info(&self) -> NetInfo;
     /// (ip, mac, age in ms)
     fn arp_table(&self) -> Vec<(Ip, [u8; 6], u64)>;
     fn tcp_connections(&self) -> Vec<ConnInfo>;
 
-    /// Bind a UDP port; 0 picks a free ephemeral port.
-    fn udp_bind(&mut self, port: u16) -> Result<UdpSocket, NetError>;
-    fn udp_local_port(&self, s: UdpSocket) -> Result<u16, NetError>;
-    fn udp_send_to(&mut self, s: UdpSocket, to: SocketAddr, data: &[u8]) -> Result<(), NetError>;
-    fn udp_recv_from(&mut self, s: UdpSocket, buf: &mut [u8]) -> Result<(usize, SocketAddr), NetError>;
-    fn udp_close(&mut self, s: UdpSocket);
-
-    fn tcp_listen(&mut self, port: u16) -> Result<TcpListener, NetError>;
-    fn tcp_unlisten(&mut self, l: TcpListener);
-    fn tcp_accept(&mut self, l: TcpListener) -> Result<(TcpStream, SocketAddr), NetError>;
-    /// Connect out from an ephemeral port. Returns at once; data written before
-    /// the handshake completes is sent afterwards. A refused or timed-out
-    /// connection shows up as `Err(Closed)` on later calls.
-    fn tcp_connect(&mut self, to: SocketAddr) -> Result<TcpStream, NetError>;
-    /// Connect from our address `src` (an interface's or an extra one), routed by it.
-    fn tcp_connect_from(&mut self, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError> {
-        if src == 0 { self.tcp_connect(to) } else { Err(NetError::NoRoute) }
-    }
-    /// Our end of a connection: the address it was accepted on (or
-    /// connected from) and the port.
-    fn tcp_local_addr(&self, _s: TcpStream) -> Result<SocketAddr, NetError> {
-        Err(NetError::BadHandle)
-    }
-    /// `Ok(false)` while the handshake is still in progress.
-    fn tcp_is_connected(&self, s: TcpStream) -> Result<bool, NetError>;
-    /// `Ok(0)` means the peer has closed its side and all data was read.
-    fn tcp_read(&mut self, s: TcpStream, buf: &mut [u8]) -> Result<usize, NetError>;
-    /// May accept fewer bytes than given.
-    fn tcp_write(&mut self, s: TcpStream, data: &[u8]) -> Result<usize, NetError>;
-    /// Graceful close (FIN after queued data). The handle is dead afterwards.
-    fn tcp_close(&mut self, s: TcpStream);
-    /// Close with RST.
-    fn tcp_abort(&mut self, s: TcpStream);
-
-    /// Raw IP of one protocol (e.g. ICMP for ping).
-    fn raw_open(&mut self, proto: u8) -> Result<RawSocket, NetError>;
-    /// (length, source address, TTL); `buf` receives the IP payload.
-    fn raw_recv(&mut self, s: RawSocket, buf: &mut [u8]) -> Result<(usize, Ip, u8), NetError>;
-    fn raw_send(&mut self, s: RawSocket, dst: Ip, payload: &[u8]) -> Result<(), NetError>;
-    fn raw_close(&mut self, s: RawSocket);
+    // Sockets with Linux semantics (crate::socket), never blocking.
+    fn socket(&mut self, domain: i32, ty: i32, protocol: i32) -> SockResult<Socket>;
+    fn bind(&mut self, s: Socket, addr: &SockAddr) -> SockResult<()>;
+    fn listen(&mut self, s: Socket, backlog: i32) -> SockResult<()>;
+    /// accept4: `flags` are SOCK_NONBLOCK / SOCK_CLOEXEC.
+    fn accept(&mut self, s: Socket, flags: i32) -> SockResult<(Socket, SockAddr)>;
+    /// EINPROGRESS until the handshake is done; then EPOLLOUT (or EPOLLERR
+    /// and SO_ERROR) tells how it went.
+    fn connect(&mut self, s: Socket, addr: &SockAddr) -> SockResult<()>;
+    /// send (`to` None) and sendto.
+    fn sendto(&mut self, s: Socket, data: &[u8], flags: i32, to: Option<&SockAddr>) -> SockResult<usize>;
+    /// recv and recvfrom: (bytes, sender); with MSG_TRUNC a datagram's full length.
+    fn recvfrom(&mut self, s: Socket, buf: &mut [u8], flags: i32) -> SockResult<(usize, Option<SockAddr>)>;
+    fn shutdown(&mut self, s: Socket, how: i32) -> SockResult<()>;
+    fn close(&mut self, s: Socket) -> SockResult<()>;
+    fn getsockname(&self, s: Socket) -> SockResult<SockAddr>;
+    fn getpeername(&self, s: Socket) -> SockResult<SockAddr>;
+    /// The option's value as Linux takes it (an int: 4 bytes, native order).
+    fn setsockopt(&mut self, s: Socket, level: i32, name: i32, value: &[u8]) -> SockResult<()>;
+    /// Writes the value into `value`; returns its length.
+    fn getsockopt(&mut self, s: Socket, level: i32, name: i32, value: &mut [u8]) -> SockResult<usize>;
+    /// FIONREAD, SIOCOUTQ, FIONBIO ...: the value the request yields.
+    fn ioctl(&mut self, s: Socket, request: u32, arg: u64) -> SockResult<u64>;
+    /// Readiness now (EPOLL* bits) and the socket's event counter (it moves
+    /// with every change the stack reports).
+    fn sock_poll(&self, s: Socket) -> SockResult<(u32, u64)>;
+    fn epoll_create(&mut self) -> SockResult<Epoll>;
+    /// EPOLL_CTL_ADD / MOD / DEL; `events` may carry EPOLLET, EPOLLONESHOT.
+    fn epoll_ctl(&mut self, ep: Epoll, op: i32, s: Socket, events: u32, data: u64) -> SockResult<()>;
+    /// The ready entries (at most `out.len()`), without waiting.
+    fn epoll_wait(&mut self, ep: Epoll, out: &mut [EpollEvent]) -> SockResult<usize>;
+    fn epoll_close(&mut self, ep: Epoll) -> SockResult<()>;
 
     // More interfaces: NICs, then VLANs on them ("nic0.109"); each looks
     // like a NIC of its own (frames on the packet path arrive untagged with

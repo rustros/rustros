@@ -10,14 +10,15 @@ use core::fmt::Write;
 
 use rustros_util::conn::Conn;
 use rustros_util::wire::{IpFmt, MacFmt};
-use rustros_api::{Module, Sys, TcpListener, say};
+use rustros_api::socket::Socket;
+use rustros_api::{Module, Sys, say};
 
 const PORT: u16 = 80;
 const MAX_REQUEST: usize = 8192;
 
 #[derive(Default)]
 pub struct Httpd {
-    listener: Option<TcpListener>,
+    listener: Option<Socket>,
     conns: Vec<Conn>,
 }
 
@@ -81,7 +82,7 @@ impl Module for Httpd {
 
     fn start(&mut self, sys: &mut dyn Sys) {
         let Some(net) = sys.net() else { return };
-        match net.tcp_listen(PORT) {
+        match rustros_util::sock::tcp_listen(net, PORT) {
             Ok(l) => self.listener = Some(l),
             Err(e) => say!(net, "httpd: cannot listen on {}: {:?}\n", PORT, e),
         }
@@ -89,7 +90,7 @@ impl Module for Httpd {
 
     fn poll(&mut self, sys: &mut dyn Sys) {
         if let (Some(l), Some(net)) = (self.listener, sys.net()) {
-            while let Ok((s, peer)) = net.tcp_accept(l) {
+            while let Ok((s, peer)) = net.accept(l, 0) {
                 self.conns.push(Conn::new(s, peer));
             }
         }
@@ -105,13 +106,13 @@ impl Module for Httpd {
                 let page = status_page(sys);
                 c.write(response("200 OK", &page).as_bytes());
                 c.inbuf.clear();
-                c.close();
+                let _ = c.close();
                 if let Some(net) = sys.net() {
                     c.pump(net, 0);
                 }
             } else if c.inbuf.len() >= MAX_REQUEST || c.eof {
                 c.write(response("400 Bad Request", "bad request\n").as_bytes());
-                c.close();
+                let _ = c.close();
                 if let Some(net) = sys.net() {
                     c.pump(net, 0);
                 }

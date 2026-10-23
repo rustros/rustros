@@ -312,7 +312,8 @@ pub trait Runtime {
 
 // ---------------------------------------------------------------- network stack
 
-use crate::sys::{ConnInfo, Ip, NetConf, NetError, NetInfo, RawSocket, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use crate::socket::{Epoll, EpollEvent, SockAddr, SockResult, Socket};
+use crate::sys::{ConnInfo, Ip, NetConf, NetInfo};
 
 /// What the network stack needs from the kernel.
 pub trait Link {
@@ -322,6 +323,12 @@ pub trait Link {
     fn send(&mut self, nic: usize, frame: &[u8]) -> bool;
     /// Not cryptographically strong; fine for ISNs and port numbers.
     fn random(&mut self) -> u64;
+    /// Socket `sock` of `owner` changed: `events` (EPOLL* bits) say what
+    /// just happened (an edge: new data is EPOLLIN again, even on a socket
+    /// that was readable). Called at the moment of the change, from inside
+    /// the stack: the kernel only records it (it must not call back into
+    /// the stack) and wakes the waiters afterwards.
+    fn notify(&mut self, owner: usize, sock: Socket, events: u32);
 }
 
 /// The system's network stack (Ethernet, ARP, IPv4, ICMP, UDP, TCP) and the
@@ -387,25 +394,30 @@ pub trait NetStack {
     /// Route and send a finished IPv4 packet (its source left alone).
     fn send_packet(&mut self, link: &mut dyn Link, packet: &[u8]) -> bool;
 
-    fn udp_bind(&mut self, owner: usize, link: &mut dyn Link, port: u16) -> Result<UdpSocket, NetError>;
-    fn udp_local_port(&self, owner: usize, s: UdpSocket) -> Result<u16, NetError>;
-    fn udp_send_to(&mut self, owner: usize, link: &mut dyn Link, s: UdpSocket, to: SocketAddr, data: &[u8]) -> Result<(), NetError>;
-    fn udp_recv_from(&mut self, owner: usize, s: UdpSocket, buf: &mut [u8]) -> Result<(usize, SocketAddr), NetError>;
-    fn udp_close(&mut self, owner: usize, s: UdpSocket);
-    fn tcp_listen(&mut self, owner: usize, port: u16) -> Result<TcpListener, NetError>;
-    fn tcp_unlisten(&mut self, owner: usize, link: &mut dyn Link, l: TcpListener);
-    fn tcp_accept(&mut self, owner: usize, l: TcpListener) -> Result<(TcpStream, SocketAddr), NetError>;
-    fn tcp_connect_from(&mut self, owner: usize, link: &mut dyn Link, src: Ip, to: SocketAddr) -> Result<TcpStream, NetError>;
-    fn tcp_local_addr(&self, owner: usize, s: TcpStream) -> Result<SocketAddr, NetError>;
-    fn tcp_is_connected(&self, owner: usize, s: TcpStream) -> Result<bool, NetError>;
-    fn tcp_read(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, buf: &mut [u8]) -> Result<usize, NetError>;
-    fn tcp_write(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, data: &[u8]) -> Result<usize, NetError>;
-    fn tcp_close(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream);
-    fn tcp_abort(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream);
-    fn raw_open(&mut self, owner: usize, proto: u8) -> Result<RawSocket, NetError>;
-    fn raw_recv(&mut self, owner: usize, s: RawSocket, buf: &mut [u8]) -> Result<(usize, Ip, u8), NetError>;
-    fn raw_send(&mut self, owner: usize, link: &mut dyn Link, s: RawSocket, dst: Ip, payload: &[u8]) -> Result<(), NetError>;
-    fn raw_close(&mut self, owner: usize, s: RawSocket);
+    // Sockets with Linux semantics (crate::socket), by owner. Every change
+    // of a socket's readiness is reported through `Link::notify`.
+    fn socket(&mut self, owner: usize, domain: i32, ty: i32, protocol: i32) -> SockResult<Socket>;
+    fn bind(&mut self, owner: usize, link: &mut dyn Link, s: Socket, addr: &SockAddr) -> SockResult<()>;
+    fn listen(&mut self, owner: usize, link: &mut dyn Link, s: Socket, backlog: i32) -> SockResult<()>;
+    fn accept(&mut self, owner: usize, link: &mut dyn Link, s: Socket, flags: i32) -> SockResult<(Socket, SockAddr)>;
+    fn connect(&mut self, owner: usize, link: &mut dyn Link, s: Socket, addr: &SockAddr) -> SockResult<()>;
+    fn sendto(&mut self, owner: usize, link: &mut dyn Link, s: Socket, data: &[u8], flags: i32, to: Option<&SockAddr>) -> SockResult<usize>;
+    fn recvfrom(&mut self, owner: usize, link: &mut dyn Link, s: Socket, buf: &mut [u8], flags: i32) -> SockResult<(usize, Option<SockAddr>)>;
+    fn shutdown(&mut self, owner: usize, link: &mut dyn Link, s: Socket, how: i32) -> SockResult<()>;
+    fn close(&mut self, owner: usize, link: &mut dyn Link, s: Socket) -> SockResult<()>;
+    fn getsockname(&self, owner: usize, s: Socket) -> SockResult<SockAddr>;
+    fn getpeername(&self, owner: usize, s: Socket) -> SockResult<SockAddr>;
+    fn setsockopt(&mut self, owner: usize, s: Socket, level: i32, name: i32, value: &[u8]) -> SockResult<()>;
+    fn getsockopt(&mut self, owner: usize, s: Socket, level: i32, name: i32, value: &mut [u8]) -> SockResult<usize>;
+    fn ioctl(&mut self, owner: usize, s: Socket, request: u32, arg: u64) -> SockResult<u64>;
+    /// Readiness now (EPOLL* bits) and the event counter.
+    fn sock_poll(&self, owner: usize, s: Socket) -> SockResult<(u32, u64)>;
+    /// Epoll instances over the owner's sockets: the stack puts a socket on
+    /// their ready lists at the moment it changes.
+    fn epoll_create(&mut self, owner: usize) -> SockResult<Epoll>;
+    fn epoll_ctl(&mut self, owner: usize, ep: Epoll, op: i32, s: Socket, events: u32, data: u64) -> SockResult<()>;
+    fn epoll_wait(&mut self, owner: usize, ep: Epoll, out: &mut [EpollEvent]) -> SockResult<usize>;
+    fn epoll_close(&mut self, owner: usize, ep: Epoll) -> SockResult<()>;
 }
 
 // ---------------------------------------------------------------- module manager

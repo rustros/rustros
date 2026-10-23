@@ -9,44 +9,60 @@ use alloc::vec::Vec;
 
 use alloc::string::String;
 use rustros_api::module::NetStack;
-use rustros_api::{ConnInfo, Ip, NetConf, NetError, NetInfo, RawSocket, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use rustros_api::socket::*;
+use rustros_api::{ConnInfo, Ip, NetConf, NetInfo};
 
 use crate::Link;
 use crate::iface::{Iface, Ifaces, IpPkt, PROTO_ICMP, PROTO_TCP, PROTO_UDP, parse_udp};
-use crate::tcp::{Handle, State, Tcp};
+use crate::tcp::{State, Tcp};
 
 /// Datagrams queued per socket before new ones are dropped.
 const QUEUE: usize = 64;
-const EPHEMERAL: core::ops::Range<u32> = 49152..65536;
 
-struct Udp {
-    id: u32,
-    owner: usize,
-    port: u16,
-    rx: VecDeque<(SocketAddr, Vec<u8>)>,
+/// An IPv4 address and port (the stack's own; sockets see `SockAddr`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Addr {
+    pub(crate) ip: Ip,
+    pub(crate) port: u16,
+}
+
+pub(crate) struct Udp {
+    pub(crate) id: u32,
+    pub(crate) owner: usize,
+    pub(crate) port: u16,
+    pub(crate) rx: VecDeque<(Addr, Vec<u8>)>,
     /// (peer, our address it sent to): replies go from that address (and
     /// out of its WAN)
-    peers: Vec<(Ip, Ip)>,
+    pub(crate) peers: Vec<(Ip, Ip)>,
+    /// The socket (its slot in `socks`).
+    pub(crate) sock: usize,
+    /// Bound to this address only (0: any).
+    pub(crate) lip: Ip,
+    /// connect()ed: only datagrams from it, sends go to it.
+    pub(crate) peer: Option<Addr>,
 }
 
 /// Peers per UDP socket whose local address is remembered.
 const PEERS: usize = 256;
 
-struct Raw {
-    id: u32,
-    owner: usize,
-    proto: u8,
-    rx: VecDeque<(Ip, u8, Vec<u8>)>,
+pub(crate) struct Raw {
+    pub(crate) id: u32,
+    pub(crate) owner: usize,
+    pub(crate) proto: u8,
+    pub(crate) rx: VecDeque<(Ip, u8, Vec<u8>)>,
+    pub(crate) sock: usize,
 }
 
 pub struct Stack {
     /// One per NIC; the first is the primary (management) interface.
     pub ifs: Ifaces,
-    tcp: Tcp,
-    listeners: Vec<(u16, usize)>,
-    udp: Vec<Udp>,
-    raw: Vec<Raw>,
+    pub(crate) tcp: Tcp,
+    pub(crate) listeners: Vec<(u16, usize)>,
+    pub(crate) udp: Vec<Udp>,
+    pub(crate) raw: Vec<Raw>,
     next_id: u32,
+    /// The applications' sockets and epoll instances (socket.rs).
+    pub(crate) sk: crate::socket::Sockets,
     /// Application names by owner index, for connection listings.
     pub owner_names: Vec<&'static str>,
     /// A pass of `loopback` used its whole budget: the last packet, for
@@ -54,16 +70,6 @@ pub struct Stack {
     pub loop_storm: Option<alloc::string::String>,
     /// The interfaces' and routes' configuration (config.rs).
     pub(crate) conf: crate::config::Config,
-}
-
-type R<T> = Result<T, NetError>;
-
-fn stream(h: Handle) -> TcpStream {
-    TcpStream::from_raw(h.to_raw())
-}
-
-fn handle(s: TcpStream) -> Handle {
-    Handle::from_raw(s.to_raw())
 }
 
 impl Stack {
@@ -78,31 +84,11 @@ impl Stack {
             owner_names: Vec::new(),
             loop_storm: None,
             conf: crate::config::Config::default(),
+            sk: crate::socket::Sockets::default(),
         }
     }
 
-    /// Add the interface of another NIC (unconfigured); returns its index.
-    pub fn add_iface(&mut self, mac: [u8; 6]) -> usize {
-        let n = self.ifs.0.len();
-        self.ifs.0.push(Iface::new(n, mac, 0, 0, 0));
-        n
-    }
-
-    /// Remove interface `i`; the ones after it move down by one.
-    pub fn remove_iface(&mut self, i: usize) {
-        if i > 0 && i < self.ifs.0.len() {
-            self.ifs.0.remove(i);
-            for (n, f) in self.ifs.0.iter_mut().enumerate() {
-                f.nic = n;
-            }
-        }
-    }
-
-    pub fn primary(&mut self) -> &mut Iface {
-        &mut self.ifs.0[0]
-    }
-
-    fn id(&mut self) -> u32 {
+    pub(crate) fn id(&mut self) -> u32 {
         self.next_id += 1;
         self.next_id
     }
@@ -119,6 +105,7 @@ impl Stack {
         // an extra address only serves connections made from it
         let open = pkt.dst == self.ifs.0[nic].ip;
         self.deliver(link, nic, &pkt, open);
+        self.tcp_events(link);
     }
 
     /// Packets we sent to ourselves (`Ifaces::is_ours`), received: a
@@ -172,7 +159,9 @@ impl Stack {
                 // the address it was sent to (an interface's or an extra one)
                 let local = pkt.dst;
                 let ours = self.ifs.0.iter().any(|f| f.is_local(local));
-                match self.udp.iter_mut().find(|u| u.port == dport) {
+                let from = Addr { ip: pkt.src, port: sport };
+                let mine = |u: &&mut Udp| u.port == dport && (u.lip == 0 || u.lip == local) && u.peer.is_none_or(|p| p == from);
+                match self.udp.iter_mut().find(mine) {
                     Some(u) if u.rx.len() < QUEUE => {
                         if ours {
                             match u.peers.iter().position(|p| p.0 == pkt.src) {
@@ -181,16 +170,23 @@ impl Stack {
                                 None => u.peers[pkt.src as usize % PEERS] = (pkt.src, local),
                             }
                         }
-                        u.rx.push_back((SocketAddr { ip: pkt.src, port: sport }, data.to_vec()))
+                        u.rx.push_back((from, data.to_vec()));
+                        let i = u.sock;
+                        self.note(link, i, EPOLLIN | EPOLLRDNORM);
                     }
                     _ => self.ifs.0[nic].stats.rx_dropped += 1,
                 }
             }
             proto => {
+                let mut woke = Vec::new();
                 for r in self.raw.iter_mut().filter(|r| r.proto == proto) {
                     if r.rx.len() < QUEUE {
                         r.rx.push_back((pkt.src, pkt.ttl, pkt.payload.to_vec()));
+                        woke.push(r.sock);
                     }
+                }
+                for i in woke {
+                    self.note(link, i, EPOLLIN | EPOLLRDNORM);
                 }
             }
         }
@@ -203,13 +199,10 @@ impl Stack {
         }
         self.tcp.poll(&mut self.ifs, link);
         self.loopback(link);
+        self.tcp_events(link);
     }
 
     // ---------------------------------------------------------------- info
-
-    pub fn info(&self) -> NetInfo {
-        self.nic_info(0).unwrap()
-    }
 
     pub fn nic_info(&self, nic: usize) -> Option<NetInfo> {
         let i = self.ifs.0.get(nic)?;
@@ -282,7 +275,7 @@ impl Stack {
             .connections()
             .map(|s| ConnInfo {
                 local_port: s.lport,
-                remote: SocketAddr { ip: s.rip, port: s.rport },
+                remote: SockAddr::v4(s.rip, s.rport),
                 state: match s.state {
                     State::SynSent => "SYN_SENT",
                     State::SynRcvd => "SYN_RCVD",
@@ -297,14 +290,15 @@ impl Stack {
                 owner: self.owner_names.get(s.owner).copied(),
             })
             // what waits: TCP listeners ("LISTEN") and bound UDP sockets ("UDP")
-            .chain(self.listeners.iter().map(|&(port, owner)| ConnInfo { local_port: port, remote: SocketAddr { ip: 0, port: 0 }, state: "LISTEN", owner: self.owner_names.get(owner).copied() }))
-            .chain(self.udp.iter().map(|u| ConnInfo { local_port: u.port, remote: SocketAddr { ip: 0, port: 0 }, state: "UDP", owner: self.owner_names.get(u.owner).copied() }))
+            .chain(self.listeners.iter().map(|&(port, owner)| ConnInfo { local_port: port, remote: SockAddr::v4(0, 0), state: "LISTEN", owner: self.owner_names.get(owner).copied() }))
+            .chain(self.udp.iter().map(|u| ConnInfo { local_port: u.port, remote: SockAddr::v4(0, 0), state: "UDP", owner: self.owner_names.get(u.owner).copied() }))
             .collect()
     }
 
     /// Drop everything `owner` holds (it was stopped or crashed): reset its
     /// connections, close its listeners and sockets.
     pub fn release_owner(&mut self, owner: usize, link: &mut dyn Link) {
+        self.sk_release(owner, link);
         for h in self.tcp.owned_by(owner) {
             self.tcp.abort(&mut self.ifs, link, h);
         }
@@ -317,199 +311,6 @@ impl Stack {
         self.raw.retain(|r| r.owner != owner);
     }
 
-    // ---------------------------------------------------------------- UDP
-
-    pub fn udp_bind(&mut self, owner: usize, link: &mut dyn Link, port: u16) -> R<UdpSocket> {
-        let port = if port != 0 {
-            if self.udp.iter().any(|u| u.port == port) {
-                return Err(NetError::AddrInUse);
-            }
-            port
-        } else {
-            let span = EPHEMERAL.end - EPHEMERAL.start;
-            let start = (link.random() % span as u64) as u32;
-            (0..span)
-                .map(|i| (EPHEMERAL.start + (start + i) % span) as u16)
-                .find(|p| !self.udp.iter().any(|u| u.port == *p))
-                .ok_or(NetError::AddrInUse)?
-        };
-        let id = self.id();
-        self.udp.push(Udp { id, owner, port, rx: VecDeque::new(), peers: Vec::new() });
-        Ok(UdpSocket::from_raw(id as u64))
-    }
-
-    fn udp_mut(&mut self, owner: usize, s: UdpSocket) -> R<&mut Udp> {
-        self.udp.iter_mut().find(|u| u.id as u64 == s.to_raw() && u.owner == owner).ok_or(NetError::BadHandle)
-    }
-
-    pub fn udp_local_port(&self, owner: usize, s: UdpSocket) -> R<u16> {
-        self.udp.iter().find(|u| u.id as u64 == s.to_raw() && u.owner == owner).map(|u| u.port).ok_or(NetError::BadHandle)
-    }
-
-    pub fn udp_send_to(&mut self, owner: usize, link: &mut dyn Link, s: UdpSocket, to: SocketAddr, data: &[u8]) -> R<()> {
-        let u = self.udp_mut(owner, s)?;
-        let port = u.port;
-        // still one of ours? (addresses change)
-        let from = u.peers.iter().find(|p| p.0 == to.ip).map_or(0, |p| p.1);
-        let from = if self.ifs.0.iter().any(|f| f.is_local(from)) { from } else { 0 };
-        if 20 + 8 + data.len() > self.ifs.mtu_for(to.ip) {
-            return Err(NetError::TooLarge);
-        }
-        if self.ifs.src_for(to.ip) == 0 && to.ip != u32::MAX {
-            return Err(NetError::NoRoute);
-        }
-        if self.ifs.send_udp_from(link, from, to.ip, port, to.port, data) { Ok(()) } else { Err(NetError::NoRoute) }
-    }
-
-    pub fn udp_recv_from(&mut self, owner: usize, s: UdpSocket, buf: &mut [u8]) -> R<(usize, SocketAddr)> {
-        let (from, data) = self.udp_mut(owner, s)?.rx.pop_front().ok_or(NetError::WouldBlock)?;
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        Ok((n, from))
-    }
-
-    pub fn udp_close(&mut self, owner: usize, s: UdpSocket) {
-        self.udp.retain(|u| !(u.id as u64 == s.to_raw() && u.owner == owner));
-    }
-
-    // ---------------------------------------------------------------- TCP
-
-    pub fn tcp_listen(&mut self, owner: usize, port: u16) -> R<TcpListener> {
-        if port == 0 || self.listeners.iter().any(|l| l.0 == port) {
-            return Err(NetError::AddrInUse);
-        }
-        self.listeners.push((port, owner));
-        self.tcp.listen(port);
-        Ok(TcpListener::from_raw(port as u64))
-    }
-
-    fn own_listener(&self, owner: usize, l: TcpListener) -> R<()> {
-        if self.listeners.contains(&(l.to_raw() as u16, owner)) { Ok(()) } else { Err(NetError::BadHandle) }
-    }
-
-    pub fn tcp_unlisten(&mut self, owner: usize, link: &mut dyn Link, l: TcpListener) {
-        if self.own_listener(owner, l).is_ok() {
-            let port = l.to_raw() as u16;
-            self.listeners.retain(|x| x.0 != port);
-            self.tcp.unlisten(&mut self.ifs, link, port);
-        }
-    }
-
-    pub fn tcp_accept(&mut self, owner: usize, l: TcpListener) -> R<(TcpStream, SocketAddr)> {
-        self.own_listener(owner, l)?;
-        let h = self.tcp.accept(l.to_raw() as u16, owner).ok_or(NetError::WouldBlock)?;
-        let s = self.tcp.sock(h).ok_or(NetError::Closed)?;
-        Ok((stream(h), SocketAddr { ip: s.rip, port: s.rport }))
-    }
-
-    /// Start an outgoing connection from a free ephemeral port.
-    pub fn tcp_connect(&mut self, owner: usize, link: &mut dyn Link, to: SocketAddr) -> R<TcpStream> {
-        self.tcp_connect_from(owner, link, 0, to)
-    }
-
-    /// Connect from our address `src` (an interface's or an extra one; 0:
-    /// the one towards `to`).
-    pub fn tcp_connect_from(&mut self, owner: usize, link: &mut dyn Link, src: Ip, to: SocketAddr) -> R<TcpStream> {
-        if self.ifs.src_for(to.ip) == 0 || to.ip == 0 || to.port == 0 {
-            return Err(NetError::NoRoute);
-        }
-        if src != 0 && !self.ifs.0.iter().any(|f| f.is_local(src)) {
-            return Err(NetError::NoRoute);
-        }
-        let span = EPHEMERAL.end - EPHEMERAL.start;
-        let start = (link.random() % span as u64) as u32;
-        let lport = (0..span)
-            .map(|i| (EPHEMERAL.start + (start + i) % span) as u16)
-            .find(|&p| !self.tcp.port_in_use(p))
-            .ok_or(NetError::AddrInUse)?;
-        let h = self.tcp.connect(&mut self.ifs, link, src, to.ip, to.port, lport, owner).ok_or(NetError::AddrInUse)?;
-        Ok(stream(h))
-    }
-
-    pub fn tcp_is_connected(&self, owner: usize, s: TcpStream) -> R<bool> {
-        self.own_stream(owner, s)?;
-        self.tcp.is_established(handle(s)).ok_or(NetError::Closed)
-    }
-
-    pub fn tcp_local_addr(&self, owner: usize, s: TcpStream) -> R<SocketAddr> {
-        self.own_stream(owner, s)?;
-        let k = self.tcp.sock(handle(s)).ok_or(NetError::Closed)?;
-        Ok(SocketAddr { ip: k.lip, port: k.lport })
-    }
-
-    fn own_stream(&self, owner: usize, s: TcpStream) -> R<()> {
-        match self.tcp.sock(handle(s)) {
-            None => Err(NetError::Closed),
-            Some(k) if k.owner != owner => Err(NetError::BadHandle),
-            Some(k) if k.released => Err(NetError::Closed),
-            Some(_) => Ok(()),
-        }
-    }
-
-    pub fn tcp_read(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, buf: &mut [u8]) -> R<usize> {
-        self.own_stream(owner, s)?;
-        if !self.tcp.peek(handle(s)).is_empty() {
-            return Ok(self.tcp.recv(&mut self.ifs, link, handle(s), buf));
-        }
-        if self.tcp.peer_done(handle(s)) { Ok(0) } else { Err(NetError::WouldBlock) }
-    }
-
-    pub fn tcp_write(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, data: &[u8]) -> R<usize> {
-        self.own_stream(owner, s)?;
-        if data.is_empty() {
-            return Ok(0);
-        }
-        match self.tcp.send(&mut self.ifs, link, handle(s), data) {
-            0 => Err(NetError::WouldBlock),
-            n => Ok(n),
-        }
-    }
-
-    pub fn tcp_close(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream) {
-        if self.own_stream(owner, s).is_ok() {
-            self.tcp.close(&mut self.ifs, link, handle(s));
-        }
-    }
-
-    pub fn tcp_abort(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream) {
-        if self.own_stream(owner, s).is_ok() {
-            self.tcp.abort(&mut self.ifs, link, handle(s));
-        }
-    }
-
-    // ---------------------------------------------------------------- raw IP
-
-    pub fn raw_open(&mut self, owner: usize, proto: u8) -> R<RawSocket> {
-        if proto == PROTO_TCP || proto == PROTO_UDP {
-            return Err(NetError::AddrInUse); // owned by the stack itself
-        }
-        let id = self.id();
-        self.raw.push(Raw { id, owner, proto, rx: VecDeque::new() });
-        Ok(RawSocket::from_raw(id as u64))
-    }
-
-    fn raw_mut(&mut self, owner: usize, s: RawSocket) -> R<&mut Raw> {
-        self.raw.iter_mut().find(|r| r.id as u64 == s.to_raw() && r.owner == owner).ok_or(NetError::BadHandle)
-    }
-
-    pub fn raw_recv(&mut self, owner: usize, s: RawSocket, buf: &mut [u8]) -> R<(usize, Ip, u8)> {
-        let (src, ttl, data) = self.raw_mut(owner, s)?.rx.pop_front().ok_or(NetError::WouldBlock)?;
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        Ok((n, src, ttl))
-    }
-
-    pub fn raw_send(&mut self, owner: usize, link: &mut dyn Link, s: RawSocket, dst: Ip, payload: &[u8]) -> R<()> {
-        let proto = self.raw_mut(owner, s)?.proto;
-        if 20 + payload.len() > self.ifs.mtu_for(dst) {
-            return Err(NetError::TooLarge);
-        }
-        if self.ifs.send_ip(link, dst, proto, payload) { Ok(()) } else { Err(NetError::NoRoute) }
-    }
-
-    pub fn raw_close(&mut self, owner: usize, s: RawSocket) {
-        self.raw.retain(|r| !(r.id as u64 == s.to_raw() && r.owner == owner));
-    }
 }
 
 // ---------------------------------------------------------------- the kernel's view
@@ -588,62 +389,62 @@ impl NetStack for Stack {
     fn send_packet(&mut self, link: &mut dyn Link, packet: &[u8]) -> bool {
         Stack::send_packet(self, link, packet)
     }
-    fn udp_bind(&mut self, owner: usize, link: &mut dyn Link, port: u16) -> R<UdpSocket> {
-        Stack::udp_bind(self, owner, link, port)
+    fn socket(&mut self, owner: usize, domain: i32, ty: i32, protocol: i32) -> SockResult<Socket> {
+        self.sk_socket(owner, domain, ty, protocol)
     }
-    fn udp_local_port(&self, owner: usize, s: UdpSocket) -> R<u16> {
-        Stack::udp_local_port(self, owner, s)
+    fn bind(&mut self, owner: usize, link: &mut dyn Link, s: Socket, addr: &SockAddr) -> SockResult<()> {
+        self.sk_bind(owner, link, s, addr)
     }
-    fn udp_send_to(&mut self, owner: usize, link: &mut dyn Link, s: UdpSocket, to: SocketAddr, data: &[u8]) -> R<()> {
-        Stack::udp_send_to(self, owner, link, s, to, data)
+    fn listen(&mut self, owner: usize, link: &mut dyn Link, s: Socket, backlog: i32) -> SockResult<()> {
+        self.sk_listen(owner, link, s, backlog)
     }
-    fn udp_recv_from(&mut self, owner: usize, s: UdpSocket, buf: &mut [u8]) -> R<(usize, SocketAddr)> {
-        Stack::udp_recv_from(self, owner, s, buf)
+    fn accept(&mut self, owner: usize, _link: &mut dyn Link, s: Socket, flags: i32) -> SockResult<(Socket, SockAddr)> {
+        self.sk_accept(owner, s, flags)
     }
-    fn udp_close(&mut self, owner: usize, s: UdpSocket) {
-        Stack::udp_close(self, owner, s)
+    fn connect(&mut self, owner: usize, link: &mut dyn Link, s: Socket, addr: &SockAddr) -> SockResult<()> {
+        self.sk_connect(owner, link, s, addr)
     }
-    fn tcp_listen(&mut self, owner: usize, port: u16) -> R<TcpListener> {
-        Stack::tcp_listen(self, owner, port)
+    fn sendto(&mut self, owner: usize, link: &mut dyn Link, s: Socket, data: &[u8], flags: i32, to: Option<&SockAddr>) -> SockResult<usize> {
+        self.sk_sendto(owner, link, s, data, flags, to)
     }
-    fn tcp_unlisten(&mut self, owner: usize, link: &mut dyn Link, l: TcpListener) {
-        Stack::tcp_unlisten(self, owner, link, l)
+    fn recvfrom(&mut self, owner: usize, link: &mut dyn Link, s: Socket, buf: &mut [u8], flags: i32) -> SockResult<(usize, Option<SockAddr>)> {
+        self.sk_recvfrom(owner, link, s, buf, flags)
     }
-    fn tcp_accept(&mut self, owner: usize, l: TcpListener) -> R<(TcpStream, SocketAddr)> {
-        Stack::tcp_accept(self, owner, l)
+    fn shutdown(&mut self, owner: usize, link: &mut dyn Link, s: Socket, how: i32) -> SockResult<()> {
+        self.sk_shutdown(owner, link, s, how)
     }
-    fn tcp_connect_from(&mut self, owner: usize, link: &mut dyn Link, src: Ip, to: SocketAddr) -> R<TcpStream> {
-        Stack::tcp_connect_from(self, owner, link, src, to)
+    fn close(&mut self, owner: usize, link: &mut dyn Link, s: Socket) -> SockResult<()> {
+        self.sk_close(owner, link, s)
     }
-    fn tcp_local_addr(&self, owner: usize, s: TcpStream) -> R<SocketAddr> {
-        Stack::tcp_local_addr(self, owner, s)
+    fn getsockname(&self, owner: usize, s: Socket) -> SockResult<SockAddr> {
+        self.sk_getsockname(owner, s)
     }
-    fn tcp_is_connected(&self, owner: usize, s: TcpStream) -> R<bool> {
-        Stack::tcp_is_connected(self, owner, s)
+    fn getpeername(&self, owner: usize, s: Socket) -> SockResult<SockAddr> {
+        self.sk_getpeername(owner, s)
     }
-    fn tcp_read(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, buf: &mut [u8]) -> R<usize> {
-        Stack::tcp_read(self, owner, link, s, buf)
+    fn setsockopt(&mut self, owner: usize, s: Socket, level: i32, name: i32, value: &[u8]) -> SockResult<()> {
+        self.sk_setsockopt(owner, s, level, name, value)
     }
-    fn tcp_write(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream, data: &[u8]) -> R<usize> {
-        Stack::tcp_write(self, owner, link, s, data)
+    fn getsockopt(&mut self, owner: usize, s: Socket, level: i32, name: i32, value: &mut [u8]) -> SockResult<usize> {
+        self.sk_getsockopt(owner, s, level, name, value)
     }
-    fn tcp_close(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream) {
-        Stack::tcp_close(self, owner, link, s)
+    fn ioctl(&mut self, owner: usize, s: Socket, request: u32, arg: u64) -> SockResult<u64> {
+        self.sk_ioctl(owner, s, request, arg)
     }
-    fn tcp_abort(&mut self, owner: usize, link: &mut dyn Link, s: TcpStream) {
-        Stack::tcp_abort(self, owner, link, s)
+    fn sock_poll(&self, owner: usize, s: Socket) -> SockResult<(u32, u64)> {
+        self.sk_poll(owner, s)
     }
-    fn raw_open(&mut self, owner: usize, proto: u8) -> R<RawSocket> {
-        Stack::raw_open(self, owner, proto)
+    fn epoll_create(&mut self, owner: usize) -> SockResult<Epoll> {
+        self.sk_epoll_create(owner)
     }
-    fn raw_recv(&mut self, owner: usize, s: RawSocket, buf: &mut [u8]) -> R<(usize, Ip, u8)> {
-        Stack::raw_recv(self, owner, s, buf)
+    fn epoll_ctl(&mut self, owner: usize, ep: Epoll, op: i32, s: Socket, events: u32, data: u64) -> SockResult<()> {
+        self.sk_epoll_ctl(owner, ep, op, s, events, data)
     }
-    fn raw_send(&mut self, owner: usize, link: &mut dyn Link, s: RawSocket, dst: Ip, payload: &[u8]) -> R<()> {
-        Stack::raw_send(self, owner, link, s, dst, payload)
+    fn epoll_wait(&mut self, owner: usize, ep: Epoll, out: &mut [EpollEvent]) -> SockResult<usize> {
+        self.sk_epoll_wait(owner, ep, out)
     }
-    fn raw_close(&mut self, owner: usize, s: RawSocket) {
-        Stack::raw_close(self, owner, s)
+    fn epoll_close(&mut self, owner: usize, ep: Epoll) -> SockResult<()> {
+        self.sk_epoll_close(owner, ep)
     }
 }
 
@@ -654,6 +455,8 @@ mod tests {
     struct Wire {
         now: u64,
         sent: usize,
+        /// what the stack reported: (owner, socket, events)
+        notes: Vec<(usize, Socket, u32)>,
     }
     impl Link for Wire {
         fn now_ms(&self) -> u64 {
@@ -666,32 +469,48 @@ mod tests {
         fn random(&mut self) -> u64 {
             0x1234_5678
         }
+        fn notify(&mut self, owner: usize, sock: Socket, events: u32) {
+            self.notes.push((owner, sock, events));
+        }
     }
 
     const fn ip(a: u8, b: u8, c: u8, d: u8) -> Ip {
         u32::from_be_bytes([a, b, c, d])
     }
 
-    fn talk(st: &mut Stack, w: &mut Wire, to: Ip, port: u16) -> SocketAddr {
-        let l = st.tcp_listen(1, port).unwrap();
-        let c = st.tcp_connect(2, w, SocketAddr { ip: to, port }).unwrap();
+    fn conn(st: &mut Stack, w: &mut Wire, owner: usize, to: Ip, port: u16) -> Socket {
+        let c = st.sk_socket(owner, AF_INET, SOCK_STREAM, 0).unwrap();
+        assert_eq!(st.sk_connect(owner, w, c, &SockAddr::v4(to, port)), Err(Errno::EINPROGRESS));
+        c
+    }
+
+    fn listen(st: &mut Stack, w: &mut Wire, owner: usize, port: u16) -> Socket {
+        let l = st.sk_socket(owner, AF_INET, SOCK_STREAM, 0).unwrap();
+        st.sk_bind(owner, w, l, &SockAddr::v4(0, port)).unwrap();
+        st.sk_listen(owner, w, l, 16).unwrap();
+        l
+    }
+
+    fn talk(st: &mut Stack, w: &mut Wire, to: Ip, port: u16) -> SockAddr {
+        let l = listen(st, w, 1, port);
+        let c = conn(st, w, 2, to, port);
         for _ in 0..10 {
             w.now += 1;
             st.poll(w);
         }
-        let (s, peer) = st.tcp_accept(1, l).expect("accepted");
-        assert_eq!(st.tcp_is_connected(2, c), Ok(true));
-        st.tcp_write(2, w, c, b"hello").unwrap();
+        let (s, peer) = st.sk_accept(1, l, 0).expect("accepted");
+        assert!(st.sk_getpeername(2, c).is_ok(), "connected");
+        st.sk_sendto(2, w, c, b"hello", 0, None).unwrap();
         st.poll(w);
         let mut b = [0u8; 16];
-        assert_eq!(st.tcp_read(1, w, s, &mut b), Ok(5));
+        assert_eq!(st.sk_recvfrom(1, w, s, &mut b, 0), Ok((5, None)));
         assert_eq!(&b[..5], b"hello");
-        st.tcp_write(1, w, s, b"back").unwrap();
+        st.sk_sendto(1, w, s, b"back", 0, None).unwrap();
         st.poll(w);
-        assert_eq!(st.tcp_read(2, w, c, &mut b), Ok(4));
-        st.tcp_close(2, w, c);
-        st.tcp_close(1, w, s);
-        st.tcp_unlisten(1, w, l);
+        assert_eq!(st.sk_recvfrom(2, w, c, &mut b, 0), Ok((4, None)));
+        st.sk_close(2, w, c).unwrap();
+        st.sk_close(1, w, s).unwrap();
+        st.sk_close(1, w, l).unwrap();
         peer
     }
 
@@ -700,17 +519,17 @@ mod tests {
     #[test]
     fn close_to_ourselves_settles() {
         let mut st = Stack::new([2; 6], ip(10, 0, 0, 1), 0xFFFF_FF00, ip(10, 0, 0, 254));
-        let mut w = Wire { now: 1, sent: 0 };
-        let l = st.tcp_listen(1, 80).unwrap();
-        let c = st.tcp_connect(2, &mut w, SocketAddr { ip: ip(10, 0, 0, 1), port: 80 }).unwrap();
+        let mut w = Wire { now: 1, sent: 0, notes: Vec::new() };
+        let l = listen(&mut st, &mut w, 1, 80);
+        let c = conn(&mut st, &mut w, 2, ip(10, 0, 0, 1), 80);
         st.poll(&mut w);
-        let (s, _) = st.tcp_accept(1, l).unwrap();
-        st.tcp_write(2, &mut w, c, b"GET").unwrap();
+        let (s, _) = st.sk_accept(1, l, 0).unwrap();
+        st.sk_sendto(2, &mut w, c, b"GET", 0, None).unwrap();
         st.poll(&mut w);
-        st.tcp_write(1, &mut w, s, b"answer").unwrap();
-        st.tcp_close(1, &mut w, s); // the server ends first
+        st.sk_sendto(1, &mut w, s, b"answer", 0, None).unwrap();
+        st.sk_close(1, &mut w, s).unwrap(); // the server ends first
         st.poll(&mut w);
-        st.tcp_close(2, &mut w, c);
+        st.sk_close(2, &mut w, c).unwrap();
         for _ in 0..5 {
             w.now += 1;
             st.poll(&mut w);
@@ -723,26 +542,132 @@ mod tests {
     fn to_ourselves() {
         let mut st = Stack::new([2; 6], ip(10, 0, 0, 1), 0xFFFF_FF00, ip(10, 0, 0, 254));
         st.ifs.0[0].extra = alloc::vec![ip(203, 0, 113, 7)];
-        let mut w = Wire { now: 1, sent: 0 };
+        let mut w = Wire { now: 1, sent: 0, notes: Vec::new() };
         // our address, loopback, an extra address (a cloud's public one)
-        assert_eq!(talk(&mut st, &mut w, ip(10, 0, 0, 1), 8888).ip, ip(10, 0, 0, 1));
-        assert_eq!(talk(&mut st, &mut w, ip(127, 0, 0, 1), 8889).ip, ip(127, 0, 0, 1));
-        assert_eq!(talk(&mut st, &mut w, ip(203, 0, 113, 7), 8890).ip, ip(203, 0, 113, 7));
+        assert_eq!(talk(&mut st, &mut w, ip(10, 0, 0, 1), 8888).ipv4(), Some(ip(10, 0, 0, 1)));
+        assert_eq!(talk(&mut st, &mut w, ip(127, 0, 0, 1), 8889).ipv4(), Some(ip(127, 0, 0, 1)));
+        assert_eq!(talk(&mut st, &mut w, ip(203, 0, 113, 7), 8890).ipv4(), Some(ip(203, 0, 113, 7)));
         // ping ourselves
-        let r = st.raw_open(3, PROTO_ICMP).unwrap();
+        let r = st.sk_socket(3, AF_INET, SOCK_RAW, PROTO_ICMP as i32).unwrap();
         let mut echo = alloc::vec![8u8, 0, 0, 0, 0, 1, 0, 1];
         let c = checksum(&echo, 0);
         echo[2..4].copy_from_slice(&c.to_be_bytes());
-        st.raw_send(3, &mut w, r, ip(10, 0, 0, 1), &echo).unwrap();
+        st.sk_sendto(3, &mut w, r, &echo, 0, Some(&SockAddr::v4(ip(10, 0, 0, 1), 0))).unwrap();
         st.poll(&mut w);
         let mut b = [0u8; 64];
         let mut got = None;
-        while let Ok((n, from, _)) = st.raw_recv(3, r, &mut b) {
-            if b[0] == 0 {
+        // the IP header, then the message (as on Linux)
+        while let Ok((n, from)) = st.sk_recvfrom(3, &mut w, r, &mut b, 0) {
+            if b[20] == 0 {
                 got = Some((n, from));
             }
         }
-        assert_eq!(got, Some((8, ip(10, 0, 0, 1))));
+        assert_eq!(got, Some((28, Some(SockAddr::v4(ip(10, 0, 0, 1), 0)))));
         assert_eq!(w.sent, 0, "nothing to ourselves went on the wire");
+    }
+
+    fn pump(st: &mut Stack, w: &mut Wire) {
+        for _ in 0..4 {
+            w.now += 1;
+            st.poll(w);
+        }
+    }
+
+    /// The socket calls with Linux semantics, and their notifications.
+    #[test]
+    fn sockets() {
+        let us = ip(10, 0, 0, 1);
+        let mut st = Stack::new([2; 6], us, 0xFFFF_FF00, ip(10, 0, 0, 254));
+        let w = &mut Wire { now: 1, sent: 0, notes: Vec::new() };
+        assert_eq!(st.sk_socket(1, AF_INET6, SOCK_STREAM, 0), Err(Errno::EAFNOSUPPORT));
+        assert_eq!(st.sk_socket(1, AF_UNIX, SOCK_STREAM, 0), Err(Errno::EAFNOSUPPORT));
+        assert_eq!(st.sk_socket(1, AF_INET, SOCK_STREAM, 17), Err(Errno::EPROTONOSUPPORT));
+        // a listener with an edge-triggered epoll on it
+        let l = st.sk_socket(1, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0).unwrap();
+        st.sk_bind(1, w, l, &SockAddr::v4(0, 7000)).unwrap();
+        assert_eq!(st.sk_setsockopt(1, l, SOL_SOCKET, SO_REUSEPORT, &1i32.to_ne_bytes()), Err(Errno::ENOPROTOOPT));
+        st.sk_listen(1, w, l, 16).unwrap();
+        let ep = st.sk_epoll_create(1).unwrap();
+        st.sk_epoll_ctl(1, ep, EPOLL_CTL_ADD, l, EPOLLIN | EPOLLET, 77).unwrap();
+        assert_eq!(st.sk_accept(1, l, 0).map(|_| ()), Err(Errno::EAGAIN));
+        // connect: in progress, then writable
+        let c = st.sk_socket(2, AF_INET, SOCK_STREAM, 0).unwrap();
+        assert_eq!(st.sk_connect(2, w, c, &SockAddr::v4(us, 7000)), Err(Errno::EINPROGRESS));
+        assert_eq!(st.sk_connect(2, w, c, &SockAddr::v4(us, 7000)), Err(Errno::EALREADY));
+        assert_eq!(st.sk_poll(2, c).unwrap().0 & EPOLLOUT, 0);
+        let seq = st.sk_poll(2, c).unwrap().1;
+        pump(&mut st, w);
+        assert!(w.notes.iter().any(|n| n.0 == 2 && n.1 == c && n.2 & EPOLLOUT != 0), "connected is reported");
+        assert!(st.sk_poll(2, c).unwrap().1 > seq, "the event counter moves");
+        assert_ne!(st.sk_poll(2, c).unwrap().0 & EPOLLOUT, 0);
+        // the listener's epoll has it, once (edge)
+        let mut out = [EpollEvent::default(); 4];
+        assert_eq!(st.sk_epoll_wait(1, ep, &mut out), Ok(1));
+        assert_eq!(out[0], EpollEvent { events: EPOLLIN, data: 77 });
+        assert_eq!(st.sk_epoll_wait(1, ep, &mut out), Ok(0));
+        let (s, peer) = st.sk_accept(1, l, SOCK_CLOEXEC).unwrap();
+        assert_eq!(peer, st.sk_getsockname(2, c).unwrap());
+        assert_eq!(st.sk_accept(1, l, 0x10).map(|_| ()), Err(Errno::EINVAL));
+        // data: EPOLLIN at once, FIONREAD, peek, read
+        st.sk_epoll_ctl(1, ep, EPOLL_CTL_ADD, s, EPOLLIN | EPOLLRDHUP | EPOLLET, 5).unwrap();
+        assert_eq!(st.sk_sendto(2, w, c, b"hello", MSG_NOSIGNAL, None), Ok(5));
+        pump(&mut st, w);
+        assert_eq!(st.sk_epoll_wait(1, ep, &mut out), Ok(1));
+        assert_eq!((out[0].data, out[0].events & EPOLLIN), (5, EPOLLIN));
+        assert_eq!(st.sk_ioctl(1, s, FIONREAD, 0), Ok(5));
+        let mut b = [0u8; 16];
+        assert_eq!(st.sk_recvfrom(1, w, s, &mut b, MSG_PEEK), Ok((5, None)));
+        assert_eq!(st.sk_recvfrom(1, w, s, &mut b[..3], 0), Ok((3, None)));
+        // more data on a socket that is still readable: a new edge
+        st.sk_sendto(2, w, c, b"!", 0, None).unwrap();
+        pump(&mut st, w);
+        assert_eq!(st.sk_epoll_wait(1, ep, &mut out), Ok(1));
+        assert_eq!(st.sk_recvfrom(1, w, s, &mut b, 0), Ok((3, None)));
+        assert_eq!(st.sk_recvfrom(1, w, s, &mut b, 0), Err(Errno::EAGAIN));
+        // the client stops sending: the server sees RDHUP and the end
+        st.sk_shutdown(2, w, c, SHUT_WR).unwrap();
+        assert_eq!(st.sk_sendto(2, w, c, b"x", 0, None), Err(Errno::EPIPE));
+        pump(&mut st, w);
+        assert_eq!(st.sk_epoll_wait(1, ep, &mut out), Ok(1));
+        assert_ne!(out[0].events & EPOLLRDHUP, 0);
+        assert_eq!(st.sk_recvfrom(1, w, s, &mut b, 0), Ok((0, None)));
+        // the server still answers on its half
+        assert_eq!(st.sk_sendto(1, w, s, b"bye", 0, None), Ok(3));
+        pump(&mut st, w);
+        assert_eq!(st.sk_recvfrom(2, w, c, &mut b, 0), Ok((3, None)));
+        st.sk_close(1, w, s).unwrap();
+        st.sk_close(2, w, c).unwrap();
+        assert_eq!(st.sk_poll(2, c), Err(Errno::EBADF));
+        // nobody listens: refused, reported once through SO_ERROR
+        let r = st.sk_socket(2, AF_INET, SOCK_STREAM, 0).unwrap();
+        assert_eq!(st.sk_connect(2, w, r, &SockAddr::v4(us, 7001)), Err(Errno::EINPROGRESS));
+        pump(&mut st, w);
+        assert_ne!(st.sk_poll(2, r).unwrap().0 & EPOLLERR, 0);
+        let mut v = [0u8; 4];
+        assert_eq!(st.sk_getsockopt(2, r, SOL_SOCKET, SO_ERROR, &mut v), Ok(4));
+        assert_eq!(i32::from_ne_bytes(v), Errno::ECONNREFUSED.0);
+        st.sk_getsockopt(2, r, SOL_SOCKET, SO_ERROR, &mut v).unwrap();
+        assert_eq!(i32::from_ne_bytes(v), 0);
+        st.sk_getsockopt(2, r, SOL_SOCKET, SO_TYPE, &mut v).unwrap();
+        assert_eq!(i32::from_ne_bytes(v), SOCK_STREAM);
+        assert_eq!(st.sk_getsockopt(2, r, SOL_SOCKET, 999, &mut v), Err(Errno::ENOPROTOOPT));
+        // UDP: connected, peek, truncation
+        let u1 = st.sk_socket(3, AF_INET, SOCK_DGRAM, 0).unwrap();
+        st.sk_bind(3, w, u1, &SockAddr::v4(us, 5300)).unwrap();
+        let u2 = st.sk_socket(4, AF_INET, SOCK_DGRAM, 0).unwrap();
+        assert_eq!(st.sk_sendto(4, w, u2, b"x", 0, None), Err(Errno::EDESTADDRREQ));
+        st.sk_connect(4, w, u2, &SockAddr::v4(us, 5300)).unwrap();
+        assert_eq!(st.sk_sendto(4, w, u2, b"datagram", 0, None), Ok(8));
+        assert_eq!(st.sk_sendto(4, w, u2, b"x", 0, Some(&SockAddr::v4(u32::MAX, 9))), Err(Errno::EACCES));
+        pump(&mut st, w);
+        assert_eq!(st.sk_ioctl(3, u1, FIONREAD, 0), Ok(8));
+        let me = st.sk_getsockname(4, u2).unwrap();
+        assert_eq!(st.sk_recvfrom(3, w, u1, &mut b[..4], MSG_PEEK | MSG_TRUNC), Ok((8, Some(me))));
+        assert_eq!(st.sk_recvfrom(3, w, u1, &mut b[..4], 0), Ok((4, Some(me))));
+        assert_eq!(st.sk_recvfrom(3, w, u1, &mut b, 0), Err(Errno::EAGAIN));
+        assert_eq!(st.sk_getpeername(4, u2), Ok(SockAddr::v4(us, 5300)));
+        assert_eq!(st.sk_getpeername(3, u1), Err(Errno::ENOTCONN));
+        // another owner cannot use it
+        assert_eq!(st.sk_recvfrom(4, w, u1, &mut b, 0), Err(Errno::EBADF));
     }
 }

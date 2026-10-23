@@ -44,7 +44,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Module, Param, SocketAddr, Sys, TcpListener, say};
+use rustros_api::socket::{SockAddr, Socket};
+use rustros_api::{Caps, Module, Param, Sys, say};
 use rustros_util::conn::Conn;
 use rustros_util::json::quote;
 use rustros_util::wire::{IpFmt, parse_ip};
@@ -66,7 +67,7 @@ struct Site {
     name: String,
     hosts: Vec<String>,
     root: String,
-    proxy: Option<SocketAddr>,
+    proxy: Option<SockAddr>,
     cert: bool,
     /// its certificate is set by hand (no ACME for it)
     manual: bool,
@@ -104,8 +105,8 @@ pub struct Sites {
     https: u16,
     token: Option<String>,
     tls: Option<Arc<tls::RustlsServerConfig>>,
-    lhttp: Option<(u16, TcpListener)>,
-    lhttps: Option<(u16, TcpListener)>,
+    lhttp: Option<(u16, Socket)>,
+    lhttps: Option<(u16, Socket)>,
     clients: Vec<Client>,
     closing: Vec<(Conn, u64)>,
     applied: String,
@@ -289,7 +290,7 @@ impl Sites {
                     let p = p.trim_start_matches("http://").trim_end_matches('/');
                     let (h, port) = p.rsplit_once(':').map_or((p, 80), |(h, port)| (h, port.parse().unwrap_or(80)));
                     match parse_ip(h) {
-                        Some(ip) => Some(SocketAddr { ip, port }),
+                        Some(ip) => Some(SockAddr::v4(ip, port)),
                         None => {
                             say!(sys, "sites: {}: proxy wants an address (a.b.c.d:port), not '{}'\n", n, h);
                             None
@@ -327,7 +328,7 @@ impl Sites {
                 st.name,
                 st.hosts.join(", "),
                 match st.proxy {
-                    Some(p) => format!("→ {}:{}", IpFmt(p.ip), p.port),
+                    Some(p) => format!("→ {}", p),
                     None => format!("files in {}/", st.root),
                 },
                 if st.cert { ", HTTPS" } else { "" }
@@ -346,11 +347,11 @@ impl Sites {
         for (slot, want) in [(&mut self.lhttp, self.http), (&mut self.lhttps, want_https)] {
             if slot.is_some_and(|(p, _)| p != want) {
                 if let Some((_, l)) = slot.take() {
-                    net.tcp_unlisten(l);
+                    let _ = net.close(l);
                 }
             }
             if slot.is_none() && want != 0 && !self.sites.is_empty() {
-                match net.tcp_listen(want) {
+                match rustros_util::sock::tcp_listen(net, want) {
                     Ok(l) => *slot = Some((want, l)),
                     Err(e) => say!(net, "sites: cannot listen on {}: {:?}\n", want, e),
                 }
@@ -362,21 +363,21 @@ impl Sites {
         let Some(net) = sys.net() else { return };
         for secure in [false, true] {
             let Some((_, l)) = (if secure { self.lhttps } else { self.lhttp }) else { continue };
-            while let Ok((s, peer)) = net.tcp_accept(l) {
+            while let Ok((s, peer)) = net.accept(l, 0) {
                 if self.clients.len() >= MAX_CONNS {
-                    net.tcp_abort(s);
+                    rustros_util::sock::abort(net, s);
                     continue;
                 }
                 let tls = match (secure, &self.tls) {
                     (true, Some(cfg)) => match tls::Tls::server(cfg.clone()) {
                         Ok(t) => Some(t),
                         Err(_) => {
-                            net.tcp_abort(s);
+                            rustros_util::sock::abort(net, s);
                             continue;
                         }
                     },
                     (true, None) => {
-                        net.tcp_abort(s);
+                        rustros_util::sock::abort(net, s);
                         continue;
                     }
                     _ => None,
@@ -515,9 +516,9 @@ impl Sites {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn proxy(&mut self, sys: &mut dyn Sys, cl: &mut Client, req: &Request, body: &[u8], backend: SocketAddr, secure: bool, now: u64) {
+    fn proxy(&mut self, sys: &mut dyn Sys, cl: &mut Client, req: &Request, body: &[u8], backend: SockAddr, secure: bool, now: u64) {
         let Some(net) = sys.net() else { return };
-        let Ok(s) = net.tcp_connect(backend) else {
+        let Ok(s) = rustros_util::sock::tcp_connect(net, &backend, 0) else {
             cl.out = simple(502, "", "the backend is unreachable\n");
             cl.phase = Phase::Done;
             return;
@@ -530,7 +531,7 @@ impl Sites {
             }
             head += &format!("{k}: {v}\r\n");
         }
-        head += &format!("X-Forwarded-For: {}\r\nX-Forwarded-Proto: {}\r\nConnection: close\r\n\r\n", IpFmt(cl.c.peer.ip), if secure { "https" } else { "http" });
+        head += &format!("X-Forwarded-For: {}\r\nX-Forwarded-Proto: {}\r\nConnection: close\r\n\r\n", IpFmt(cl.c.peer.ipv4().unwrap_or(0)), if secure { "https" } else { "http" });
         up.write(head.as_bytes());
         up.write(body);
         cl.deadline = now + PROXY_MS;
@@ -614,7 +615,7 @@ impl Sites {
             cl.out.extend_from_slice(&core::mem::take(&mut up.inbuf));
             if !alive || up.eof {
                 let Phase::Proxy(mut up) = core::mem::replace(&mut cl.phase, Phase::Done) else { unreachable!() };
-                up.close();
+                let _ = up.close();
                 up.pump(net, 0);
             }
         }
@@ -635,7 +636,7 @@ impl Sites {
         cl.c.pump(net, 0);
         if matches!(cl.phase, Phase::Done) && cl.out.is_empty() && cl.tls.as_ref().is_none_or(|t| t.pending_write() == 0) {
             // all handed over: close once sent
-            cl.c.close();
+            let _ = cl.c.close();
             self.closing.push((cl.c, now + REQUEST_MS));
             return None;
         }

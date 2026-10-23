@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod abi;
 pub mod frame;
 pub mod module;
+pub mod socket;
 pub mod sys;
 
 pub use frame::{Frame, HEADROOM, Offload, Verdict};

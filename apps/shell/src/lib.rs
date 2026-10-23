@@ -18,7 +18,8 @@ use rustros_util::netcmd;
 use rustros_util::secret;
 use rustros_util::wire::PROTO_ICMP;
 use rustros_util::wire::{Ip, IpFmt, MacFmt, be16, checksum, parse_ip};
-use rustros_api::{Admin, Caps, Kv, Module, ModuleInfo, ModuleKind, Net, Param, RawSocket, SocketAddr, Sys, say};
+use rustros_api::socket::{AF_INET, SOCK_RAW, SockAddr, Socket};
+use rustros_api::{Admin, Caps, Kv, Module, ModuleInfo, ModuleKind, Net, Param, Sys, say};
 
 /// Bytes of an HTTP response echoed to the console; the rest is only counted.
 const HTTP_SHOW: usize = 1024;
@@ -94,7 +95,7 @@ fn admin(sys: &mut dyn Sys) -> &mut dyn Admin {
 pub struct Shell {
     edit: rustros_util::lineedit::LineEdit,
     ask: Option<netcmd::Ask>,
-    icmp: Option<RawSocket>,
+    icmp: Option<Socket>,
     ping: Option<Ping>,
     http: Option<HttpGet>,
     greeted: bool,
@@ -290,9 +291,9 @@ impl Shell {
                 };
                 let port = args.next().and_then(|p| p.parse().ok()).unwrap_or(80);
                 let path = args.next().unwrap_or("/");
-                match net(sys).tcp_connect(SocketAddr { ip, port }) {
+                match rustros_util::sock::tcp_connect(net(sys), &SockAddr::v4(ip, port), 0) {
                     Ok(s) => {
-                        let mut conn = Conn::new(s, SocketAddr { ip, port });
+                        let mut conn = Conn::new(s, SockAddr::v4(ip, port));
                         // written before the handshake completes; sent once it does
                         conn.write(alloc::format!("GET {path} HTTP/1.0\r\nHost: {}\r\nUser-Agent: RustROS\r\n\r\n", IpFmt(ip)).as_bytes());
                         say!(sys, "connecting to {}...\n", conn.peer);
@@ -419,7 +420,7 @@ impl Shell {
     fn http_poll(&mut self, sys: &mut dyn Sys) {
         let Some(h) = self.http.as_mut() else { return };
         let now = sys.now_ms();
-        if !h.connected && net(sys).tcp_is_connected(h.conn.stream) == Ok(true) {
+        if !h.connected && rustros_util::sock::connected(net(sys), h.conn.stream) == Ok(true) {
             h.connected = true;
             say!(sys, "connected in {} ms\n", now - h.started);
         }
@@ -438,7 +439,7 @@ impl Shell {
             if timed_out && !done {
                 h.conn.abort(net(sys));
             } else if alive {
-                h.conn.close();
+                let _ = h.conn.close();
                 h.conn.pump(net(sys), 0);
             }
             let why = if h.total > 0 || h.conn.eof {
@@ -458,8 +459,14 @@ impl Shell {
         let Some(sock) = self.icmp else { return };
         // replies
         let mut buf = [0u8; 1500];
-        while let Ok((n, src, ttl)) = net(sys).raw_recv(sock, &mut buf) {
-            let m = &buf[..n];
+        while let Ok((n, from)) = net(sys).recvfrom(sock, &mut buf, 0) {
+            // as on Linux: the IP header, then the ICMP message
+            let ihl = (buf[0] & 0xF) as usize * 4;
+            if ihl < 20 || n < ihl {
+                continue;
+            }
+            let (src, ttl) = (from.and_then(|a| a.ipv4()).unwrap_or(0), buf[8]);
+            let m = &buf[ihl..n];
             let Some(p) = self.ping.as_mut() else { continue };
             if m.len() < 8 || m[0] != 0 || src != p.dst || be16(m, 4) != p.id {
                 continue;
@@ -528,8 +535,8 @@ impl Shell {
             if !sys.packet().is_some_and(|pk| pk.send_packet(&ip)) {
                 say!(sys, "ping: no route from {}\n", IpFmt(src));
             }
-        } else if let Err(e) = net(sys).raw_send(sock, dst, &m) {
-            say!(sys, "ping: {:?}\n", e);
+        } else if let Err(e) = net(sys).sendto(sock, &m, 0, Some(&SockAddr::v4(dst, 0))) {
+            say!(sys, "ping: {}\n", e);
         }
     }
 }
@@ -559,7 +566,7 @@ impl Module for Shell {
     }
 
     fn start(&mut self, sys: &mut dyn Sys) {
-        self.icmp = net(sys).raw_open(PROTO_ICMP).ok();
+        self.icmp = net(sys).socket(AF_INET, SOCK_RAW, PROTO_ICMP as i32).ok();
     }
 
     fn poll(&mut self, sys: &mut dyn Sys) {

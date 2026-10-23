@@ -531,6 +531,7 @@ version = "0.1.0"
 dependencies = [
  "rustros-api",
  "rustros-util",
+ "tcpip",
 ]
 
 [[package]]
@@ -991,6 +992,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tcpip"
+version = "0.1.0"
+dependencies = [
+ "rustros-api",
+ "rustros-util",
 ]
 
 [[package]]

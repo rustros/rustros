@@ -32,7 +32,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Module, Net, NetError, Param, SocketAddr, Sys, TcpListener, UdpSocket, say};
+use rustros_api::socket::{Errno, SockAddr, Socket};
+use rustros_api::{Caps, Module, Net, Param, Sys, say};
 use rustros_util::conn::Conn;
 use rustros_util::dns;
 use rustros_util::wire::{Ip, IpFmt, parse_ip, parse_net};
@@ -104,7 +105,7 @@ enum Phase {
     SocksAuth,
     SocksRequest,
     HttpHeader,
-    Resolve { sock: UdpSocket, id: u16, server: Ip, sent: u64, tries: u8 },
+    Resolve { sock: Socket, id: u16, server: Ip, sent: u64, tries: u8 },
     Connecting,
     Relay,
 }
@@ -126,7 +127,7 @@ struct Client {
 #[derive(Default)]
 pub struct Proxy {
     instances: Vec<Instance>,
-    listeners: BTreeMap<u16, TcpListener>,
+    listeners: BTreeMap<u16, Socket>,
     clients: Vec<Client>,
     /// connections being closed: their last bytes still going out
     closing: Vec<(Conn, u64)>,
@@ -151,10 +152,10 @@ fn http_error(status: &str, extra: &str) -> Vec<u8> {
     format!("HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len()).into_bytes()
 }
 
-fn socks_reply(rep: u8, bound: SocketAddr) -> Vec<u8> {
+fn socks_reply(rep: u8, bound: SockAddr) -> Vec<u8> {
     let mut r = alloc::vec![5, rep, 0, 1];
-    r.extend_from_slice(&bound.ip.to_be_bytes());
-    r.extend_from_slice(&bound.port.to_be_bytes());
+    r.extend_from_slice(&bound.ipv4().unwrap_or(0).to_be_bytes());
+    r.extend_from_slice(&bound.port().to_be_bytes());
     r
 }
 
@@ -358,13 +359,13 @@ impl Proxy {
         self.listeners.retain(|port, l| {
             let keep = ports.contains(port);
             if !keep {
-                net.tcp_unlisten(*l);
+                let _ = net.close(*l);
             }
             keep
         });
         for p in ports {
             if !self.listeners.contains_key(&p) {
-                match net.tcp_listen(p) {
+                match rustros_util::sock::tcp_listen(net, p) {
                     Ok(l) => {
                         self.listeners.insert(p, l);
                     }
@@ -387,8 +388,8 @@ impl Proxy {
         let now = sys.now_ms();
         let Some(net) = sys.net() else { return };
         for (&port, &l) in &self.listeners {
-            while let Ok((s, peer)) = net.tcp_accept(l) {
-                let local = net.tcp_local_addr(s).map(|a| a.ip).unwrap_or(0);
+            while let Ok((s, peer)) = net.accept(l, 0) {
+                let local = net.getsockname(s).ok().and_then(|a| a.ipv4()).unwrap_or(0);
                 // the instance on that address, else the one on any
                 let inst = self
                     .instances
@@ -396,16 +397,16 @@ impl Proxy {
                     .filter(|i| i.port == port && (i.bind == 0 || i.bind == local))
                     .max_by_key(|i| i.bind != 0);
                 let Some(inst) = inst else {
-                    net.tcp_abort(s);
+                    rustros_util::sock::abort(net, s);
                     continue;
                 };
-                if !inst.allowed(peer.ip) || inst.conns >= inst.max {
+                if !inst.allowed(peer.ipv4().unwrap_or(0)) || inst.conns >= inst.max {
                     inst.refused += 1;
                     if inst.log {
                         let why = if inst.conns >= inst.max { "too many connections" } else { "not in allow" };
-                        say!(net, "proxy: {}: refused {} ({})\n", inst.name, IpFmt(peer.ip), why);
+                        say!(net, "proxy: {}: refused {} ({})\n", inst.name, IpFmt(peer.ipv4().unwrap_or(0)), why);
                     }
-                    net.tcp_abort(s);
+                    rustros_util::sock::abort(net, s);
                     continue;
                 }
                 inst.conns += 1;
@@ -450,7 +451,7 @@ impl Proxy {
         };
         if !cl.c.pump(net, room) {
             if let Some(u) = cl.up.as_mut() {
-                u.close();
+                let _ = u.close();
                 u.pump(net, 0);
             }
             return false;
@@ -476,7 +477,7 @@ impl Proxy {
                     let n = 2 + b[1] as usize;
                     if !methods.contains(&want) {
                         cl.c.write(&[5, 0xFF]);
-                        cl.c.close();
+                        let _ = cl.c.close();
                         cl.c.pump(net, 0);
                         return false;
                     }
@@ -502,9 +503,9 @@ impl Proxy {
                     cl.c.write(&[1, if ok { 0 } else { 1 }]);
                     if !ok {
                         if inst.log {
-                            say!(net, "proxy: {}: {} wrong login\n", inst.name, IpFmt(cl.c.peer.ip));
+                            say!(net, "proxy: {}: {} wrong login\n", inst.name, IpFmt(cl.c.peer.ipv4().unwrap_or(0)));
                         }
-                        cl.c.close();
+                        let _ = cl.c.close();
                         cl.c.pump(net, 0);
                         return false;
                     }
@@ -530,8 +531,8 @@ impl Proxy {
                     if b[0] != 5 || b[1] != 1 || host.is_none() {
                         // only CONNECT, and no IPv6
                         let rep = if b[0] != 5 || len == 0 { 1 } else if b[1] != 1 { 7 } else { 8 };
-                        cl.c.write(&socks_reply(rep, SocketAddr { ip: 0, port: 0 }));
-                        cl.c.close();
+                        cl.c.write(&socks_reply(rep, SockAddr::v4(0, 0)));
+                        let _ = cl.c.close();
                         cl.c.pump(net, 0);
                         return false;
                     }
@@ -545,7 +546,7 @@ impl Proxy {
                     let Some(end) = cl.c.inbuf.windows(4).position(|w| w == b"\r\n\r\n") else {
                         if cl.c.inbuf.len() >= MAX_HEADER || cl.c.eof {
                             cl.c.write(&http_error("400 Bad Request", ""));
-                            cl.c.close();
+                            let _ = cl.c.close();
                             cl.c.pump(net, 0);
                             return false;
                         }
@@ -559,10 +560,10 @@ impl Proxy {
                         }
                         Err(answer) => {
                             if inst.log {
-                                say!(net, "proxy: {}: {} refused: {}\n", inst.name, IpFmt(cl.c.peer.ip), String::from_utf8_lossy(&answer[9..answer.iter().position(|&b| b == b'\r').unwrap_or(9)]));
+                                say!(net, "proxy: {}: {} refused: {}\n", inst.name, IpFmt(cl.c.peer.ipv4().unwrap_or(0)), String::from_utf8_lossy(&answer[9..answer.iter().position(|&b| b == b'\r').unwrap_or(9)]));
                             }
                             cl.c.write(&answer);
-                            cl.c.close();
+                            let _ = cl.c.close();
                             cl.c.pump(net, 0);
                             return false;
                         }
@@ -572,8 +573,8 @@ impl Proxy {
                     let (sock, id, server) = (*sock, *id, *server);
                     let mut buf = [0u8; 1500];
                     let mut got = None;
-                    while let Ok((n, from)) = net.udp_recv_from(sock, &mut buf) {
-                        if from.ip == server {
+                    while let Ok((n, from)) = net.recvfrom(sock, &mut buf, 0) {
+                        if from.and_then(|a| a.ipv4()) == Some(server) {
                             if let Some(a) = dns::answer(&buf[..n], id) {
                                 got = Some(a);
                                 break;
@@ -582,7 +583,7 @@ impl Proxy {
                     }
                     match got {
                         Some(Ok(ip)) => {
-                            net.udp_close(sock);
+                            let _ = net.close(sock);
                             if self.dns_cache.len() >= DNS_CACHE {
                                 self.dns_cache.retain(|_, e| e.1 > now);
                                 if self.dns_cache.len() >= DNS_CACHE {
@@ -605,7 +606,7 @@ impl Proxy {
                                 *sent = now;
                                 match dns::query(id, &cl.host) {
                                     Some(q) => {
-                                        let _ = net.udp_send_to(sock, SocketAddr { ip: server, port: 53 }, &q);
+                                        let _ = net.sendto(sock, &q, 0, Some(&SockAddr::v4(server, 53)));
                                     }
                                     None => {
                                         return fail(cl, net, 4, "400 Bad Request");
@@ -618,10 +619,10 @@ impl Proxy {
                 }
                 Phase::Connecting => {
                     let Some(up) = cl.up.as_mut() else { return false };
-                    match net.tcp_is_connected(up.stream) {
+                    match rustros_util::sock::connected(net, up.stream) {
                         Ok(false) => break,
                         Ok(true) => {
-                            let bound = net.tcp_local_addr(up.stream).unwrap_or(SocketAddr { ip: 0, port: 0 });
+                            let bound = net.getsockname(up.stream).unwrap_or(SockAddr::v4(0, 0));
                             match cl.reply {
                                 Reply::Socks => cl.c.write(&socks_reply(0, bound)),
                                 Reply::HttpTunnel => cl.c.write(b"HTTP/1.1 200 Connection established\r\n\r\n"),
@@ -660,16 +661,16 @@ impl Proxy {
                     // no half-close: one side's end ends both, after the rest is sent
                     if !alive || up.eof {
                         if alive {
-                            up.close();
+                            let _ = up.close();
                             up.pump(net, 0);
                         }
-                        cl.c.close();
+                        let _ = cl.c.close();
                         return cl.c.pump(net, 0);
                     }
                     if cl.c.eof {
-                        up.close();
+                        let _ = up.close();
                         up.pump(net, 0);
-                        cl.c.close();
+                        let _ = cl.c.close();
                         return cl.c.pump(net, 0);
                     }
                     if now - cl.last >= IDLE_MS {
@@ -687,7 +688,7 @@ impl Proxy {
 
 fn drop_client(net: &mut dyn Net, c: &mut Client) {
     if let Phase::Resolve { sock, .. } = c.phase {
-        net.udp_close(sock);
+        let _ = net.close(sock);
     }
     if let Some(u) = c.up.as_mut() {
         u.abort(net);
@@ -702,10 +703,10 @@ fn fail(cl: &mut Client, net: &mut dyn Net, rep: u8, status: &str) -> bool {
         u.abort(net);
     }
     match cl.reply {
-        Reply::Socks => cl.c.write(&socks_reply(rep, SocketAddr { ip: 0, port: 0 })),
+        Reply::Socks => cl.c.write(&socks_reply(rep, SockAddr::v4(0, 0))),
         _ => cl.c.write(&http_error(status, "")),
     }
-    cl.c.close();
+    let _ = cl.c.close();
     cl.c.pump(net, 0);
     false
 }
@@ -722,7 +723,7 @@ fn start_resolve(cl: &mut Client, inst: &Instance, cache: &mut BTreeMap<String, 
         }
     }
     cl.host = name;
-    match net.udp_bind(0) {
+    match rustros_util::sock::udp_bind(net, 0) {
         Ok(sock) => cl.phase = Phase::Resolve { sock, id: net.random() as u16, server: inst.dns, sent: 0, tries: 0 },
         Err(_) => {
             fail(cl, net, 1, "502 Bad Gateway");
@@ -733,10 +734,10 @@ fn start_resolve(cl: &mut Client, inst: &Instance, cache: &mut BTreeMap<String, 
 
 fn connect(cl: &mut Client, inst: &Instance, net: &mut dyn Net, ip: Ip, now: u64) {
     if inst.log {
-        say!(net, "proxy: {}: {} -> {}:{}{}\n", inst.name, IpFmt(cl.c.peer.ip), cl.host, cl.port, if parse_ip(&cl.host).is_some() { String::new() } else { format!(" ({})", IpFmt(ip)) });
+        say!(net, "proxy: {}: {} -> {}:{}{}\n", inst.name, IpFmt(cl.c.peer.ipv4().unwrap_or(0)), cl.host, cl.port, if parse_ip(&cl.host).is_some() { String::new() } else { format!(" ({})", IpFmt(ip)) });
     }
-    let to = SocketAddr { ip, port: cl.port };
-    let r = if inst.egress != 0 { net.tcp_connect_from(inst.egress, to) } else { net.tcp_connect(to) };
+    let to = SockAddr::v4(ip, cl.port);
+    let r = if inst.egress != 0 { rustros_util::sock::tcp_connect(net, &to, inst.egress) } else { rustros_util::sock::tcp_connect(net, &to, 0) };
     match r {
         Ok(s) => {
             cl.up = Some(Conn::new(s, to));
@@ -744,7 +745,7 @@ fn connect(cl: &mut Client, inst: &Instance, net: &mut dyn Net, ip: Ip, now: u64
             cl.deadline = now + CONNECT_MS;
         }
         Err(e) => {
-            fail(cl, net, if e == NetError::NoRoute { 3 } else { 1 }, "502 Bad Gateway");
+            fail(cl, net, if e == Errno::ENETUNREACH { 3 } else { 1 }, "502 Bad Gateway");
             // the caller notices: the client is closing
             cl.phase = Phase::Connecting;
         }
@@ -809,11 +810,11 @@ impl Module for Proxy {
                 let c = self.clients.swap_remove(i);
                 if let Some(net) = sys.net() {
                     if let Phase::Resolve { sock, .. } = c.phase {
-                        net.udp_close(sock);
+                        let _ = net.close(sock);
                     }
                 }
                 for mut conn in core::iter::once(c.c).chain(c.up) {
-                    conn.close();
+                    let _ = conn.close();
                     self.closing.push((conn, now + CONNECT_MS));
                 }
                 if let Some(inst) = self.instances.iter_mut().find(|x| x.name == c.inst) {

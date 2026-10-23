@@ -10,7 +10,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::{Net, SocketAddr};
+use rustros_api::Net;
+use rustros_api::socket::SockAddr;
 use rustros_util::conn::Conn;
 use rustros_util::dns::{Looked, Lookup};
 use rustros_util::wire::{Ip, parse_ip};
@@ -89,8 +90,8 @@ impl Call {
     }
 
     fn connect(&self, net: &mut dyn Net, ip: Ip) -> Result<Phase, String> {
-        let to = SocketAddr { ip, port: self.url.port };
-        let s = net.tcp_connect(to).map_err(|e| format!("connect {to}: {e:?}"))?;
+        let to = SockAddr::v4(ip, self.url.port);
+        let s = rustros_util::sock::tcp_connect(net, &to, 0).map_err(|e| format!("connect {to}: {e:?}"))?;
         Ok(Phase::Connecting(Conn::new(s, to)))
     }
 
@@ -163,7 +164,7 @@ impl Call {
                 },
                 Some(_) => return Some(Err(format!("{} does not resolve", self.url.host))),
             },
-            Phase::Connecting(mut c) => match net.tcp_is_connected(c.stream) {
+            Phase::Connecting(mut c) => match rustros_util::sock::connected(net, c.stream) {
                 Ok(false) => self.phase = Some(Phase::Connecting(c)),
                 Ok(true) => {
                     let mut t = match tls::Tls::client_trusting(&self.url.host, &self.ca) {
@@ -201,7 +202,7 @@ impl Call {
                     return Some(Err(String::from("answer too big")));
                 }
                 if let Some(done) = parse(&self.answer, false) {
-                    c.close();
+                    let _ = c.close();
                     c.pump(net, 0);
                     self.keep_headers();
                     return Some(done);

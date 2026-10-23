@@ -17,10 +17,8 @@ use std::cell::RefCell;
 
 use rustros_api::abi::*;
 
-use rustros_api::{
-    Admin, Module, Base, Caps, ConnInfo, Frame, HEADROOM, Ip, Kv, KvError, Net, NetError, NetInfo, Packet, RawSocket,
-    SocketAddr, StorageInfo, Sys, TcpListener, TcpStream, UdpSocket, UpdateInfo, Verdict,
-};
+use rustros_api::socket::{Epoll, EpollEvent, Errno, SockAddr, SockResult, Socket};
+use rustros_api::{Admin, Module, Base, Caps, ConnInfo, Frame, HEADROOM, Ip, Kv, KvError, Net, NetInfo, Packet, StorageInfo, Sys, UpdateInfo, Verdict};
 
 mod ffi {
     #[link(wasm_import_module = "rustros")]
@@ -34,24 +32,25 @@ mod ffi {
         pub fn net_info(p: *mut u8) -> i32;
         pub fn arp_table(p: *mut u8, cap: usize) -> i32;
         pub fn tcp_connections(p: *mut u8, cap: usize) -> i32;
-        pub fn udp_bind(port: i32) -> i64;
-        pub fn udp_local_port(h: i64) -> i32;
-        pub fn udp_send_to(h: i64, ip: i32, port: i32, p: *const u8, n: usize) -> i32;
-        pub fn udp_recv_from(h: i64, p: *mut u8, cap: usize, from: *mut u8) -> i32;
-        pub fn udp_close(h: i64);
-        pub fn tcp_listen(port: i32) -> i64;
-        pub fn tcp_unlisten(h: i64);
-        pub fn tcp_accept(h: i64, peer: *mut u8) -> i64;
-        pub fn tcp_connect(ip: i32, port: i32) -> i64;
-        pub fn tcp_is_connected(h: i64) -> i32;
-        pub fn tcp_read(h: i64, p: *mut u8, cap: usize) -> i32;
-        pub fn tcp_write(h: i64, p: *const u8, n: usize) -> i32;
-        pub fn tcp_close(h: i64);
-        pub fn tcp_abort(h: i64);
-        pub fn raw_open(proto: i32) -> i64;
-        pub fn raw_recv(h: i64, p: *mut u8, cap: usize, src: *mut u8) -> i32;
-        pub fn raw_send(h: i64, ip: i32, p: *const u8, n: usize) -> i32;
-        pub fn raw_close(h: i64);
+        pub fn sock_socket(domain: i32, ty: i32, proto: i32) -> i64;
+        pub fn sock_bind(h: i64, a: *const u8) -> i32;
+        pub fn sock_listen(h: i64, backlog: i32) -> i32;
+        pub fn sock_accept(h: i64, flags: i32, a: *mut u8) -> i64;
+        pub fn sock_connect(h: i64, a: *const u8) -> i32;
+        pub fn sock_sendto(h: i64, p: *const u8, n: usize, flags: i32, a: *const u8) -> i32;
+        pub fn sock_recvfrom(h: i64, p: *mut u8, cap: usize, flags: i32, a: *mut u8) -> i32;
+        pub fn sock_shutdown(h: i64, how: i32) -> i32;
+        pub fn sock_close(h: i64) -> i32;
+        pub fn sock_getsockname(h: i64, a: *mut u8) -> i32;
+        pub fn sock_getpeername(h: i64, a: *mut u8) -> i32;
+        pub fn sock_setsockopt(h: i64, level: i32, name: i32, p: *const u8, n: usize) -> i32;
+        pub fn sock_getsockopt(h: i64, level: i32, name: i32, p: *mut u8, cap: usize) -> i32;
+        pub fn sock_ioctl(h: i64, req: i32, arg: i64) -> i64;
+        pub fn sock_poll(h: i64, p: *mut u8) -> i32;
+        pub fn epoll_create() -> i64;
+        pub fn epoll_ctl(ep: i64, op: i32, h: i64, events: i32, data: i64) -> i32;
+        pub fn epoll_wait(ep: i64, p: *mut u8, max: i32) -> i32;
+        pub fn epoll_close(ep: i64) -> i32;
         pub fn mac(p: *mut u8) -> i32;
         pub fn send_frame(p: *const u8, n: usize) -> i32;
         pub fn kv_get(kp: *const u8, kn: usize, p: *mut u8, cap: usize) -> i32;
@@ -87,10 +86,6 @@ fn le64(b: &[u8]) -> u64 {
     u64::from_le_bytes(b[..8].try_into().unwrap())
 }
 
-fn addr(b: &[u8; 8]) -> SocketAddr {
-    SocketAddr { ip: le32(b), port: u16::from_le_bytes([b[4], b[5]]) }
-}
-
 thread_local! {
     /// Strings handed out as &'static str (app names), leaked once each.
     static INTERNED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
@@ -108,12 +103,17 @@ fn intern(s: &str) -> &'static str {
     })
 }
 
-fn handle(r: i64) -> Result<u64, NetError> {
-    if r < 0 { Err(to_net_err(r)) } else { Ok(r as u64) }
+/// A socket import's answer: the value, or -errno.
+fn ok64(r: i64) -> SockResult<u64> {
+    if r < 0 { Err(Errno(-r as i32)) } else { Ok(r as u64) }
 }
 
-fn status(r: i32) -> Result<(), NetError> {
-    if r < 0 { Err(to_net_err(r as i64)) } else { Ok(()) }
+fn ok32(r: i32) -> SockResult<usize> {
+    if r < 0 { Err(Errno(-r)) } else { Ok(r as usize) }
+}
+
+fn addr_from(b: &[u8; SOCKADDR]) -> Option<SockAddr> {
+    sockaddr_from(b)
 }
 
 pub struct GuestSys {
@@ -213,76 +213,86 @@ impl Net for GuestSys {
                 }
                 Some(ConnInfo {
                     local_port: f[0].parse().ok()?,
-                    remote: SocketAddr { ip: f[1].parse().ok()?, port: f[2].parse().ok()? },
+                    remote: SockAddr::v4(f[1].parse().ok()?, f[2].parse().ok()?),
                     state: intern(f[3]),
                     owner: (f[4] != "-").then(|| intern(f[4])),
                 })
             })
             .collect()
     }
-    fn udp_bind(&mut self, port: u16) -> Result<UdpSocket, NetError> {
-        handle(unsafe { ffi::udp_bind(port as i32) }).map(UdpSocket::from_raw)
+    fn socket(&mut self, domain: i32, ty: i32, protocol: i32) -> SockResult<Socket> {
+        ok64(unsafe { ffi::sock_socket(domain, ty, protocol) }).map(Socket::from_raw)
     }
-    fn udp_local_port(&self, s: UdpSocket) -> Result<u16, NetError> {
-        let r = unsafe { ffi::udp_local_port(s.to_raw() as i64) };
-        if r < 0 { Err(to_net_err(r as i64)) } else { Ok(r as u16) }
+    fn bind(&mut self, s: Socket, addr: &SockAddr) -> SockResult<()> {
+        ok32(unsafe { ffi::sock_bind(s.to_raw() as i64, sockaddr_bytes(addr).as_ptr()) }).map(|_| ())
     }
-    fn udp_send_to(&mut self, s: UdpSocket, to: SocketAddr, data: &[u8]) -> Result<(), NetError> {
-        status(unsafe { ffi::udp_send_to(s.to_raw() as i64, to.ip as i32, to.port as i32, data.as_ptr(), data.len()) })
+    fn listen(&mut self, s: Socket, backlog: i32) -> SockResult<()> {
+        ok32(unsafe { ffi::sock_listen(s.to_raw() as i64, backlog) }).map(|_| ())
     }
-    fn udp_recv_from(&mut self, s: UdpSocket, buf: &mut [u8]) -> Result<(usize, SocketAddr), NetError> {
-        let mut from = [0u8; 8];
-        let r = unsafe { ffi::udp_recv_from(s.to_raw() as i64, buf.as_mut_ptr(), buf.len(), from.as_mut_ptr()) };
-        if r < 0 { Err(to_net_err(r as i64)) } else { Ok((r as usize, addr(&from))) }
+    fn accept(&mut self, s: Socket, flags: i32) -> SockResult<(Socket, SockAddr)> {
+        let mut a = [0u8; SOCKADDR];
+        let h = ok64(unsafe { ffi::sock_accept(s.to_raw() as i64, flags, a.as_mut_ptr()) })?;
+        Ok((Socket::from_raw(h), addr_from(&a).ok_or(Errno::EAFNOSUPPORT)?))
     }
-    fn udp_close(&mut self, s: UdpSocket) {
-        unsafe { ffi::udp_close(s.to_raw() as i64) }
+    fn connect(&mut self, s: Socket, addr: &SockAddr) -> SockResult<()> {
+        ok32(unsafe { ffi::sock_connect(s.to_raw() as i64, sockaddr_bytes(addr).as_ptr()) }).map(|_| ())
     }
-    fn tcp_listen(&mut self, port: u16) -> Result<TcpListener, NetError> {
-        handle(unsafe { ffi::tcp_listen(port as i32) }).map(TcpListener::from_raw)
+    fn sendto(&mut self, s: Socket, data: &[u8], flags: i32, to: Option<&SockAddr>) -> SockResult<usize> {
+        let a = to.map(sockaddr_bytes);
+        let ap = a.as_ref().map_or(usize::MAX as *const u8, |a| a.as_ptr());
+        ok32(unsafe { ffi::sock_sendto(s.to_raw() as i64, data.as_ptr(), data.len(), flags, ap) })
     }
-    fn tcp_unlisten(&mut self, l: TcpListener) {
-        unsafe { ffi::tcp_unlisten(l.to_raw() as i64) }
+    fn recvfrom(&mut self, s: Socket, buf: &mut [u8], flags: i32) -> SockResult<(usize, Option<SockAddr>)> {
+        let mut a = [0u8; SOCKADDR];
+        let n = ok32(unsafe { ffi::sock_recvfrom(s.to_raw() as i64, buf.as_mut_ptr(), buf.len(), flags, a.as_mut_ptr()) })?;
+        Ok((n, addr_from(&a)))
     }
-    fn tcp_accept(&mut self, l: TcpListener) -> Result<(TcpStream, SocketAddr), NetError> {
-        let mut peer = [0u8; 8];
-        let h = handle(unsafe { ffi::tcp_accept(l.to_raw() as i64, peer.as_mut_ptr()) })?;
-        Ok((TcpStream::from_raw(h), addr(&peer)))
+    fn shutdown(&mut self, s: Socket, how: i32) -> SockResult<()> {
+        ok32(unsafe { ffi::sock_shutdown(s.to_raw() as i64, how) }).map(|_| ())
     }
-    fn tcp_connect(&mut self, to: SocketAddr) -> Result<TcpStream, NetError> {
-        handle(unsafe { ffi::tcp_connect(to.ip as i32, to.port as i32) }).map(TcpStream::from_raw)
+    fn close(&mut self, s: Socket) -> SockResult<()> {
+        ok32(unsafe { ffi::sock_close(s.to_raw() as i64) }).map(|_| ())
     }
-    fn tcp_is_connected(&self, s: TcpStream) -> Result<bool, NetError> {
-        let r = unsafe { ffi::tcp_is_connected(s.to_raw() as i64) };
-        if r < 0 { Err(to_net_err(r as i64)) } else { Ok(r == 1) }
+    fn getsockname(&self, s: Socket) -> SockResult<SockAddr> {
+        let mut a = [0u8; SOCKADDR];
+        ok32(unsafe { ffi::sock_getsockname(s.to_raw() as i64, a.as_mut_ptr()) })?;
+        addr_from(&a).ok_or(Errno::EAFNOSUPPORT)
     }
-    fn tcp_read(&mut self, s: TcpStream, buf: &mut [u8]) -> Result<usize, NetError> {
-        let r = unsafe { ffi::tcp_read(s.to_raw() as i64, buf.as_mut_ptr(), buf.len()) };
-        if r < 0 { Err(to_net_err(r as i64)) } else { Ok(r as usize) }
+    fn getpeername(&self, s: Socket) -> SockResult<SockAddr> {
+        let mut a = [0u8; SOCKADDR];
+        ok32(unsafe { ffi::sock_getpeername(s.to_raw() as i64, a.as_mut_ptr()) })?;
+        addr_from(&a).ok_or(Errno::EAFNOSUPPORT)
     }
-    fn tcp_write(&mut self, s: TcpStream, data: &[u8]) -> Result<usize, NetError> {
-        let r = unsafe { ffi::tcp_write(s.to_raw() as i64, data.as_ptr(), data.len()) };
-        if r < 0 { Err(to_net_err(r as i64)) } else { Ok(r as usize) }
+    fn setsockopt(&mut self, s: Socket, level: i32, name: i32, value: &[u8]) -> SockResult<()> {
+        ok32(unsafe { ffi::sock_setsockopt(s.to_raw() as i64, level, name, value.as_ptr(), value.len()) }).map(|_| ())
     }
-    fn tcp_close(&mut self, s: TcpStream) {
-        unsafe { ffi::tcp_close(s.to_raw() as i64) }
+    fn getsockopt(&mut self, s: Socket, level: i32, name: i32, value: &mut [u8]) -> SockResult<usize> {
+        ok32(unsafe { ffi::sock_getsockopt(s.to_raw() as i64, level, name, value.as_mut_ptr(), value.len()) })
     }
-    fn tcp_abort(&mut self, s: TcpStream) {
-        unsafe { ffi::tcp_abort(s.to_raw() as i64) }
+    fn ioctl(&mut self, s: Socket, request: u32, arg: u64) -> SockResult<u64> {
+        ok64(unsafe { ffi::sock_ioctl(s.to_raw() as i64, request as i32, arg as i64) })
     }
-    fn raw_open(&mut self, proto: u8) -> Result<RawSocket, NetError> {
-        handle(unsafe { ffi::raw_open(proto as i32) }).map(RawSocket::from_raw)
+    fn sock_poll(&self, s: Socket) -> SockResult<(u32, u64)> {
+        let mut b = [0u8; 12];
+        ok32(unsafe { ffi::sock_poll(s.to_raw() as i64, b.as_mut_ptr()) })?;
+        Ok((le32(&b), le64(&b[4..])))
     }
-    fn raw_recv(&mut self, s: RawSocket, buf: &mut [u8]) -> Result<(usize, Ip, u8), NetError> {
-        let mut meta = [0u8; 8];
-        let r = unsafe { ffi::raw_recv(s.to_raw() as i64, buf.as_mut_ptr(), buf.len(), meta.as_mut_ptr()) };
-        if r < 0 { Err(to_net_err(r as i64)) } else { Ok((r as usize, le32(&meta), meta[4])) }
+    fn epoll_create(&mut self) -> SockResult<Epoll> {
+        ok64(unsafe { ffi::epoll_create() }).map(Epoll::from_raw)
     }
-    fn raw_send(&mut self, s: RawSocket, dst: Ip, payload: &[u8]) -> Result<(), NetError> {
-        status(unsafe { ffi::raw_send(s.to_raw() as i64, dst as i32, payload.as_ptr(), payload.len()) })
+    fn epoll_ctl(&mut self, ep: Epoll, op: i32, s: Socket, events: u32, data: u64) -> SockResult<()> {
+        ok32(unsafe { ffi::epoll_ctl(ep.to_raw() as i64, op, s.to_raw() as i64, events as i32, data as i64) }).map(|_| ())
     }
-    fn raw_close(&mut self, s: RawSocket) {
-        unsafe { ffi::raw_close(s.to_raw() as i64) }
+    fn epoll_wait(&mut self, ep: Epoll, out: &mut [EpollEvent]) -> SockResult<usize> {
+        let mut b = vec![0u8; out.len() * 12];
+        let n = ok32(unsafe { ffi::epoll_wait(ep.to_raw() as i64, b.as_mut_ptr(), out.len() as i32) })?;
+        for (e, c) in out.iter_mut().zip(b.chunks_exact(12)).take(n) {
+            *e = EpollEvent { events: le32(c), data: le64(&c[4..]) };
+        }
+        Ok(n)
+    }
+    fn epoll_close(&mut self, ep: Epoll) -> SockResult<()> {
+        ok32(unsafe { ffi::epoll_close(ep.to_raw() as i64) }).map(|_| ())
     }
 }
 

@@ -27,7 +27,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use rustros_api::{Caps, Module, ModuleKind, Param, Sys, TcpListener, say};
+use rustros_api::socket::Socket;
+use rustros_api::{Caps, Module, ModuleKind, Param, Sys, say};
 use rustros_util::conn::Conn;
 use rustros_util::sha256::{Hmac, Sha256, ct_eq};
 use rustros_util::wire::{Ip, IpFmt, fmt_ip_list, parse_ip, parse_net};
@@ -52,7 +53,7 @@ const PAGE: &str = include_str!("page.html");
 
 #[derive(Default)]
 pub struct WebAdmin {
-    listener: Option<(TcpListener, u16)>,
+    listener: Option<(Socket, u16)>,
     conns: Vec<Conn>,
     /// SHA-256 of PW_SALT + password (None: no password set, no logins)
     pw: Option<[u8; 32]>,
@@ -261,9 +262,9 @@ impl WebAdmin {
         if self.listener.is_none_or(|(_, p)| p != port) {
             let Some(net) = sys.net() else { return };
             if let Some((l, _)) = self.listener.take() {
-                net.tcp_unlisten(l);
+                let _ = net.close(l);
             }
-            match net.tcp_listen(port) {
+            match rustros_util::sock::tcp_listen(net, port) {
                 Ok(l) => {
                     self.listener = Some((l, port));
                     say!(sys, "webadmin: http on port {}{}\n", port, if self.pw.is_none() { " (no password yet: cfg webadmin password <text>)" } else { "" });
@@ -810,11 +811,11 @@ impl Module for WebAdmin {
             self.reload_at = now + RELOAD_MS;
         }
         if let (Some((l, _)), Some(net)) = (self.listener, sys.net()) {
-            while let Ok((s, peer)) = net.tcp_accept(l) {
-                if self.allowed(peer.ip) && self.conns.len() < 32 {
+            while let Ok((s, peer)) = net.accept(l, 0) {
+                if self.allowed(peer.ipv4().unwrap_or(0)) && self.conns.len() < 32 {
                     self.conns.push(Conn::new(s, peer));
                 } else {
-                    net.tcp_abort(s);
+                    rustros_util::sock::abort(net, s);
                 }
             }
         }
@@ -836,7 +837,7 @@ impl Module for WebAdmin {
             if let Some(reply) = reply {
                 c.write(&reply);
                 c.inbuf.clear();
-                c.close();
+                let _ = c.close();
                 if let Some(net) = sys.net() {
                     c.pump(net, 0);
                 }

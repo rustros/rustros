@@ -33,7 +33,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use rustros_api::{Caps, Module, Net, Param, SocketAddr, Sys, TcpListener, UdpSocket, say};
+use rustros_api::socket::{SockAddr, Socket};
+use rustros_api::{Caps, Module, Net, Param, Sys, say};
 use rustros_util::conn::Conn;
 use rustros_util::dns::{Looked, Lookup};
 use rustros_util::sha256::Sha256;
@@ -116,9 +117,9 @@ enum StreamPhase {
 }
 
 struct Udp {
-    sock: UdpSocket,
+    sock: Socket,
     /// all packets to this one (v2, connect)
-    one: Option<SocketAddr>,
+    one: Option<SockAddr>,
     /// a packet waiting for its target's name: (lookup, name, port, data)
     waiting: Option<(Lookup, String, u16, Vec<u8>)>,
     last: u64,
@@ -154,7 +155,7 @@ struct Session {
 #[derive(Default)]
 pub struct AnyTls {
     instances: Vec<Instance>,
-    listeners: BTreeMap<u16, TcpListener>,
+    listeners: BTreeMap<u16, Socket>,
     sessions: Vec<Session>,
     closing: Vec<(Conn, u64)>,
     dns_cache: BTreeMap<String, (Ip, u64)>,
@@ -269,13 +270,13 @@ impl AnyTls {
         self.listeners.retain(|port, l| {
             let keep = ports.contains(port);
             if !keep {
-                net.tcp_unlisten(*l);
+                let _ = net.close(*l);
             }
             keep
         });
         for p in ports {
             if !self.listeners.contains_key(&p) {
-                match net.tcp_listen(p) {
+                match rustros_util::sock::tcp_listen(net, p) {
                     Ok(l) => {
                         self.listeners.insert(p, l);
                     }
@@ -353,19 +354,19 @@ impl AnyTls {
         let now = sys.now_ms();
         let Some(net) = sys.net() else { return };
         for (&port, &l) in &self.listeners {
-            while let Ok((s, peer)) = net.tcp_accept(l) {
-                let local = net.tcp_local_addr(s).map(|a| a.ip).unwrap_or(0);
+            while let Ok((s, peer)) = net.accept(l, 0) {
+                let local = net.getsockname(s).ok().and_then(|a| a.ipv4()).unwrap_or(0);
                 let Some(inst) = self.instances.iter_mut().filter(|i| i.port == port && (i.bind == 0 || i.bind == local)).max_by_key(|i| i.bind != 0) else {
-                    net.tcp_abort(s);
+                    rustros_util::sock::abort(net, s);
                     continue;
                 };
-                if !inst.allow.iter().any(|&(n, m)| peer.ip & m == n) || inst.sessions >= inst.max {
+                if !inst.allow.iter().any(|&(n, m)| peer.ipv4().unwrap_or(0) & m == n) || inst.sessions >= inst.max {
                     inst.refused += 1;
-                    net.tcp_abort(s);
+                    rustros_util::sock::abort(net, s);
                     continue;
                 }
                 let Ok(t) = tls::Tls::server(inst.config.clone()) else {
-                    net.tcp_abort(s);
+                    rustros_util::sock::abort(net, s);
                     continue;
                 };
                 inst.sessions += 1;
@@ -396,7 +397,7 @@ impl AnyTls {
         let s = &mut self.sessions[si];
         if !matches!(s.phase, Phase::Frames) && now >= s.deadline {
             if inst.log {
-                say!(net, "anytls: {}: {} gave up during {}\n", inst.name, IpFmt(s.c.peer.ip), if matches!(s.phase, Phase::Handshake) { "TLS" } else { "the password" });
+                say!(net, "anytls: {}: {} gave up during {}\n", inst.name, IpFmt(s.c.peer.ipv4().unwrap_or(0)), if matches!(s.phase, Phase::Handshake) { "TLS" } else { "the password" });
             }
             return false;
         }
@@ -411,7 +412,7 @@ impl AnyTls {
         }
         if let Some(e) = s.tls.error.take() {
             if inst.log {
-                say!(net, "anytls: {}: {} TLS: {}\n", inst.name, IpFmt(s.c.peer.ip), e);
+                say!(net, "anytls: {}: {} TLS: {}\n", inst.name, IpFmt(s.c.peer.ipv4().unwrap_or(0)), e);
             }
             flush(s, net);
             return false;
@@ -426,13 +427,13 @@ impl AnyTls {
                 let user = inst.users.iter().find(|(_, h)| rustros_util::sha256::ct_eq(h, &s.plain[..32]));
                 let Some((name, _)) = user else {
                     if inst.log {
-                        say!(net, "anytls: {}: {} wrong password\n", inst.name, IpFmt(s.c.peer.ip));
+                        say!(net, "anytls: {}: {} wrong password\n", inst.name, IpFmt(s.c.peer.ipv4().unwrap_or(0)));
                     }
                     return false;
                 };
                 s.user = name.clone();
                 if inst.log {
-                    say!(net, "anytls: {}: {} logged in as {}\n", inst.name, IpFmt(s.c.peer.ip), s.user);
+                    say!(net, "anytls: {}: {} logged in as {}\n", inst.name, IpFmt(s.c.peer.ipv4().unwrap_or(0)), s.user);
                 }
                 s.plain.drain(..34 + pad);
                 s.phase = Phase::Frames;
@@ -551,14 +552,14 @@ fn end_stream(net: &mut dyn Net, st: Stream) {
         StreamPhase::Resolve(l) => l.cancel(net),
         StreamPhase::Connecting(mut c) => c.abort(net),
         StreamPhase::Relay(mut c) => {
-            c.close();
+            let _ = c.close();
             c.pump(net, 0);
         }
         StreamPhase::Udp(u) => {
             if let Some((l, ..)) = u.waiting {
                 l.cancel(net);
             }
-            net.udp_close(u.sock);
+            let _ = net.close(u.sock);
         }
         _ => {}
     }
@@ -595,8 +596,8 @@ fn remember(cache: &mut BTreeMap<String, (Ip, u64)>, name: String, ip: Ip, now: 
 }
 
 fn connect(inst: &Instance, net: &mut dyn Net, ip: Ip, port: u16) -> Option<Conn> {
-    let to = SocketAddr { ip, port };
-    let r = if inst.egress != 0 { net.tcp_connect_from(inst.egress, to) } else { net.tcp_connect(to) };
+    let to = SockAddr::v4(ip, port);
+    let r = if inst.egress != 0 { rustros_util::sock::tcp_connect(net, &to, inst.egress) } else { rustros_util::sock::tcp_connect(net, &to, 0) };
     r.ok().map(|s| Conn::new(s, to))
 }
 
@@ -626,7 +627,7 @@ fn stream_step(st: &mut Stream, sid: u32, version: u32, inst: &Instance, cache: 
                             if st.udp_v2 {
                                 st.phase = StreamPhase::UdpRequest;
                             } else {
-                                let Ok(sock) = net.udp_bind(0) else { return refuse(out, sid, 1, "no UDP socket") };
+                                let Ok(sock) = rustros_util::sock::udp_bind(net, 0) else { return refuse(out, sid, 1, "no UDP socket") };
                                 st.phase = StreamPhase::Udp(Udp { sock, one: None, waiting: None, last: now });
                             }
                             continue;
@@ -668,7 +669,7 @@ fn stream_step(st: &mut Stream, sid: u32, version: u32, inst: &Instance, cache: 
                     return refuse(out, sid, version, "the name does not resolve");
                 }
             },
-            StreamPhase::Connecting(c) => match net.tcp_is_connected(c.stream) {
+            StreamPhase::Connecting(c) => match rustros_util::sock::connected(net, c.stream) {
                 Ok(false) if now < st.deadline => return (true, 0),
                 Ok(true) => {
                     if version >= 2 {
@@ -709,16 +710,16 @@ fn stream_step(st: &mut Stream, sid: u32, version: u32, inst: &Instance, cache: 
                     Some(Err(e)) => return refuse(out, sid, 1, &e),
                     Some(Ok((host, port, used))) => {
                         st.input.drain(..1 + used);
-                        let Ok(sock) = net.udp_bind(0) else { return refuse(out, sid, 1, "no UDP socket") };
+                        let Ok(sock) = rustros_util::sock::udp_bind(net, 0) else { return refuse(out, sid, 1, "no UDP socket") };
                         let mut u = Udp { sock, one: None, waiting: None, last: now };
                         if connect_flag != 0 {
                             match parse_ip(&host).or_else(|| cached(cache, &host, now)) {
-                                Some(ip) => u.one = Some(SocketAddr { ip, port }),
+                                Some(ip) => u.one = Some(SockAddr::v4(ip, port)),
                                 None => match Lookup::start(net, &host, inst.dns) {
                                     // resolved before any packet goes
                                     Some(l) => u.waiting = Some((l, host, port, Vec::new())),
                                     None => {
-                                        net.udp_close(sock);
+                                        let _ = net.close(sock);
                                         return refuse(out, sid, 1, "no DNS socket");
                                     }
                                 },
@@ -748,9 +749,9 @@ fn udp_step(u: &mut Udp, input: &mut Vec<u8>, sid: u32, inst: &Instance, cache: 
                 if let Looked::Found(ip) = r {
                     remember(cache, name, ip, now);
                     if data.is_empty() && u.one.is_none() {
-                        u.one = Some(SocketAddr { ip, port }); // the v2 connect target
+                        u.one = Some(SockAddr::v4(ip, port)); // the v2 connect target
                     } else {
-                        let _ = net.udp_send_to(u.sock, SocketAddr { ip, port }, &data);
+                        let _ = net.sendto(u.sock, &data, 0, Some(&SockAddr::v4(ip, port)));
                     }
                 }
             }
@@ -758,7 +759,7 @@ fn udp_step(u: &mut Udp, input: &mut Vec<u8>, sid: u32, inst: &Instance, cache: 
     }
     loop {
         let ((host, port), hdr) = if let Some(one) = u.one {
-            ((format!("{}", IpFmt(one.ip)), one.port), 0)
+            ((format!("{}", IpFmt(one.ipv4().unwrap_or(0))), one.port()), 0)
         } else {
             match read_addr(input, 0, 2, 1) {
                 None => break,
@@ -777,7 +778,7 @@ fn udp_step(u: &mut Udp, input: &mut Vec<u8>, sid: u32, inst: &Instance, cache: 
         moved += len;
         match parse_ip(&host).or_else(|| cached(cache, &host, now)) {
             Some(ip) => {
-                let _ = net.udp_send_to(u.sock, SocketAddr { ip, port }, &data);
+                let _ = net.sendto(u.sock, &data, 0, Some(&SockAddr::v4(ip, port)));
             }
             None => {
                 if let Some(l) = Lookup::start(net, &host, inst.dns) {
@@ -789,12 +790,13 @@ fn udp_step(u: &mut Udp, input: &mut Vec<u8>, sid: u32, inst: &Instance, cache: 
     }
     // what comes back
     let mut buf = [0u8; 2048];
-    while let Ok((n, from)) = net.udp_recv_from(u.sock, &mut buf) {
+    while let Ok((n, from)) = net.recvfrom(u.sock, &mut buf, 0) {
         let mut p = Vec::with_capacity(n + 9);
         if u.one.is_none() {
             p.push(0);
-            p.extend_from_slice(&from.ip.to_be_bytes());
-            p.extend_from_slice(&from.port.to_be_bytes());
+            let from = from.unwrap_or(SockAddr::v4(0, 0));
+            p.extend_from_slice(&from.ipv4().unwrap_or(0).to_be_bytes());
+            p.extend_from_slice(&from.port().to_be_bytes());
         }
         p.extend_from_slice(&(n as u16).to_be_bytes());
         p.extend_from_slice(&buf[..n]);
@@ -880,11 +882,11 @@ impl Module for AnyTls {
                 inst.sessions = inst.sessions.saturating_sub(1);
                 if inst.log {
                     if let Some(net) = sys.net() {
-                        say!(net, "anytls: {}: {} session ended\n", inst.name, IpFmt(s.c.peer.ip));
+                        say!(net, "anytls: {}: {} session ended\n", inst.name, IpFmt(s.c.peer.ipv4().unwrap_or(0)));
                     }
                 }
             }
-            s.c.close();
+            let _ = s.c.close();
             self.closing.push((s.c, now + CONNECT_MS));
         }
     }
