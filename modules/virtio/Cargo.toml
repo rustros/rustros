@@ -1,0 +1,16 @@
+[package]
+name = "virtio-mod"
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "virtio"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+virtio = { path = "../../virtio" }

@@ -46,6 +46,11 @@ APPS = {
     "panel": "connects the machine to a management panel",
     "sites": "websites: static files, reverse proxy, Let's Encrypt",
     "ext4": "the ext4 file system driver: mounts the files partition (journal, metadata checksums)",
+    # services: each replaces the boot image's while the system runs
+    "netstack": "the full-speed network stack: takes over from the boot image's bootstrap one at boot; later versions replace it while it runs, connections intact",
+    "storage": "the storage service (grubenv, kernel slots, key-value store, console log)",
+    "modman": "the module manager",
+    "virtio": "the virtio-blk and virtio-net drivers",
 }
 
 

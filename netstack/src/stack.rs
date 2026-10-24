@@ -60,7 +60,7 @@ pub struct Stack {
     pub(crate) listeners: Vec<(u16, usize)>,
     pub(crate) udp: Vec<Udp>,
     pub(crate) raw: Vec<Raw>,
-    next_id: u32,
+    pub(crate) next_id: u32,
     /// The applications' sockets and epoll instances (socket.rs).
     pub(crate) sk: crate::socket::Sockets,
     /// Application names by owner index, for connection listings.
@@ -388,6 +388,30 @@ impl NetStack for Stack {
     }
     fn send_packet(&mut self, link: &mut dyn Link, packet: &[u8]) -> bool {
         Stack::send_packet(self, link, packet)
+    }
+    #[cfg(feature = "handover")]
+    fn state_version(&self) -> u32 {
+        crate::handover::VERSION
+    }
+    #[cfg(feature = "handover")]
+    fn save_state(&self, version: u32) -> Option<Vec<u8>> {
+        Stack::save_state(self, version)
+    }
+    #[cfg(feature = "handover")]
+    fn load_state(&mut self, state: &[u8]) -> Result<(), String> {
+        Stack::load_state(self, state)
+    }
+    #[cfg(not(feature = "handover"))]
+    fn state_version(&self) -> u32 {
+        0
+    }
+    #[cfg(not(feature = "handover"))]
+    fn save_state(&self, _version: u32) -> Option<Vec<u8>> {
+        None
+    }
+    #[cfg(not(feature = "handover"))]
+    fn load_state(&mut self, _state: &[u8]) -> Result<(), String> {
+        Err(String::from("this network stack (the boot image's) cannot take over a running one"))
     }
     fn socket(&mut self, owner: usize, domain: i32, ty: i32, protocol: i32) -> SockResult<Socket> {
         self.sk_socket(owner, domain, ty, protocol)

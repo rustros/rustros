@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 use rustros_api::socket::*;
 use rustros_api::Ip;
 use rustros_util::epoll::EpollSet;
+#[cfg(feature = "handover")]
+use rustros_util::snap::{Bad, R, W};
 
 use crate::Link;
 use crate::iface::{PROTO_TCP, PROTO_UDP};
@@ -67,6 +69,116 @@ pub struct Sockets {
     /// TCP connection -> socket
     by_conn: BTreeMap<u64, usize>,
     epolls: Vec<Slot<(usize, EpollSet)>>,
+}
+
+// ---------------------------------------------------------------- state handover
+
+#[cfg(feature = "handover")]
+impl Sockets {
+    /// The socket table and the epoll instances, for the next version.
+    pub(crate) fn save(&self, w: &mut W) {
+        w.n(self.socks.len());
+        for s in &self.socks {
+            w.u32(s.generation);
+            let Some(e) = &s.it else {
+                w.u8(0);
+                continue;
+            };
+            w.u8(1);
+            w.n(e.owner);
+            w.u32(e.ty as u32);
+            w.u32(e.proto as u32);
+            w.u32(e.flags as u32);
+            match e.st {
+                St::Fresh => w.u8(0),
+                St::Listen(port) => {
+                    w.u8(1);
+                    w.u16(port);
+                }
+                St::Conn(h, hs) => {
+                    w.u8(2);
+                    w.u64(h.to_raw());
+                    w.u8(hs as u8);
+                }
+                St::Dead => w.u8(3),
+                St::Dgram(id) => {
+                    w.u8(4);
+                    w.u64(id.map_or(u64::MAX, u64::from));
+                }
+                St::Raw(id) => {
+                    w.u8(5);
+                    w.u32(id);
+                }
+            }
+            w.u32(e.local.0);
+            w.u16(e.local.1);
+            w.u64(e.seq);
+            w.u32(e.err.map_or(0, |e| e.0 as u32));
+            w.u8(e.shut_rd as u8 | (e.shut_wr as u8) << 1 | (e.broadcast as u8) << 2 | (e.linger0 as u8) << 3);
+            w.n(e.kept.len());
+            for (level, name, v) in &e.kept {
+                w.u32(*level as u32);
+                w.u32(*name as u32);
+                w.bytes(v);
+            }
+        }
+        w.n(self.by_conn.len());
+        for (&h, &i) in &self.by_conn {
+            w.u64(h);
+            w.n(i);
+        }
+        w.n(self.epolls.len());
+        for s in &self.epolls {
+            w.u32(s.generation);
+            match &s.it {
+                Some((owner, set)) => {
+                    w.u8(1);
+                    w.n(*owner);
+                    set.save(w);
+                }
+                None => w.u8(0),
+            }
+        }
+    }
+
+    pub(crate) fn load(r: &mut R) -> Result<Sockets, Bad> {
+        let socks = r.list(|r| {
+            let generation = r.u32()?;
+            if !r.bool()? {
+                return Ok(Slot { generation, it: None });
+            }
+            let (owner, ty, proto, flags) = (r.n()?, r.u32()? as i32, r.u32()? as i32, r.u32()? as i32);
+            let st = match r.u8()? {
+                0 => St::Fresh,
+                1 => St::Listen(r.u16()?),
+                2 => St::Conn(Handle::from_raw(r.u64()?), r.bool()?),
+                3 => St::Dead,
+                4 => St::Dgram(u32::try_from(r.u64()?).ok()),
+                5 => St::Raw(r.u32()?),
+                _ => return Err(Bad),
+            };
+            let local = (r.u32()?, r.u16()?);
+            let seq = r.u64()?;
+            let err = match r.u32()? as i32 {
+                0 => None,
+                e => Some(Errno(e)),
+            };
+            let f = r.u8()?;
+            let kept = r.list(|r| Ok((r.u32()? as i32, r.u32()? as i32, r.bytes()?)))?;
+            let e = Entry { owner, ty, proto, flags, st, local, seq, err, shut_rd: f & 1 != 0, shut_wr: f & 2 != 0, broadcast: f & 4 != 0, linger0: f & 8 != 0, kept };
+            Ok(Slot { generation, it: Some(e) })
+        })?;
+        let mut by_conn = BTreeMap::new();
+        for _ in 0..r.count()? {
+            by_conn.insert(r.u64()?, r.n()?);
+        }
+        let epolls = r.list(|r| {
+            let generation = r.u32()?;
+            let it = if r.bool()? { Some((r.n()?, EpollSet::load(r)?)) } else { None };
+            Ok(Slot { generation, it })
+        })?;
+        Ok(Sockets { socks, by_conn, epolls })
+    }
 }
 
 fn raw_of(idx: usize, generation: u32) -> u64 {

@@ -1,0 +1,16 @@
+[package]
+name = "storage-mod"
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "storage"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rustros-module = { path = "../support" }
+storage = { path = "../../storage" }

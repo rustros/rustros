@@ -12,3 +12,10 @@ bench = false
 rustros-api = { path = "../api" }
 rustros-util = { path = "../util" }
 tcpip = { path = "../tcpip" }
+
+[features]
+# the state handover to another version (hot replacement); the boot image's
+# bootstrap stack leaves it out (the full one replaces it at boot, before
+# anything holds state)
+default = ["handover"]
+handover = []

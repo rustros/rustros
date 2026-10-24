@@ -153,6 +153,10 @@ extern "C" fn isr_handler(f: &mut Frame) {
         0..=31 => {
             let cr2: u64;
             unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) }
+            // in an installed module's code: pinned on it, whoever called it
+            if let Some(name) = crate::loader::owner_of(f.rip) {
+                crate::modules::set_current_native(Some(name));
+            }
             crate::crash(format_args!(
                 "CPU exception {} err={:#x} rip={:#x} rsp={:#x} cr2={:#x} rax={:#x}",
                 f.vector, f.err, f.rip, f.rsp, cr2, f.rax

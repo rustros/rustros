@@ -11,6 +11,7 @@ mod drivers;
 mod modules;
 mod klog;
 mod perf;
+mod services;
 mod acpi;
 mod arch;
 mod boot;
@@ -117,6 +118,18 @@ pub fn crash(args: fmt::Arguments) -> ! {
     arch::reboot()
 }
 
+/// The storage service a crash is recorded with (again after it was replaced).
+pub fn set_crash_sink(k: &mut Kernel) {
+    // Safety: `k` lives on kmain's stack frame until reboot and never moves;
+    // the service lives until it is replaced, which calls this again.
+    unsafe { *CRASH_SINK.get() = k.boot.as_mut().map(|b| &mut **b as *mut dyn Storage) };
+}
+
+/// Where a disk's driver object is (it tells disks apart).
+fn disk_at(d: &Box<dyn BlockDevice>) -> usize {
+    &**d as *const dyn BlockDevice as *const u8 as usize
+}
+
 const CTRL_RIGHT_BRACKET: u8 = 0x1D;
 
 /// Power off through ACPI; without it, reboot. (Callers say so first.)
@@ -144,7 +157,7 @@ fn console_owner(k: &Kernel, slots: &[Slot], force_rescue: bool) -> Option<usize
 /// switched off at the next boot; that needs a disk write, done only when the
 /// disk is idle.
 pub fn watchdog_expired(samples: [u64; 8], rip: u64) -> ! {
-    match modules::current_native() {
+    match loader::owner_of(rip).or_else(modules::current_native) {
         Some(name) if !drivers::busy() => crash(format_args!("watchdog: main loop stuck in native app {}", name)),
         _ => {
             kprintln!("\n*** watchdog: main loop stuck for {} s (at {:#x}; also {:x?}), rebooting", arch::WATCHDOG_MS / 1000, rip, samples);
@@ -226,7 +239,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             for (name, img) in mods {
                 let name: &'static str = Box::leak(name.into_boxed_str());
                 let before = modules::set_current_native(Some(name));
-                let r = loader::load(&img);
+                let r = loader::load(&img, None);
                 modules::set_current_native(before);
                 match r {
                     Ok(mut m) => {
@@ -247,15 +260,17 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // the drivers take their devices: disks now, NICs once grubenv is readable
     let mut pci = Vec::new();
     virtio::pci::scan(|d| pci.push(d));
-    let mut disks = Vec::new();
+    let mut disks: Vec<Box<dyn BlockDevice>> = Vec::new();
+    // which disk is which: (where it is, what it is), to know the boot disk
+    let mut disk_devs = Vec::new();
     for d in pci.iter().filter(|d| d.class != 2) {
         if let Some((rustros_api::module::Device::Block(dev), driver)) = drivers::probe(&mut bm.drivers, *d, "") {
-            disks.push(drivers::Disk { dev, driver });
+            disks.push(Box::new(drivers::Disk { dev, driver }));
+            disk_devs.push((disk_at(disks.last().unwrap()), services::Dev { pci: *d, driver }));
         }
     }
-    let disks: Vec<Box<dyn BlockDevice>> = disks.into_iter().map(|d| Box::new(d) as Box<dyn BlockDevice>).collect();
     let mut boot = match bm.storage.take() {
-        Some(mut s) => match s.open(drivers::HW, &cmdline, disks, arch::rdtsc()) {
+        Some(mut s) => match s.open(drivers::HW, &cmdline, &mut disks, arch::rdtsc(), None) {
             Ok(()) => Some(s),
             Err(e) => {
                 kprintln!("disk: online update and storage disabled: {}", e);
@@ -267,6 +282,10 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             None
         }
     };
+    // the one the storage service took
+    let left: Vec<usize> = disks.iter().map(disk_at).collect();
+    let disk_dev = boot.as_ref().and_then(|_| disk_devs.into_iter().find(|d| !left.contains(&d.0))).map(|d| d.1);
+    drop(disks);
     if let Some(b) = boot.as_deref_mut() {
         // the console log so far
         klog::flush(b);
@@ -277,9 +296,11 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let offloads = cmdline_get(&cmdline, "offload").or_else(|| boot.as_ref().and_then(|b| b.env("net_offload"))) != Some("off");
     let options = if offloads { "" } else { "offload=off" };
     let mut nics: Vec<Box<dyn NetDevice>> = Vec::new();
+    let mut nic_dev = Vec::new();
     for d in pci.iter().filter(|d| d.class == 2) {
-        if let Some((rustros_api::module::Device::Net(n), _)) = drivers::probe(&mut bm.drivers, *d, options) {
+        if let Some((rustros_api::module::Device::Net(n), driver)) = drivers::probe(&mut bm.drivers, *d, options) {
             nics.push(n);
+            nic_dev.push(services::Dev { pci: *d, driver });
         }
     }
     if nics.is_empty() {
@@ -301,6 +322,8 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         kprintln!("{}", l);
     }
     let mut k = Kernel::new(nics, boot, cmdline, stack);
+    k.drivers = bm.drivers.drain(..).map(|d| (d, services::Provider::boot())).collect();
+    (k.nic_dev, k.disk_dev, k.nic_options) = (nic_dev, disk_dev, options);
     if let Err(e) = k.net_set_running(&conf) {
         kprintln!("net: {}; the interfaces start unconfigured", e);
         let _ = k.net_set_running(&rustros_api::NetConf::default());
@@ -319,10 +342,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     if k.unstable_boots > 1 {
         kprintln!("boot: {} unstable boots in a row", k.unstable_boots);
     }
-    if let Some(b) = k.boot.as_mut() {
-        // Safety: `k` lives on this stack frame until reboot and never moves.
-        unsafe { *CRASH_SINK.get() = Some(&mut **b as *mut dyn Storage) };
-    }
+    set_crash_sink(&mut k);
     let mut hw_watchdog = watchdog::Esb::probe();
     match &hw_watchdog {
         Some(_) => kprintln!("watchdog: i6300esb armed ({} s), software watchdog {} s", watchdog::TIMEOUT_S, arch::WATCHDOG_MS / 1000),
@@ -339,15 +359,19 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     k.manager = bm.manager.take();
     k.stack.set_owner_names(k.names.clone());
     kprintln!("modules: {} (boot modules)", k.names.join(", "));
-    for id in 0..slots.len() {
-        modules::call(&mut k, &mut slots, id, |app, ctx| app.start(ctx));
-    }
-    // installed modules (native modules, WebAssembly)
+    let boot_apps = slots.len();
+    // installed modules (native modules, WebAssembly): first those that
+    // replace services of the boot image (nothing holds state in them yet),
+    // then file system drivers, the runtime, the apps
     if k.safe_mode {
         kprintln!("boot: SAFE MODE: installed modules are not started; fix them (mod rm / mod switch) and reboot");
     } else {
         modules::boot(&mut k);
         modules::apply(&mut k, &mut slots);
+    }
+    k.booting = false;
+    for id in 0..boot_apps {
+        modules::call(&mut k, &mut slots, id, |app, ctx| app.start(ctx));
     }
     kprintln!();
 

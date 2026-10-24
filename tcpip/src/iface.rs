@@ -52,8 +52,8 @@ pub struct Iface {
     pub extra: Vec<Ip>,
     pub arp: Vec<ArpEntry>,
     /// IP packets waiting for an ARP reply: (next hop, packet, queued at)
-    pending: Vec<(Ip, Vec<u8>, u64)>,
-    ip_id: u16,
+    pub pending: Vec<(Ip, Vec<u8>, u64)>,
+    pub ip_id: u16,
     pub stats: Stats,
 }
 

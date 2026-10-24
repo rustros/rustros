@@ -108,6 +108,29 @@ impl EpollSet {
         !self.ready.is_empty()
     }
 
+    /// For the state handover (`snap`).
+    pub fn save(&self, w: &mut crate::snap::W) {
+        w.n(self.items.len());
+        for i in &self.items {
+            w.u64(i.obj);
+            w.u32(i.events);
+            w.u64(i.data);
+            w.u8(i.queued as u8 | (i.armed as u8) << 1);
+        }
+        w.n(self.ready.len());
+        for &o in &self.ready {
+            w.u64(o);
+        }
+    }
+
+    pub fn load(r: &mut crate::snap::R) -> Result<EpollSet, crate::snap::Bad> {
+        let items = r.list(|r| {
+            let (obj, events, data, f) = (r.u64()?, r.u32()?, r.u64()?, r.u8()?);
+            Ok(Item { obj, events, data, queued: f & 1 != 0, armed: f & 2 != 0 })
+        })?;
+        Ok(EpollSet { items, ready: r.list(|r| r.u64())?.into() })
+    }
+
     /// Ready entries into `out`, each with the object's readiness now
     /// (`ready_now`; None: the object is gone). Never waits.
     pub fn wait(&mut self, out: &mut [EpollEvent], mut ready_now: impl FnMut(u64) -> Option<u32>) -> usize {

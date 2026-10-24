@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use rustros_api::module::{Export, ModHost, ModManager, ModOp, RUNTIME, Storage};
+use rustros_api::module::{Export, ModHost, ModManager, ModOp, ROLE_FS, ROLE_SERVICE, RUNTIME, Storage};
 use rustros_api::{Caps, Module, ModuleInfo, ModuleKind};
 
 use crate::loader;
@@ -132,6 +132,19 @@ impl ModHost for Host<'_> {
             Err(String::from("unknown image format (expected a native module ELF or WebAssembly)"))
         }
     }
+    fn role(&self, image: &[u8]) -> Option<&'static str> {
+        if !image.starts_with(b"\x7fELF") {
+            return None;
+        }
+        let m = loader::load(image, None).ok()?;
+        if crate::services::is_service(&m) {
+            Some(ROLE_SERVICE)
+        } else if matches!(m.export, Some(Export::Filesystem(_))) {
+            Some(ROLE_FS)
+        } else {
+            None
+        }
+    }
     fn has_runtime(&self) -> bool {
         self.k.runtime_ref().is_some()
     }
@@ -139,7 +152,7 @@ impl ModHost for Host<'_> {
         self.k.builtin_names.contains(&name)
     }
     fn is_running(&self, name: &str) -> bool {
-        self.k.names.contains(&name)
+        self.k.names.contains(&name) || crate::services::provides(self.k, name)
     }
 }
 
@@ -153,7 +166,8 @@ pub fn manager<T>(k: &mut Kernel, f: impl FnOnce(&mut dyn ModManager, &mut dyn M
 
 /// The running installed modules, for `module_list`.
 pub fn running(k: &Kernel) -> Vec<ModuleInfo> {
-    k.app_status
+    let mut services = crate::services::running(k);
+    let mut apps: Vec<ModuleInfo> = k.app_status
         .iter()
         .map(|s| ModuleInfo {
             name: String::from(s.name),
@@ -167,7 +181,9 @@ pub fn running(k: &Kernel) -> Vec<ModuleInfo> {
             params: s.params.clone(),
             version: String::from(s.version),
         })
-        .collect()
+        .collect();
+    apps.append(&mut services);
+    apps
 }
 
 // ---------------------------------------------------------------- main loop side
@@ -208,7 +224,7 @@ fn apply_runtime(k: &mut Kernel, slots: &mut [Slot], start: bool) {
         let image = manager(k, |m, h| m.choose(h, RUNTIME)).flatten().map(|(_, image)| image);
         if let Some(image) = image {
             unsafe { *CURRENT_NATIVE.get() = Some(RUNTIME) };
-            let r = loader::load(&image);
+            let r = loader::load(&image, Some(RUNTIME));
             unsafe { *CURRENT_NATIVE.get() = None };
             match r {
                 Ok(m) if matches!(m.export, Some(Export::Runtime(_))) => {
@@ -250,6 +266,14 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
             apply_runtime(k, slots, matches!(op, ModOp::Start(_)));
             continue;
         }
+        // a module that replaced services: the boot image's come back
+        if matches!(op, ModOp::Stop(_)) && crate::services::provides(k, name) {
+            match crate::services::revert(k, name) {
+                Ok(()) => kprintln!("modules: {} stopped (the boot image's services are back)", name),
+                Err(e) => kprintln!("modules: {}: cannot go back to the boot image's services: {}", name, e),
+            }
+            continue;
+        }
         // a file system driver of that name goes (unmounting what it had)
         let was_fs = drop_filesystem(k, name);
         if was_fs && matches!(op, ModOp::Stop(_)) {
@@ -284,10 +308,16 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
             ModuleKind::Native => {
                 // a crash inside the module's init is pinned on it too
                 unsafe { *CURRENT_NATIVE.get() = Some(leaked) };
-                let r = loader::load(&image);
+                let r = loader::load(&image, Some(leaked));
                 unsafe { *CURRENT_NATIVE.get() = None };
                 match r {
                     Ok(m) if matches!(m.export, Some(Export::Module(_))) => Slot::Native(m),
+                    Ok(m) if crate::services::is_service(&m) => {
+                        if let Err(e) = crate::services::start(k, leaked, m) {
+                            kprintln!("modules: {}: {}", name, e);
+                        }
+                        continue;
+                    }
                     Ok(m) if matches!(m.export, Some(Export::Filesystem(_))) => {
                         add_filesystem(k, leaked, m, image.len());
                         continue;

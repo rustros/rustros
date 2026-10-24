@@ -51,6 +51,17 @@ impl DiskLog {
         Some(log)
     }
 
+    /// Carry on with this boot's log (`seq`, `total` bytes so far, the
+    /// partial sector `tail`) after the storage service was replaced.
+    pub fn resume(start: u64, sectors: u64, seq: u64, total: u64, tail: Vec<u8>) -> Option<DiskLog> {
+        (sectors >= SLOTS * SLOT_SECTORS && tail.len() < 512).then_some(DiskLog { base: start, seq, total, tail })
+    }
+
+    /// (boot number, bytes written, the partial sector): what `resume` takes.
+    pub fn position(&self) -> (u64, u64, &[u8]) {
+        (self.seq, self.total, &self.tail)
+    }
+
     /// Mask passwords that reached the logs on disk (written before they
     /// were masked at the console).
     fn scrub(&self, disk: &mut dyn BlockDevice) {

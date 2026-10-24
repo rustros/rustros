@@ -50,8 +50,9 @@ fn other(slot: char) -> char {
 }
 
 impl Updater {
-    /// Find the boot disk (the one holding our grubenv and running slot).
-    pub fn new<D: BlockDevice>(cmdline: &str, disks: Vec<D>) -> Result<(D, Updater), &'static str> {
+    /// Find the boot disk (the one holding our grubenv and running slot)
+    /// and take it out of `disks`.
+    pub fn new<D: BlockDevice>(cmdline: &str, disks: &mut Vec<D>) -> Result<(D, Updater), &'static str> {
         let slot = match arg(cmdline, "rustros.slot") {
             Some("a") => 'a',
             Some("b") => 'b',
@@ -64,7 +65,8 @@ impl Updater {
         };
         let env_lba: u64 = arg(cmdline, "rustros.env").and_then(|v| v.parse().ok()).ok_or("bad rustros.env")?;
         let cur = if slot == 'a' { a } else { b };
-        for mut disk in disks {
+        for i in 0..disks.len() {
+            let disk = &mut disks[i];
             let mut env = alloc::vec![0u8; 1024];
             let mut elf = alloc::vec![0u8; 512];
             if disk.read(env_lba, &mut env) && env.starts_with(ENV_MAGIC) && disk.read(cur, &mut elf) && elf.starts_with(b"\x7fELF") {
@@ -94,10 +96,15 @@ impl Updater {
                     written: 0,
                     active: false,
                 };
-                return Ok((disk, upd));
+                return Ok((disks.swap_remove(i), upd));
             }
         }
         Err("boot disk not found among virtio-blk devices")
+    }
+
+    /// A kernel image is being written (`begin` .. `commit`).
+    pub fn busy(&self) -> bool {
+        self.active
     }
 
     /// The running kernel's slot: (first sector, sectors).

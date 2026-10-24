@@ -51,8 +51,12 @@ impl Handle {
     pub fn to_raw(self) -> u64 {
         (self.idx as u64) << 32 | self.generation as u64
     }
+    pub fn from_raw(raw: u64) -> Handle {
+        Handle { idx: (raw >> 32) as usize, generation: raw as u32 }
+    }
 }
 
+/// The fields are public for the state handover (netstack).
 pub struct Sock {
     pub state: State,
     /// our address: replies come from it (and go out of its WAN)
@@ -60,22 +64,22 @@ pub struct Sock {
     pub lport: u16,
     pub rip: Ip,
     pub rport: u16,
-    snd_una: u32,
-    snd_nxt: u32,
+    pub snd_una: u32,
+    pub snd_nxt: u32,
     /// Highest sequence number ever sent (snd_nxt goes back on retransmit).
-    snd_max: u32,
-    snd_wnd: u32,
-    rcv_nxt: u32,
+    pub snd_max: u32,
+    pub snd_wnd: u32,
+    pub rcv_nxt: u32,
     /// Bytes starting at `snd_una`: sent-but-unacked, then unsent.
-    tx: Vec<u8>,
-    rx: Vec<u8>,
-    fin_queued: bool,
-    rto: u64,
-    rtx_at: u64,
-    retries: u32,
-    deadline: u64,
-    mss: usize,
-    accepted: bool,
+    pub tx: Vec<u8>,
+    pub rx: Vec<u8>,
+    pub fin_queued: bool,
+    pub rto: u64,
+    pub rtx_at: u64,
+    pub retries: u32,
+    pub deadline: u64,
+    pub mss: usize,
+    pub accepted: bool,
     /// Application that accepted this connection.
     pub owner: usize,
     /// The application has closed its handle; the connection may still be
@@ -83,9 +87,9 @@ pub struct Sock {
     pub released: bool,
 }
 
-struct Slot {
-    generation: u32,
-    sock: Option<Sock>,
+pub struct Slot {
+    pub generation: u32,
+    pub sock: Option<Sock>,
 }
 
 /// What happened to a connection (for the socket layer's notifications).
@@ -114,12 +118,13 @@ pub enum Event {
     Accept(u16),
 }
 
+/// The fields are public for the state handover (netstack).
 pub struct Tcp {
-    slots: Vec<Slot>,
-    listening: Vec<u16>,
-    max_conns: usize,
+    pub slots: Vec<Slot>,
+    pub listening: Vec<u16>,
+    pub max_conns: usize,
     /// What happened since the socket layer last looked (`take_events`).
-    events: Vec<Event>,
+    pub events: Vec<Event>,
 }
 
 /// Our MSS: what fits in one IP packet on the interface towards `rip`.

@@ -14,6 +14,7 @@ use devices::NetDevice;
 use rustros_api::module::{Disk, Export, Filesystem, Link, NetStack, Runtime, Storage};
 use rustros_api::socket::{Epoll, EpollEvent, SockAddr, SockResult, Socket};
 
+use crate::services::{self, Provider};
 use crate::{arch, console, kprintln, modules};
 
 /// Frames waiting to be put back on the packet path, at most.
@@ -86,8 +87,24 @@ pub struct Kernel {
     pub ifmap: Vec<IfMap>,
     pub boot: Option<Box<dyn Storage>>,
     pub cmdline: String,
-    /// The network stack (the boot module's).
+    /// The network stack.
     pub stack: Box<dyn NetStack>,
+    /// Where the services come from (the boot modules, or an installed
+    /// module that replaced them; services.rs).
+    pub stack_by: Provider,
+    pub boot_by: Provider,
+    pub manager_by: Provider,
+    pub drivers: Vec<(Box<dyn rustros_api::module::Driver>, Provider)>,
+    /// What each NIC is (its PCI function, its driver), and the boot disk.
+    pub nic_dev: Vec<services::Dev>,
+    pub disk_dev: Option<services::Dev>,
+    /// The NIC drivers' options ("offload=off").
+    pub nic_options: &'static str,
+    /// The boot image's services while installed ones replace them.
+    pub parked: services::Parked,
+    /// Booting: no app has run yet, so nothing holds state in the network
+    /// stack but its configuration.
+    pub booting: bool,
     /// Module names by id ("" for a free slot).
     pub names: Vec<&'static str>,
     /// Capabilities granted, by app id.
@@ -99,7 +116,7 @@ pub struct Kernel {
     pub filesystems: Vec<(&'static str, crate::loader::Module)>,
     /// the driver that has the files partition mounted
     pub files_fs: Option<usize>,
-    /// The installed modules' bookkeeping (the boot module's).
+    /// The installed modules' bookkeeping.
     pub manager: Option<Box<dyn rustros_api::module::ModManager>>,
     pub app_status: Vec<modules::ModuleStatus>,
     /// Boots in a row that did not run stable (from grubenv via GRUB).
@@ -124,6 +141,15 @@ impl Kernel {
             boot,
             cmdline,
             stack,
+            stack_by: Provider::boot(),
+            boot_by: Provider::boot(),
+            manager_by: Provider::boot(),
+            drivers: Vec::new(),
+            nic_dev: Vec::new(),
+            disk_dev: None,
+            nic_options: "",
+            parked: services::Parked::default(),
+            booting: true,
             names: Vec::new(),
             caps: Vec::new(),
             builtin_names: Vec::new(),

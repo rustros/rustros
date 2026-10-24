@@ -18,6 +18,7 @@ pub mod offload;
 pub mod pem;
 pub mod secret;
 pub mod sha256;
+pub mod snap;
 pub mod sock;
 pub mod sort;
 pub mod wire;

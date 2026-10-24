@@ -63,7 +63,8 @@ impl Write for Msg {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     let mut m = Msg { buf: [0; 512], len: 0 };
     let _ = write!(m, "panic: {info}");
-    (host().crash)(m.buf.as_ptr(), m.len)
+    // any address inside this module says whose crash it is
+    (host().crash)(m.buf.as_ptr(), m.len, panic as fn(&core::panic::PanicInfo) -> ! as usize)
 }
 
 /// Entry point body (see `export_module!`): checks the fingerprint, then builds

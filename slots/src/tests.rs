@@ -51,16 +51,16 @@ fn cmdline(slot: char, trial: bool) -> String {
 #[test]
 fn finds_the_boot_disk() {
     let other = Mem { data: vec![0; 300 * 512] };
-    let (_, u) = Updater::new(&cmdline('a', false), vec![other, disk("a")]).ok().unwrap();
+    let (_, u) = Updater::new(&cmdline('a', false), &mut vec![other, disk("a")]).ok().unwrap();
     assert_eq!(u.slot, 'a');
     assert!(!u.trial);
-    assert!(Updater::new(&cmdline('a', false), vec![Mem { data: vec![0; 300 * 512] }]).is_err());
-    assert!(Updater::new("ip=1.2.3.4", vec![disk("a")]).is_err());
+    assert!(Updater::new(&cmdline('a', false), &mut vec![Mem { data: vec![0; 300 * 512] }]).is_err());
+    assert!(Updater::new("ip=1.2.3.4", &mut vec![disk("a")]).is_err());
 }
 
 #[test]
 fn update_writes_the_other_slot_and_arms_a_trial() {
-    let (mut d, mut u) = Updater::new(&cmdline('a', false), vec![disk("a")]).ok().unwrap();
+    let (mut d, mut u) = Updater::new(&cmdline('a', false), &mut vec![disk("a")]).ok().unwrap();
     let image: Vec<u8> = (0..20_000u32).map(|i| (i * 7) as u8).collect();
     assert!(u.begin());
     for chunk in image.chunks(777) {
@@ -76,7 +76,7 @@ fn update_writes_the_other_slot_and_arms_a_trial() {
 
 #[test]
 fn image_larger_than_a_slot_is_refused() {
-    let (mut d, mut u) = Updater::new(&cmdline('a', false), vec![disk("a")]).ok().unwrap();
+    let (mut d, mut u) = Updater::new(&cmdline('a', false), &mut vec![disk("a")]).ok().unwrap();
     assert!(u.begin());
     assert!(!u.write(&mut d, &vec![1u8; SECS as usize * 512 + 1]));
     assert!(!u.commit(&mut d));
@@ -86,7 +86,7 @@ fn image_larger_than_a_slot_is_refused() {
 #[test]
 fn trial_boot_must_confirm_before_updating() {
     // GRUB booted slot b once (it cleared try_slot already)
-    let (mut d, mut u) = Updater::new(&cmdline('b', true), vec![disk("a")]).ok().unwrap();
+    let (mut d, mut u) = Updater::new(&cmdline('b', true), &mut vec![disk("a")]).ok().unwrap();
     assert!(u.trial);
     assert!(!u.begin(), "no update while the rollback copy is still needed");
     assert!(u.confirm(&mut d));
@@ -97,7 +97,7 @@ fn trial_boot_must_confirm_before_updating() {
 
 #[test]
 fn variables_survive_slot_changes() {
-    let (mut d, mut u) = Updater::new(&cmdline('a', false), vec![disk("a")]).ok().unwrap();
+    let (mut d, mut u) = Updater::new(&cmdline('a', false), &mut vec![disk("a")]).ok().unwrap();
     assert!(u.set_vars(&mut d, &[("net_ip", "10.0.0.2/24"), ("net_gw", "10.0.0.1")]));
     assert!(!u.set_vars(&mut d, &[("x", "two\nlines")]));
     assert!(u.begin());
@@ -106,7 +106,7 @@ fn variables_survive_slot_changes() {
     let env = env_text(&d);
     assert!(env.contains("net_ip=10.0.0.2/24\n") && env.contains("net_gw=10.0.0.1\n") && env.contains("try_slot=b\n"), "{env}");
     // what the next boot sees
-    let (mut d, mut u) = Updater::new(&cmdline('b', true), vec![d]).ok().unwrap();
+    let (mut d, mut u) = Updater::new(&cmdline('b', true), &mut vec![d]).ok().unwrap();
     assert_eq!(u.get("net_ip"), Some("10.0.0.2/24"));
     assert!(u.set_vars(&mut d, &[("net_gw", "")]));
     assert_eq!(u.get("net_gw"), None);

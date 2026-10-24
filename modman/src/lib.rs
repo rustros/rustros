@@ -6,7 +6,8 @@
 //! `native` (module ELF), `wasm`, `prefer` (which form to run),
 //! `native-off` (the native form crashed the system; set at boot from the
 //! crash record, so the module falls back to its WebAssembly form) and
-//! `role` (`fs`: a file system driver, started first). Its settings are
+//! `role` (`service`: it replaces services of the boot image, started
+//! before anything else; `fs`: a file system driver, started next). Its settings are
 //! `<name>/cfg/<key>`. Changes are queued and applied by the kernel's main
 //! loop between passes.
 #![cfg_attr(not(test), no_std)]
@@ -19,15 +20,17 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use rustros_api::module::{ModHost, ModManager, ModOp, RUNTIME};
+use rustros_api::module::{ModHost, ModManager, ModOp, ROLE_FS, ROLE_SERVICE, RUNTIME};
 use rustros_api::{ModuleInfo, ModuleKind};
+use rustros_util::snap::{Bad, R, W};
 
 const PREFIX: &str = "sys/app/";
 /// Old location of WebAssembly modules (before native modules existed).
 const LEGACY_WASM: &str = "sys/wasm/";
-/// The mark a file system driver gets once loaded (so it starts first later).
+/// What a module is besides an app (`ROLE_SERVICE`, `ROLE_FS`).
 const ROLE: &str = "role";
-const ROLE_FS: &[u8] = b"fs";
+/// The state handed to the next version (hot replacement).
+const TAG: &[u8; 4] = b"MODM";
 
 #[derive(Default)]
 pub struct Manager {
@@ -104,6 +107,12 @@ impl ModManager for Manager {
         put(h, &key(name, "prefer"), kind.as_str().as_bytes())?;
         if kind == ModuleKind::Native {
             delete(h, &key(name, "native-off"));
+            match h.role(image) {
+                Some(r) => put(h, &key(name, ROLE), r.as_bytes())?,
+                None => {
+                    delete(h, &key(name, ROLE));
+                }
+            }
         }
         self.ops.push_back(ModOp::Start(String::from(name)));
         Ok(kind)
@@ -224,14 +233,20 @@ impl ModManager for Manager {
                 }
             }
         }
-        let mut order: Vec<(bool, bool, String)> = Vec::new();
+        // what the image carries is installed first, so it starts in order too
+        install_bundled(self, h);
+        self.ops.clear();
+        let mut order: Vec<(u8, bool, String)> = Vec::new();
         for n in installed(h) {
-            let fs = get(h, &key(&n, ROLE)).as_deref() == Some(ROLE_FS);
-            order.push((!fs, n != RUNTIME, n));
+            let first = match get(h, &key(&n, ROLE)).as_deref() {
+                Some(r) if r == ROLE_SERVICE.as_bytes() => 0,
+                Some(r) if r == ROLE_FS.as_bytes() => 1,
+                _ => 2,
+            };
+            order.push((first, n != RUNTIME, n));
         }
         rustros_util::sort::sort(&mut order);
         self.ops.extend(order.into_iter().map(|(_, _, n)| ModOp::Start(n)));
-        install_bundled(self, h);
     }
 
     fn next_op(&mut self) -> Option<ModOp> {
@@ -260,9 +275,43 @@ impl ModManager for Manager {
     }
 
     fn is_filesystem(&mut self, h: &mut dyn ModHost, name: &str) {
-        if get(h, &key(name, ROLE)).as_deref() != Some(ROLE_FS) {
-            let _ = put(h, &key(name, ROLE), ROLE_FS);
+        if get(h, &key(name, ROLE)).as_deref() != Some(ROLE_FS.as_bytes()) {
+            let _ = put(h, &key(name, ROLE), ROLE_FS.as_bytes());
         }
+    }
+
+    fn state_version(&self) -> u32 {
+        1
+    }
+
+    /// Format 1: the queued operations (0: start, 1: stop; the name).
+    fn save_state(&self, version: u32) -> Option<Vec<u8>> {
+        if version != 1 {
+            return None;
+        }
+        let mut w = W::new(TAG, 1);
+        w.n(self.ops.len());
+        for op in &self.ops {
+            let (ModOp::Start(n) | ModOp::Stop(n)) = op;
+            w.u8(matches!(op, ModOp::Stop(_)) as u8);
+            w.bytes(n.as_bytes());
+        }
+        Some(w.0)
+    }
+
+    fn load_state(&mut self, state: &[u8]) -> Result<(), String> {
+        let (mut r, v) = R::new(state, TAG)?;
+        if v != 1 {
+            return Err(format!("state format {v}: this version reads 1"));
+        }
+        let ops = r.list(|r| {
+            let stop = r.bool()?;
+            let n = String::from_utf8(r.bytes()?).map_err(|_| Bad)?;
+            Ok(if stop { ModOp::Stop(n) } else { ModOp::Start(n) })
+        })?;
+        r.end()?;
+        self.ops = ops.into();
+        Ok(())
     }
 
     fn runtime_changed(&mut self, h: &mut dyn ModHost, mut restart: Vec<String>) {
@@ -327,5 +376,23 @@ fn install_bundled(m: &mut Manager, h: &mut dyn ModHost) {
             }
             Err(e) => h.log(&format!("modules: bundled {}: {}", name, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handover() {
+        let mut m = Manager::new();
+        m.ops.extend([ModOp::Start(String::from("netstack")), ModOp::Stop(String::from("echo"))]);
+        let state = m.save_state(1).unwrap();
+        let mut next = Manager::new();
+        assert!(next.load_state(&state[..state.len() - 1]).is_err());
+        next.load_state(&state).unwrap();
+        assert!(matches!(next.next_op(), Some(ModOp::Start(n)) if n == "netstack"));
+        assert!(matches!(next.next_op(), Some(ModOp::Stop(n)) if n == "echo"));
+        assert!(next.next_op().is_none());
     }
 }

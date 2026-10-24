@@ -9,6 +9,8 @@
 extern crate alloc;
 
 pub mod config;
+#[cfg(feature = "handover")]
+pub mod handover;
 pub mod socket;
 pub mod stack;
 

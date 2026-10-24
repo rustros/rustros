@@ -271,19 +271,19 @@ def pack(kernel: bytes, bundle: bytes = b"") -> bytes:
 
     # ELF64: header, program headers, a marker, the stub segment, then a
     # section header table with just the null entry (GRUB wants one); the
-    # bundle after that, 4 KiB aligned
+    # bundle after that, sector aligned (4 KiB aligned in memory)
     PH = 56
     nph = 3 if bundle else 2
     seg_off = 0x100
     shoff = (seg_off + len(stub) + 7) & ~7
     elf_end = shoff + 64
-    bundle_off = (elf_end + 0xFFF) & ~0xFFF
+    bundle_off = (elf_end + 511) & ~511
     ehdr = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
     ehdr += struct.pack("<HHIQQQIHHHHHH", 2, 0x3E, 1, start, 64, shoff, 0, 64, PH, nph, 64, 1, 0)
     ph = struct.pack("<IIQQQQQQ", 1, 6, seg_off, base, base, 0, end - base, 8)
     ph += struct.pack("<IIQQQQQQ", 1, 7, seg_off, stub_base, stub_base, len(stub), len(stub), 8)
     if bundle:
-        ph += struct.pack("<IIQQQQQQ", 1, 4, bundle_off, bundle_base, bundle_base, len(bundle), len(bundle), 4096)
+        ph += struct.pack("<IIQQQQQQ", 1, 4, bundle_off, bundle_base, bundle_base, len(bundle), len(bundle), 512)
     head = ehdr + ph + b"RUSTPACK"
     assert len(head) <= seg_off
     head += bytes(seg_off - len(head))
@@ -297,8 +297,8 @@ def pack(kernel: bytes, bundle: bytes = b"") -> bytes:
 
 # the kernel's field for the boot modules' address and length (kernel/src/bootmods.rs)
 BUNDLE_AT = b"RRSBNDL1@ADDRESS"
-BUNDLE_MAGIC = b"RRSBNDL1"
-BUNDLE_HEAD = 4096   # magic, count, then 80-byte entries: name (32), offset in sectors (4), stored bytes (4),
+BUNDLE_MAGIC = b"RRSBNDL2"
+BUNDLE_HEAD = 512    # magic, count, then 80-byte entries: name (32), offset in sectors (4), stored bytes (4),
                      # SHA-256 of the module (32), its bytes (4), flags (4: 1 = stored LZ4-compressed)
 BUNDLE_ENTRY = 80
 
@@ -319,6 +319,7 @@ def boot_bundle(specs):
         padded = packed + bytes(-len(packed) % 512)
         blobs.append(padded)
         at += len(padded) // 512
+    assert 16 + len(entries) * BUNDLE_ENTRY <= BUNDLE_HEAD, "too many boot modules"
     head = (BUNDLE_MAGIC + struct.pack("<II", len(entries), 0) + b"".join(entries)).ljust(BUNDLE_HEAD, b"\0")
     return head + b"".join(blobs)
 

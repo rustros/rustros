@@ -13,8 +13,9 @@ use rustros_api::Module;
 use rustros_api::module::{Driver, Export, ModManager, NetStack, Storage};
 use rustros_util::sha256::Sha256;
 
-const MAGIC: &[u8; 8] = b"RRSBNDL1";
-const HEAD: usize = 4096;
+const MAGIC: &[u8; 8] = b"RRSBNDL2";
+/// One sector: the header and up to 6 entries.
+const HEAD: usize = 512;
 const ENTRY: usize = 80;
 
 /// Where the boot modules are and how long: tools/pack.py writes it here.

@@ -5,22 +5,22 @@
 - 一张 raw 盘同时支持 **BIOS 和 UEFI** 启动（GRUB 2 + multiboot2）
 - 面向 KVM/VPS：**virtio-net**、**virtio-blk**，modern（1.0）和 legacy 设备都支持
 - **在线更新**：通过网络上传新内核写入备用槽，试启动一次，确认后才切换；不确认就自动回滚
-- **内核保持在 256 KiB 以内**：内核只做内存、中断、包转发路径和模块加载；设备驱动（virtio-blk、virtio-net）、协议栈、存储服务（分区、kvstore、A/B 槽、开机日志）、模块管理（安装、选择运行形式、开机顺序）、rescue、dhcp、updater 是随内核一起放在槽里的引导模块，文件系统驱动（ext4）、应用、WebAssembly 运行时都是可以在线安装和更新的模块
+- **内核保持在 256 KiB 以内**：内核只做内存、中断、包转发路径和模块加载；设备驱动（virtio-blk、virtio-net）、协议栈、存储服务（分区、kvstore、A/B 槽、开机日志）、模块管理（安装、选择运行形式、开机顺序）、rescue、dhcp、updater 是随内核一起放在槽里的引导模块，其中的服务都能在运行中换成安装的新版本（见“服务的热替换”）；文件系统驱动（ext4）、应用、WebAssembly 运行时都是可以在线安装和更新的模块
 - unsafe 只出现在 `kernel/`（以及 `wasmhost` 的一处）；其余 crate 和应用都是 `#![forbid(unsafe_code)]`
 
 ## 目录结构
 
 ```
-kernel/        HAL（启动、CPU、内存、控制台、PCI、virtio、看门狗）+ 组装和调度   ← 唯一含 unsafe 的地方
+kernel/        HAL（启动、CPU、内存、控制台、PCI、看门狗）+ 组装和调度、模块加载、服务替换（services.rs）   ← 唯一含 unsafe 的地方
 api/           rustros-api：应用接口 App/Sys、类型、错误码、WebAssembly ABI（无依赖）
 util/          rustros-util：给应用用的工具：Conn、地址和报文工具、SHA-256/HMAC
 devices/       设备接口：BlockDevice、NetDevice
-netstack/      协议栈（在引导模块里）：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发；网络配置：生效、候选、apply/确认/超时回滚，读取与保存（命令行/grubenv，util::netconf）
-tcpip/         协议栈里每个包都要经过的部分：IPv4 接口（以太网、ARP、IP、ICMP、路由）和 TCP，按 -O3 编译；netstack 的其余部分按 -Os 编译，让启动镜像放得进 256 KiB 的槽
+netstack/      协议栈：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发；网络配置：生效、候选、apply/确认/超时回滚，读取与保存（命令行/grubenv，util::netconf）；交给下一个版本的状态（handover.rs）。引导模块里是不带状态交接的引导版，完整的在 netstack 模块里
+tcpip/         协议栈里每个包都要经过的部分：IPv4 接口（以太网、ARP、IP、ICMP、路由）和 TCP，按 -O3 编译，netstack 的其余部分按 -Os；引导模块里的引导版全部按 -Os，让启动镜像放得进 256 KiB 的槽
 kvstore/       键值存储引擎（断电安全）
-storage/       存储服务（在引导模块里）：GPT 分区、kvstore、A/B 槽与 grubenv、开机日志、files 分区
-modman/        模块管理（在引导模块里）：已装模块的存放（sys/app/<名>/）、安装/删除/切换、选择原生或 WebAssembly 形式、开机顺序、崩溃后关掉原生形式、镜像自带模块；内核只负责加载和运行
-virtio/        virtio-pci 传输层、PCI 配置空间、virtio-blk 和 virtio-net 驱动（在引导模块里）
+storage/       存储服务（在引导模块里，可替换）：GPT 分区、kvstore、A/B 槽与 grubenv、开机日志、files 分区
+modman/        模块管理（在引导模块里，可替换）：已装模块的存放（sys/app/<名>/）、安装/删除/切换、选择原生或 WebAssembly 形式、模块的角色（服务、文件系统驱动）和开机顺序、崩溃后关掉原生形式、镜像自带模块；内核只负责加载和运行
+virtio/        virtio-pci 传输层、PCI 配置空间、virtio-blk 和 virtio-net 驱动（在引导模块里，可替换：设备复位后由新驱动接管）
 slots/         A/B 内核槽位 + grubenv（在线更新、试启动、回滚）
 wasmhost/      WebAssembly 运行时（wasmi），可选：`make WASM=0` 不带它
 apps/          原生应用：shell、echo、httpd、updater
@@ -33,7 +33,8 @@ tools/         mkimg.py 生成 raw 盘；pack.py 把内核打成自解压 ELF（
 ```
 应用 ──► api + util
 kernel ──► api / util / devices / virtio::pci
-引导模块 ──► virtio, storage, netstack, modman, rescue, dhcp, updater ──► api / util / devices
+引导模块 ──► virtio, storage, netstack（引导版）, modman, rescue, dhcp, updater ──► api / util / devices
+服务模块 ──► netstack、storage、modman、virtio（各自单独一个模块，替换启动镜像里的同类服务）
 ```
 
 除了 `kernel`，所有 crate 都是 `#![forbid(unsafe_code)]`，`wasmhost` 例外，它有一处 unsafe，用来在一次 guest 调用期间把 `Sys` 借给 host 函数。不碰硬件的服务（kvstore、slots、storage）都可以在宿主机上做单元测试：
@@ -146,12 +147,60 @@ tools/rustros-update.py HOST info     # 运行时长、槽位、地址、存储�
 
 流程如下：
 
-1. ESP 里有两个预分配、物理连续的槽位 `/boot/kernel-a.elf` 和 `/boot/kernel-b.elf`（镜像默认 2 MiB，每个槽 256 KiB；内核连同引导模块约 245 KiB）。内核从启动参数得知它们的扇区号，更新时直接写扇区，不改动 FAT。
+1. ESP 里有两个预分配、物理连续的槽位 `/boot/kernel-a.elf` 和 `/boot/kernel-b.elf`（镜像默认 2 MiB，每个槽 256 KiB；内核连同引导模块正好 256 KiB）。内核从启动参数得知它们的扇区号，更新时直接写扇区，不改动 FAT。
 2. 上传前先校验头部的 HMAC-SHA256（服务端每次连接下发随机 nonce，防止重放），通过后才写盘。整个镜像的 HMAC 校验通过后，才在 `grubenv` 里写 `try_slot`。
 3. GRUB 只会用 `try_slot` 启动一次，并且会先把它清掉。新内核必须在 5 分钟内确认（`confirm`），否则自动重启。如果新内核起不来，断电重启也会回到 `boot_slot`；加载失败时，GRUB 会走 fallback 菜单项。
 4. 试启动期间拒绝再次上传，避免覆盖用来回滚的旧内核。
 
 **无损扩容。** 槽不够大时，`rustros-update.py HOST esp-grow 8 1024` 把 ESP 在线扩到 8 MiB、槽扩到 1 MiB，数据分区不动：先在 ESP 后面的空闲启动区（64 MiB 以内）写好一份更大的新 ESP（GRUB、grub.cfg、grubenv、两个槽里的内核原样拷过去，只改 grub.cfg 里的扇区号），读回校验，再只改 GPT 里 ESP 那一项的位置，然后重启。切换之前断电，用的还是旧 ESP；切换之后断电，用的是已经校验过的新 ESP。分区编号和 GUID 不变，BIOS 和 UEFI 都照常找到它。
+
+## 服务的热替换
+
+启动镜像里的服务（驱动、存储、协议栈、模块管理）都可以在运行中换成新版本，不用重启。做法和安装应用一样：用 `module-install` 装一个导出同类服务的模块。
+
+```sh
+make modules
+tools/rustros-update.py HOST module-install netstack build/modules/netstack.mod   # 协议栈
+tools/rustros-update.py HOST module-install storage  build/modules/storage.mod    # 存储服务
+tools/rustros-update.py HOST module-install modman   build/modules/modman.mod     # 模块管理
+tools/rustros-update.py HOST module-install virtio   build/modules/virtio.mod     # virtio-blk、virtio-net 驱动
+tools/rustros-update.py HOST module-remove storage                                # 换回启动镜像里的版本
+```
+
+替换在两轮主循环之间进行，这时没有正在进行的调用：
+
+1. 加载新版本，检查接口指纹（`API_FINGERPRINT`）。
+2. 旧版本把状态写成两个版本都认识的格式，新版本接过去。每个版本声明自己能读的最新格式，并且能读所有更旧的格式。
+3. 调用方切到新版本，旧版本和它的代码随后卸载。
+4. 任何一步失败，旧版本照常运行，状态不丢。
+
+各服务交接的内容：
+
+| 服务 | 交接什么 | 说明 |
+|---|---|---|
+| 协议栈 | 全部状态：配置、ARP 缓存、socket、TCP 连接（序号、收发缓冲、定时器）、epoll 实例和就绪队列、UDP 和原始 socket 的队列 | 已有连接不断，应用手里的 socket 编号不变 |
+| 存储 | 启动盘本身，加上本次开机日志写到了哪里；其余都在盘上 | 正在写内核槽（在线更新）时拒绝替换，写完再装一次 |
+| 模块管理 | 还没执行的模块操作队列 | |
+| 驱动 | 不交接 | 设备先复位，再由新驱动重新接管，网络会断开片刻，TCP 自己重传。换掉启动盘的驱动时，存储服务先交出磁盘，再接着用新驱动 |
+
+**协议栈的引导版。** 启动镜像要放进 256 KiB 的槽，所以里面的协议栈是按体积编译、不带状态交接的引导版，只负责联网和拉取模块。
+
+- 镜像默认把完整的、按速度编译的 `netstack` 模块带在磁盘上（`DISK_MODULES=netstack`），第一次开机时安装。
+- 以后每次开机，它都在任何应用运行之前接替引导版。这时引导版里除了网络配置还没有别的状态，交接配置就够了。
+- 之后的协议栈更新都在运行中完成，带完整的状态交接。
+- 例外：运行中从引导版换成安装的协议栈，或者删掉安装的协议栈回到引导版，都要到下次开机才生效。
+
+**安全网：**
+
+- **崩溃按代码地址归属。** CPU 异常的地址、panic 的模块、卡死时的指令地址落在哪个安装的模块里，就记在它头上。下次开机关掉它，回到启动镜像里的版本。
+- **安全模式。** 连续三次不稳定启动后进入安全模式，不启动任何安装的模块，只用启动镜像里的服务。
+- **版本检查。** 内核更新以后，启动镜像里的服务可能比以前安装的新。版本更旧的服务模块不会被使用，用 `mod rm` 删掉即可。
+
+**测试：** `hot_test.py` 在 BIOS 下跑一遍，再在 UEFI 加 legacy virtio 设备下跑一遍：
+
+- 在 24 MB 的 HTTPS 下载和 16 MB 的 TCP 回环数据流进行中替换协议栈，两者都完整结束，空闲连接也还能用。
+- 在数据流进行中替换 virtio 驱动，数据流同样完整。
+- 存储和模块管理替换后再删掉，换回启动镜像里的版本。
 
 ## 写自己的应用
 
@@ -218,7 +267,11 @@ pub trait App {
    - 或者等它空闲（排空）后再替换。
 4. **热更新要有回归测试**：例如替换协议栈模块时已有 TCP 连接不断，替换兼容层时运行中的容器不受影响。
 
-现状：协议栈、网络配置、驱动、存储服务、模块管理已经移出内核，但它们在**引导模块**里，开机加载一次后不能替换，更新它们仍然需要重启。让它们能在运行中替换（替换机制加状态交接）是这条目标要补的工作。安装的模块（应用、ext4、WebAssembly 运行时）现在已经可以在线替换。
+现状：
+
+- 启动镜像里的服务（协议栈、存储、模块管理、驱动）已经可以在运行中替换，协议栈带完整的状态交接，见“服务的热替换”。
+- 安装的模块（应用、ext4、WebAssembly 运行时）本来就能在线替换，但它们是重启式的：应用丢掉自己的 socket，ext4 先卸载再由新驱动挂载，WebAssembly 实例在新运行时上重新启动。
+- 内核本身更新仍然需要重启。
 
 **启动镜像保持最小、不变**：原始启动镜像（256 KiB 的内核槽）不扩容，只保留启动、联网、拉取模块和救援所需的部分。其他组件，包括将来兼容 Linux 的完整版本（兼容层、VFS、容器运行时等），一律作为模块缓存在磁盘上、开机从磁盘加载、通过网络更新，或随离线安装包写到磁盘上。
 

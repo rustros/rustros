@@ -30,10 +30,22 @@ pub struct HostTable {
     pub dealloc: extern "C" fn(ptr: *mut u8, size: usize, align: usize),
     pub realloc: extern "C" fn(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8,
     /// Fatal error in the module (its panic handler): record and reboot.
-    pub crash: extern "C" fn(msg: *const u8, len: usize) -> !,
+    /// `at` is an address inside the module, so the crash is pinned on it.
+    pub crash: extern "C" fn(msg: *const u8, len: usize, at: usize) -> !,
 }
 
 /// What a module provides.
+///
+/// The services (`Driver`, `Storage`, `NetStack`, `Manager`) come with the
+/// kernel in the boot modules' binary, and each can be replaced while the
+/// system runs by an installed module exporting the same kind of service
+/// (hot replacement). Between two main-loop passes no call is in flight; the
+/// kernel then moves the old version's state to the new one: the old one
+/// writes it in a format both read (each says the newest it reads,
+/// `state_version`; every version reads all older formats), the new one
+/// takes it over. If that fails the old one stays, with its state intact.
+/// Drivers hand nothing over: their devices are reset and the new driver
+/// takes them again (the link drops for a moment).
 pub enum Export {
     Module(Box<dyn Module>),
     /// Runs applications in another format (the WebAssembly runtime).
@@ -127,7 +139,7 @@ pub struct PciAddr {
 
 /// Where a device's interrupt status register is: reading it acknowledges
 /// a legacy interrupt.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IrqAck {
     Mmio(usize),
     Port(u16),
@@ -153,9 +165,15 @@ pub trait Hw: Sync {
 
 /// A device driver. Drivers come with the kernel (boot modules) and are
 /// offered the PCI functions at boot: disks first (before the storage
-/// service opens), NICs after it (their settings may be in grubenv).
+/// service opens), NICs after it (their settings may be in grubenv). A
+/// driver of the same name replacing it while the system runs is offered
+/// the same devices again, after they were reset.
 pub trait Driver {
     fn name(&self) -> &'static str;
+    /// The release this version is from (see `BUILD`).
+    fn version(&self) -> &'static str {
+        crate::BUILD
+    }
     /// Drive `dev` if it is this driver's kind of device. `options`: settings
     /// as on the command line ("offload=off").
     fn probe(&mut self, hw: &'static dyn Hw, dev: PciAddr, options: &str) -> Option<Device>;
@@ -165,9 +183,24 @@ pub trait Driver {
 /// key-value store, the console log kept on disk, the files partition. A
 /// boot module provides it; the kernel calls it for the system calls.
 pub trait Storage {
-    /// Take the boot disk among `disks` (the one with the slots the command
-    /// line names) and open what is on it (progress to `hw.log`).
-    fn open(&mut self, hw: &'static dyn Hw, cmdline: &str, disks: Vec<Box<dyn Disk>>, seed: u64) -> Result<(), String>;
+    /// The release this version is from (see `BUILD`).
+    fn version(&self) -> &'static str {
+        crate::BUILD
+    }
+    /// Take the boot disk out of `disks` (the one with the slots the command
+    /// line names) and open what is on it (progress to `hw.log`). `state`:
+    /// carry on from another version's (hot replacement) instead of
+    /// starting this boot's log. On failure `disks` is left as it was.
+    fn open(&mut self, hw: &'static dyn Hw, cmdline: &str, disks: &mut Vec<Box<dyn Disk>>, seed: u64, state: Option<&[u8]>) -> Result<(), String>;
+    /// The newest state format this version reads (0: none).
+    fn state_version(&self) -> u32;
+    /// Something that must not be cut short is going on (a kernel image
+    /// being written to a slot): a replacement waits for it.
+    fn busy(&self) -> bool;
+    /// Let go of the boot disk for a replacement: it goes into `disks`, the
+    /// state (format `version`) is returned. None (this version cannot
+    /// write that format): nothing changed.
+    fn hand_over(&mut self, version: u32, disks: &mut Vec<Box<dyn Disk>>) -> Option<Vec<u8>>;
 
     /// The slot running ('a' or 'b'), and whether this is its trial boot.
     fn slot(&self) -> (char, bool);
@@ -336,6 +369,10 @@ pub trait Link {
 /// The kernel feeds it the frames for us and sends what it sends; a boot
 /// module provides it.
 pub trait NetStack {
+    /// The release this version is from (see `BUILD`).
+    fn version(&self) -> &'static str {
+        crate::BUILD
+    }
     /// One received frame (plain: no offloads pending) from interface `nic`.
     fn input(&mut self, link: &mut dyn Link, nic: usize, frame: &[u8]);
     /// Timers, retransmissions, packets to ourselves. Returns a line for the
@@ -394,6 +431,15 @@ pub trait NetStack {
     /// Route and send a finished IPv4 packet (its source left alone).
     fn send_packet(&mut self, link: &mut dyn Link, packet: &[u8]) -> bool;
 
+    /// The newest state format this version reads (0: none).
+    fn state_version(&self) -> u32;
+    /// Everything (configuration, interfaces with their ARP caches, sockets
+    /// with their TCP connections, buffers and timers, epoll instances) in
+    /// format `version`; None if this version cannot write it.
+    fn save_state(&self, version: u32) -> Option<Vec<u8>>;
+    /// Take over another version's state, before any other call.
+    fn load_state(&mut self, state: &[u8]) -> Result<(), String>;
+
     // Sockets with Linux semantics (crate::socket), by owner. Every change
     // of a socket's readiness is reported through `Link::notify`.
     fn socket(&mut self, owner: usize, domain: i32, ty: i32, protocol: i32) -> SockResult<Socket>;
@@ -426,6 +472,9 @@ use crate::sys::{ModuleInfo, ModuleKind};
 
 /// The WebAssembly runtime is the native module installed under this name.
 pub const RUNTIME: &str = "wasm";
+/// Module roles (`ModHost::role`).
+pub const ROLE_SERVICE: &str = "service";
+pub const ROLE_FS: &str = "fs";
 
 /// What the module manager asks the kernel to do with a module.
 pub enum ModOp {
@@ -444,6 +493,10 @@ pub trait ModHost {
     /// What `image` is, if the system can run it: a native module, or a
     /// format the runtime takes (checked by it).
     fn check(&self, image: &[u8]) -> Result<ModuleKind, String>;
+    /// What a native module is besides an app (it is loaded to see):
+    /// `ROLE_SERVICE` (it replaces services: started before anything else)
+    /// or `ROLE_FS` (a file system driver: started next).
+    fn role(&self, image: &[u8]) -> Option<&'static str>;
     fn has_runtime(&self) -> bool;
     fn is_builtin(&self, name: &str) -> bool;
     fn is_running(&self, name: &str) -> bool;
@@ -453,6 +506,10 @@ pub trait ModHost {
 /// at boot. The kernel runs them (loading, the app table, crash attribution)
 /// and applies the operations queued here between main loop passes.
 pub trait ModManager {
+    /// The release this version is from (see `BUILD`).
+    fn version(&self) -> &'static str {
+        crate::BUILD
+    }
     fn install(&mut self, host: &mut dyn ModHost, name: &str, image: &[u8]) -> Result<ModuleKind, String>;
     /// Both forms (`kind` None) or one.
     fn remove(&mut self, host: &mut dyn ModHost, name: &str, kind: Option<ModuleKind>) -> bool;
@@ -474,4 +531,9 @@ pub trait ModManager {
     /// The runtime changed: `stopped` (its instances) and every installed
     /// module not running get another chance.
     fn runtime_changed(&mut self, host: &mut dyn ModHost, stopped: Vec<String>);
+    /// The newest state format this version reads (0: none).
+    fn state_version(&self) -> u32;
+    /// The queued operations, in format `version`.
+    fn save_state(&self, version: u32) -> Option<Vec<u8>>;
+    fn load_state(&mut self, state: &[u8]) -> Result<(), String>;
 }

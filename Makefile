@@ -19,8 +19,11 @@ CMDLINE ?=
 # Modules built into the kernel (everything else is a loadable module, see modules/):
 # apps built into the kernel itself (none: rescue, dhcp and the updater are the boot module)
 APPS ?=
-# one binary with rescue, dhcp and the updater (modules/boot)
+# one binary with the boot image's services and rescue, dhcp and the updater (modules/boot)
 BOOT_MODULES := boot
+# modules the image carries on its disk, installed at the first boot (the
+# full-speed network stack replaces the boot image's bootstrap one at boot)
+DISK_MODULES ?= netstack
 # The online update key is generated once and kept here:
 KEY_FILE ?= build/update.key
 
@@ -37,7 +40,7 @@ QEMU := qemu-system-x86_64 -m 256 -serial stdio \
 	-drive file=$(IMG),format=raw,if=virtio \
 	-nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:9000-:9000,hostfwd=tcp:127.0.0.1:7777-:7
 
-.PHONY: all kernel bootmods $(PACKED) wasm modules run-bios run-uefi update clean
+.PHONY: all kernel bootmods disk-modules $(PACKED) wasm modules run-bios run-uefi update clean
 all: $(IMG)
 
 kernel:
@@ -47,8 +50,8 @@ $(PACKED): kernel bootmods tools/pack.py
 	@mkdir -p build
 	python3 tools/pack.py $(KERNEL) $@ $(foreach m,$(BOOT_MODULES),--boot=$(m)=build/modules/$(m).mod)
 
-$(IMG): $(PACKED) tools/mkimg.py
-	python3 tools/mkimg.py $(PACKED) $@ $(if $(IP),--ip $(IP)) $(if $(GW),--gw $(GW)) --key-file $(KEY_FILE) $(if $(MTU),--mtu $(MTU)) $(if $(KEY),--key $(KEY)) $(if $(SIZE_MB),--size-mb $(SIZE_MB)) $(if $(CMDLINE),--cmdline "$(CMDLINE)")
+$(IMG): $(PACKED) tools/mkimg.py disk-modules
+	python3 tools/mkimg.py $(PACKED) $@ $(foreach m,$(DISK_MODULES),--bundle $(m)=build/modules/$(m).mod) $(if $(IP),--ip $(IP)) $(if $(GW),--gw $(GW)) --key-file $(KEY_FILE) $(if $(MTU),--mtu $(MTU)) $(if $(KEY),--key $(KEY)) $(if $(SIZE_MB),--size-mb $(SIZE_MB)) $(if $(CMDLINE),--cmdline "$(CMDLINE)")
 
 wasm:
 	cd wasm && cargo build --release
@@ -57,15 +60,20 @@ wasm:
 
 # the boot modules, built with the kernel (same API)
 bootmods:
-	cd modules && cargo build --release $(foreach m,$(BOOT_MODULES),-p $(m)-mod)
+	cd modules && cargo build --profile boot $(foreach m,$(BOOT_MODULES),-p $(m)-mod)
 	@mkdir -p build/modules
-	@for m in $(BOOT_MODULES); do cp modules/target/x86_64-unknown-none/release/$$m build/modules/$$m.mod; done
+	@for m in $(BOOT_MODULES); do cp modules/target/x86_64-unknown-none/boot/$$m build/modules/$$m.mod; done
+
+disk-modules:
+	$(if $(DISK_MODULES),cd modules && cargo build --release $(foreach m,$(DISK_MODULES),-p $(m)-mod))
+	@mkdir -p build/modules
+	@for m in $(DISK_MODULES); do cp modules/target/x86_64-unknown-none/release/$$m build/modules/$$m.mod; done
 
 modules:
 	cd modules && cargo build --release
 	@mkdir -p build/modules
 	@for f in modules/target/x86_64-unknown-none/release/*; do \
-		[ -f "$$f" ] && [ -x "$$f" ] && cp "$$f" build/modules/$$(basename $$f).mod; done; ls build/modules
+		[ -f "$$f" ] && [ -x "$$f" ] && [ "$$(basename $$f)" != boot ] && cp "$$f" build/modules/$$(basename $$f).mod; done; ls build/modules
 
 run-bios: $(IMG)
 	$(QEMU)

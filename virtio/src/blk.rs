@@ -46,6 +46,15 @@ struct Req {
     status: u8,
 }
 
+impl Drop for VirtioBlk {
+    fn drop(&mut self) {
+        // the device lets go of the bounce buffer first
+        self.dev.reset();
+        // Safety: allocated in `new` with this layout
+        unsafe { alloc::alloc::dealloc(self.bounce, core::alloc::Layout::from_size_align_unchecked(self.max_len, 4096)) };
+    }
+}
+
 pub fn is_blk(d: &PciDev) -> bool {
     d.vendor == 0x1AF4 && (d.device == 0x1001 || d.device == 0x1042)
 }

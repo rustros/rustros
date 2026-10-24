@@ -34,6 +34,10 @@ impl Hw for KernelHw {
         }
         // Safety: boot time, single core, before the line is unmasked.
         let r = unsafe { ISRS.get() };
+        // a device taken again by a new driver (hot replacement): known already
+        if r.0[..r.1].iter().any(|&(l, a)| l == line && a == ack) {
+            return true;
+        }
         if r.1 == MAX_ISRS {
             return false;
         }

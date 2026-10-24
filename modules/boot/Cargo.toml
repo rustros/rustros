@@ -18,5 +18,5 @@ dhcp = { path = "../../apps/dhcp" }
 updater = { path = "../../apps/updater" }
 virtio = { path = "../../virtio" }
 storage = { path = "../../storage" }
-netstack = { path = "../../netstack" }
+netstack = { path = "../../netstack", default-features = false }
 modman = { path = "../../modman" }

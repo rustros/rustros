@@ -17,12 +17,12 @@ pub struct Config {
     /// The NICs' MACs (interface `i < macs.len()` is NIC `i`).
     pub macs: Vec<[u8; 6]>,
     /// What each interface is: (NIC, VLAN).
-    links: Vec<(u8, Option<u16>)>,
-    candidate: Option<NetConf>,
+    pub(crate) links: Vec<(u8, Option<u16>)>,
+    pub(crate) candidate: Option<NetConf>,
     /// What ran before the first apply (the revert point).
-    baseline: Option<NetConf>,
+    pub(crate) baseline: Option<NetConf>,
     /// When an applied candidate is reverted unless confirmed.
-    deadline: Option<u64>,
+    pub(crate) deadline: Option<u64>,
 }
 
 impl Stack {

@@ -13,6 +13,7 @@ use devices::BlockDevice;
 use kvstore::Store;
 use rustros_api::module::{Disk, Hw, Storage};
 use rustros_api::sys::{KvError, StorageInfo};
+use rustros_util::snap::{R, W};
 
 use crate::gpt::Gpt;
 use crate::log::{DiskLog, SLOTS};
@@ -80,9 +81,34 @@ impl Service {
     }
 }
 
+/// The state handed to the next version (hot replacement).
+const TAG: &[u8; 4] = b"STOR";
+
+/// Where this boot's log is (None: it is not kept).
+fn resume_state(s: &[u8]) -> Result<Option<(u64, u64, Vec<u8>)>, String> {
+    let (mut r, v) = R::new(s, TAG)?;
+    if v != 1 {
+        return Err(format!("state format {v}: this version reads 1"));
+    }
+    let log = if r.bool()? { Some((r.u64()?, r.u64()?, r.bytes()?)) } else { None };
+    r.end()?;
+    Ok(log)
+}
+
 impl Storage for Service {
-    fn open(&mut self, hw: &'static dyn Hw, cmdline: &str, disks: Vec<Box<dyn Disk>>, seed: u64) -> Result<(), String> {
-        let log = |s: String| hw.log(&s);
+    fn open(&mut self, hw: &'static dyn Hw, cmdline: &str, disks: &mut Vec<Box<dyn Disk>>, seed: u64, state: Option<&[u8]>) -> Result<(), String> {
+        // carrying on after a replacement: this boot's log goes on, the
+        // boot messages are not repeated
+        let resume = match state {
+            Some(s) => Some(resume_state(s)?),
+            None => None,
+        };
+        let quiet = resume.is_some();
+        let log = |s: String| {
+            if !quiet {
+                hw.log(&s)
+            }
+        };
         let (mut disk, upd) = slots::Updater::new(cmdline, disks)?;
         log(format!("disk: running slot {}{}", upd.slot, if upd.trial { " (trial boot)" } else { "" }));
         if let Some(p) = upd.get("last_panic") {
@@ -104,12 +130,17 @@ impl Storage for Service {
                 Some((store, part))
             }
             Err(e) => {
-                log(format!("storage: unavailable: {}", e));
+                hw.log(&format!("storage: unavailable: {}", e));
                 None
             }
         };
         // the console log goes to the start of the cache partition
-        let dl = store.as_ref().and_then(|(_, part)| part.cache).and_then(|(start, n)| DiskLog::open(&mut *disk, start, n));
+        let cache = store.as_ref().and_then(|(_, part)| part.cache);
+        let dl = match resume {
+            Some(Some((seq, total, tail))) => cache.and_then(|(start, n)| DiskLog::resume(start, n, seq, total, tail)),
+            Some(None) => None,
+            None => cache.and_then(|(start, n)| DiskLog::open(&mut *disk, start, n)),
+        };
         match &dl {
             Some(l) => log(format!("log: this is boot {}; the last {} boots' console logs are kept", l.seq, SLOTS)),
             None => log("log: no cache partition, the console log is not kept".to_string()),
@@ -121,6 +152,32 @@ impl Storage for Service {
         }
         self.b = Some(Open { disk, upd, store, log: dl, files });
         Ok(())
+    }
+
+    fn state_version(&self) -> u32 {
+        1
+    }
+    fn busy(&self) -> bool {
+        self.b.as_ref().is_some_and(|b| b.upd.busy())
+    }
+    /// Format 1: whether this boot's log is kept, and where it is (boot
+    /// number, bytes written, the partial sector). Everything else is on
+    /// the disk.
+    fn hand_over(&mut self, version: u32, disks: &mut Vec<Box<dyn Disk>>) -> Option<Vec<u8>> {
+        if version != 1 || self.busy() {
+            return None;
+        }
+        let b = self.b.take()?;
+        let mut w = W::new(TAG, 1);
+        w.u8(b.log.is_some() as u8);
+        if let Some(l) = &b.log {
+            let (seq, total, tail) = l.position();
+            w.u64(seq);
+            w.u64(total);
+            w.bytes(tail);
+        }
+        disks.push(b.disk);
+        Some(w.0)
     }
 
     fn slot(&self) -> (char, bool) {

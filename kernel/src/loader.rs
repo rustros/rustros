@@ -10,6 +10,9 @@
 use alloc::alloc::{Layout, alloc_zeroed, dealloc, realloc};
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
+
+use crate::Global;
 
 use rustros_api::API_FINGERPRINT;
 use rustros_api::module::{Export, HostTable};
@@ -113,11 +116,25 @@ impl Drop for Module {
     fn drop(&mut self) {
         // the export's destructors are code inside the module
         drop(self.export.take());
+        // Safety: single core, main loop only
+        unsafe { LOADED.get() }.retain(|m| m.0 != self.base as usize);
         unsafe { dealloc(self.base, self.layout) };
     }
 }
 
-pub fn load(img: &[u8]) -> Result<Module, String> {
+/// Installed modules in memory: (start, end, name).
+static LOADED: Global<Vec<(usize, usize, &'static str)>> = Global::new(Vec::new());
+
+/// The installed module whose image holds address `at` (a crash there is
+/// pinned on it, whoever called it).
+pub fn owner_of(at: u64) -> Option<&'static str> {
+    // Safety: single core; the crash path only reads it
+    unsafe { LOADED.get() }.iter().find(|m| (m.0..m.1).contains(&(at as usize))).map(|m| m.2)
+}
+
+/// Load a module; `name`: an installed module's (its crashes are pinned on
+/// it by address), None for the boot modules' binary.
+pub fn load(img: &[u8], name: Option<&'static str>) -> Result<Module, String> {
     let l = parse(img)?;
     let layout = Layout::from_size_align(l.span, 4096).map_err(|_| String::from("bad module size"))?;
     let base = unsafe { alloc_zeroed(layout) };
@@ -167,6 +184,11 @@ pub fn load(img: &[u8]) -> Result<Module, String> {
             r += relaent;
         }
     }
+    // a crash in its init is pinned on it too
+    if let Some(name) = name {
+        // Safety: single core, main loop only
+        unsafe { LOADED.get() }.push((base as usize, base as usize + l.span, name));
+    }
     type Init = extern "C" fn(*const HostTable, *mut Option<Export>) -> u64;
     // Safety: the entry point is inside the image (parse()); its signature is
     // the module ABI, and both sides only use C types until the fingerprints
@@ -174,6 +196,8 @@ pub fn load(img: &[u8]) -> Result<Module, String> {
     let init: Init = unsafe { core::mem::transmute(base.add(l.entry)) };
     let mut out: Option<Export> = None;
     let fp = init(&HOST, &mut out);
+    // Safety: as above (registered for good below, once it is loaded)
+    unsafe { LOADED.get() }.retain(|m| m.0 != base as usize);
     if fp != API_FINGERPRINT {
         // the module did not touch `out`
         core::mem::forget(out);
@@ -184,6 +208,10 @@ pub fn load(img: &[u8]) -> Result<Module, String> {
     m.export = out;
     if m.export.is_none() {
         return Err(String::from("module exported nothing"));
+    }
+    if let Some(name) = name {
+        // Safety: single core, main loop only
+        unsafe { LOADED.get() }.push((base as usize, base as usize + l.span, name));
     }
     Ok(m)
 }
@@ -208,9 +236,12 @@ extern "C" fn host_realloc(ptr: *mut u8, size: usize, align: usize, new_size: us
     }
 }
 
-extern "C" fn host_crash(msg: *const u8, len: usize) -> ! {
+extern "C" fn host_crash(msg: *const u8, len: usize, at: usize) -> ! {
     // Safety: the module passes a buffer of its own; we only read it.
     let m = unsafe { core::slice::from_raw_parts(msg, len.min(4096)) };
+    if let Some(name) = owner_of(at as u64) {
+        crate::modules::set_current_native(Some(name));
+    }
     crate::crash(format_args!("{}", core::str::from_utf8(m).unwrap_or("module crash")))
 }
 

@@ -107,6 +107,14 @@ pub struct Virtio {
     msix_refused: core::cell::Cell<bool>,
 }
 
+/// A device's driver goes: the device stops before its queues are freed
+/// (`dev` is the drivers' first field, so it is dropped first).
+impl Drop for Virtio {
+    fn drop(&mut self) {
+        self.reset();
+    }
+}
+
 unsafe fn rd<T>(a: usize) -> T {
     unsafe { read_volatile(a as *const T) }
 }
@@ -298,6 +306,15 @@ impl Virtio {
         }
     }
 
+    /// Stop the device: it lets go of every buffer it was given (before
+    /// they are freed: a driver being dropped, or replaced).
+    pub fn reset(&self) {
+        self.set_status(0);
+        // a modern device reads back 0 once it is done
+        let t = self.hw.now_ms();
+        while self.status() != 0 && self.hw.now_ms() - t < 100 {}
+    }
+
     fn negotiate(&self, wanted: u64) -> Option<u64> {
         self.set_status(0);
         while self.status() != 0 {}
@@ -440,7 +457,7 @@ impl Virtio {
                 }
             };
             wr::<u16>(avail, 1); // VIRTQ_AVAIL_F_NO_INTERRUPT
-            Some(Queue { idx, size, desc, avail, used, notify, avail_idx: 0, last_used: 0 })
+            Some(Queue { bytes: total, idx, size, desc, avail, used, notify, avail_idx: 0, last_used: 0 })
         }
     }
 }
@@ -455,6 +472,8 @@ pub const D_WRITE: u16 = 2;
 
 /// A split virtqueue. Drivers manage descriptor ids themselves.
 pub struct Queue {
+    /// its memory: `desc`, `bytes` long
+    bytes: usize,
     idx: u16,
     pub size: u16,
     desc: usize,
@@ -463,6 +482,14 @@ pub struct Queue {
     notify: Notify,
     avail_idx: u16,
     last_used: u16,
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        // Safety: allocated in `Virtio::queue` with this layout; the device
+        // was reset first (its driver's `dev` is dropped before its queues)
+        unsafe { alloc::alloc::dealloc(self.desc as *mut u8, Layout::from_size_align_unchecked(self.bytes, 4096)) };
+    }
 }
 
 impl Queue {

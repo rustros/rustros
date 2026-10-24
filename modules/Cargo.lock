@@ -580,6 +580,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "modman-mod"
+version = "0.1.0"
+dependencies = [
+ "modman",
+ "rustros-module",
+]
+
+[[package]]
 name = "nat"
 version = "0.1.0"
 dependencies = [
@@ -610,6 +618,14 @@ dependencies = [
  "rustros-api",
  "rustros-util",
  "tcpip",
+]
+
+[[package]]
+name = "netstack-mod"
+version = "0.1.0"
+dependencies = [
+ "netstack",
+ "rustros-module",
 ]
 
 [[package]]
@@ -1087,6 +1103,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "storage-mod"
+version = "0.1.0"
+dependencies = [
+ "rustros-module",
+ "storage",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1183,6 +1207,14 @@ dependencies = [
  "devices",
  "rustros-api",
  "rustros-util",
+]
+
+[[package]]
+name = "virtio-mod"
+version = "0.1.0"
+dependencies = [
+ "rustros-module",
+ "virtio",
 ]
 
 [[package]]
