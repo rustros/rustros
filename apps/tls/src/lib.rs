@@ -56,9 +56,6 @@ enum Side {
     Server(UnbufferedServerConnection),
 }
 
-/// The client of earlier days: `Tls::client` under its old name.
-pub type TlsClient = Tls;
-
 /// A server's certificate chain and key (PEM), ready for connections.
 pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>, String> {
     let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<_, _>>().map_err(|e| format!("certificate: {e:?}"))?;
@@ -119,10 +116,6 @@ impl rustls::server::ResolvesServerCert for BySni {
 
 impl Tls {
     /// Start a handshake with `host` (the name the certificate must carry).
-    pub fn new(host: &str) -> Result<Tls, String> {
-        Tls::client(host)
-    }
-
     pub fn client(host: &str) -> Result<Tls, String> {
         Tls::client_trusting(host, "")
     }

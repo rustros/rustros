@@ -229,9 +229,6 @@ impl Caps {
     pub fn bits(self) -> u32 {
         self.0
     }
-    pub fn from_bits(bits: u32) -> Caps {
-        Caps(bits & 31)
-    }
 }
 
 impl core::ops::BitOr for Caps {
@@ -387,10 +384,6 @@ pub trait Kv: Base {
     fn file_delete(&mut self, _name: &str) -> bool {
         false
     }
-    /// (total, used) bytes of the files partition.
-    fn files_usage(&self) -> Option<(u64, u64)> {
-        None
-    }
 }
 
 /// Raw Ethernet, for apps that forward packets (see `Module::on_frames`).
@@ -399,16 +392,10 @@ pub trait Packet: Base {
     /// Send a frame built from scratch (forwarded frames use `Verdict::Transmit`).
     fn send_frame(&mut self, frame: &[u8]) -> bool;
 
-    // For forwarding between NICs:
-    fn nic_mac(&self, nic: usize) -> Option<[u8; 6]> {
-        (nic == 0).then(|| self.mac())
-    }
-    fn send_frame_on(&mut self, nic: usize, frame: &[u8]) -> bool {
-        nic == 0 && self.send_frame(frame)
-    }
-    /// `send_frame_on` for a frame with offloads pending (`Frame::offload`).
+    /// Send a frame out of interface `nic`, offloads pending as `offload`
+    /// says (`Frame::offload`).
     fn send_frame_offload(&mut self, nic: usize, frame: &[u8], offload: Offload) -> bool {
-        offload.is_none() && self.send_frame_on(nic, frame)
+        nic == 0 && offload.is_none() && self.send_frame(frame)
     }
     /// (NIC, next hop) towards `dst` by the system's routes.
     fn route(&self, _dst: Ip) -> Option<(usize, Ip)> {
@@ -453,10 +440,6 @@ pub trait Admin: Base {
     /// forever. Only the i6300esb (if present) gets the machine back.
     fn debug_freeze(&mut self) -> !;
     fn clear_crash(&mut self) -> bool;
-
-    fn net_config(&mut self, ip: Ip, mask: Ip, gw: Ip);
-    /// Clamped to 576..=1500.
-    fn net_set_mtu(&mut self, mtu: usize);
 
     // The whole network configuration in three stages: a candidate (edited
     // freely, neither in effect nor stored), the running one, and what is

@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustros_util::wire::Ip;
-use rustros_api::{IfConf, NetConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetInfo, StorageInfo, Sys, UpdateInfo, Frame, Verdict};
+use rustros_api::{NetConf, Admin, ModuleInfo, ModuleKind, Base, Caps, ConnInfo, Kv, KvError, Net, Packet, NetInfo, StorageInfo, Sys, UpdateInfo, Frame, Verdict};
 
 use devices::NetDevice;
 
@@ -182,15 +182,6 @@ impl Kernel {
         let r = self.stack.set_config(net);
         self.sync_ifmap();
         r
-    }
-
-    /// Change interface `i`'s addresses (the others stay as they are).
-    pub fn set_if(&mut self, i: usize, f: impl FnOnce(&mut IfConf)) {
-        let mut conf = self.stack.config();
-        if let Some(c) = conf.ifs.get_mut(i) {
-            f(c);
-        }
-        let _ = self.net_set_running(&conf);
     }
 
     /// An applied candidate that was not confirmed in time goes.
@@ -549,12 +540,6 @@ impl Kv for Ctx<'_> {
         let now = arch::unix_time() as u32;
         self.k.with_files(|fs, d| fs.remove(d, &path, now)).unwrap_or(false)
     }
-    fn files_usage(&self) -> Option<(u64, u64)> {
-        match self.k.filesystems.get(self.k.files_fs?)?.1.export.as_ref()? {
-            Export::Filesystem(fs) => Some(fs.usage()),
-            _ => None,
-        }
-    }
 }
 
 impl Packet for Ctx<'_> {
@@ -563,12 +548,6 @@ impl Packet for Ctx<'_> {
     }
     fn send_frame(&mut self, frame: &[u8]) -> bool {
         self.k.nics[0].send(frame)
-    }
-    fn nic_mac(&self, nic: usize) -> Option<[u8; 6]> {
-        self.k.nics.get(self.k.ifmap.get(nic)?.phys).map(|n| n.mac())
-    }
-    fn send_frame_on(&mut self, nic: usize, frame: &[u8]) -> bool {
-        if_send(&mut self.k.nics, &self.k.ifmap, nic, frame)
     }
     fn send_frame_offload(&mut self, nic: usize, frame: &[u8], offload: rustros_api::Offload) -> bool {
         if_send_offload(&mut self.k.nics, &self.k.ifmap, nic, frame, offload)
@@ -628,12 +607,6 @@ impl Admin for Ctx<'_> {
     }
     fn clear_crash(&mut self) -> bool {
         self.k.boot.as_mut().is_some_and(|b| b.env_set(&[("last_panic", "")]))
-    }
-    fn net_config(&mut self, ip: Ip, mask: Ip, gw: Ip) {
-        self.k.set_if(0, |c| (c.ip, c.mask, c.gw) = (ip, mask, gw));
-    }
-    fn net_set_mtu(&mut self, mtu: usize) {
-        self.k.set_if(0, |c| c.mtu = mtu.clamp(576, 1500) as u16);
     }
     fn boot_net(&self) -> Vec<(String, String)> {
         let Some(b) = self.k.boot.as_ref() else { return Vec::new() };

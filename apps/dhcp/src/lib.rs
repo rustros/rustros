@@ -12,7 +12,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use rustros_api::socket::{SockAddr, Socket};
-use rustros_api::{Caps, Module, Sys, say};
+use rustros_api::{Admin, Caps, IfConf, Module, Sys, say};
 use rustros_util::wire::{BROADCAST, Ip, IpFmt};
 
 const CLIENT_PORT: u16 = 68;
@@ -32,6 +32,15 @@ const RETRY_MAX_MS: u64 = 32_000;
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
 
 /// What a server said.
+/// Change NIC 0's settings in the configuration in effect (the rest stays).
+fn set_nic0(admin: &mut dyn Admin, f: impl FnOnce(&mut IfConf)) {
+    let mut conf = admin.net_running();
+    if let Some(c) = conf.ifs.get_mut(0) {
+        f(c);
+    }
+    let _ = admin.net_set_running(&conf);
+}
+
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Reply {
     pub kind: u8,
@@ -178,10 +187,12 @@ impl Dhcp {
 
     fn apply(&mut self, sys: &mut dyn Sys, r: &Reply) {
         let Some(admin) = sys.admin() else { return };
-        admin.net_config(r.yiaddr, r.mask, r.router);
-        if r.mtu >= 576 {
-            admin.net_set_mtu(r.mtu as usize);
-        }
+        set_nic0(admin, |c| {
+            (c.ip, c.mask, c.gw) = (r.yiaddr, r.mask, r.router);
+            if r.mtu >= 576 {
+                c.mtu = r.mtu.min(1500);
+            }
+        });
     }
 
     fn handle(&mut self, sys: &mut dyn Sys, r: Reply) {
@@ -211,7 +222,7 @@ impl Dhcp {
             (State::Requesting { .. } | State::Bound { .. }, NAK) => {
                 say!(sys, "dhcp: NAK from {}, starting over\n", IpFmt(r.server));
                 if let Some(a) = sys.admin() {
-                    a.net_config(0, 0, 0);
+                    set_nic0(a, |c| (c.ip, c.mask, c.gw) = (0, 0, 0));
                 }
                 self.discover(sys, RETRY_MIN_MS);
             }
@@ -245,7 +256,7 @@ impl Dhcp {
                 if elapsed >= expiry {
                     say!(sys, "dhcp: lease on {} expired, starting over\n", IpFmt(ip));
                     if let Some(a) = sys.admin() {
-                        a.net_config(0, 0, 0);
+                        set_nic0(a, |c| (c.ip, c.mask, c.gw) = (0, 0, 0));
                     }
                     self.discover(sys, RETRY_MIN_MS);
                     return;

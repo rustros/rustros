@@ -521,7 +521,7 @@ fn no_local(_: Ip) -> bool {
 #[test]
 fn static_srcnat_tracks_replies() {
     let mut s = StaticNat::new(7);
-    s.set_rules(vec![(HOST, PUB)], vec![]);
+    s.set_all(vec![(HOST, PUB)], vec![], vec![]);
     let mut out = tcp(HOST, 1111, REMOTE, 80, SYN, &[], b"");
     assert!(s.process(0, &mut out, &no_local, false));
     assert_valid(&out);
@@ -598,7 +598,7 @@ fn port_forwards() {
 #[test]
 fn srcnat_leaves_replies_to_the_hosts_own_address() {
     let mut s = StaticNat::new(7);
-    s.set_rules(vec![(HOST, PUB)], vec![]);
+    s.set_all(vec![(HOST, PUB)], vec![], vec![]);
     // someone pings the host at its own address (routed): the reply keeps it
     let mut ping = echo(REMOTE, HOST, 8, 21);
     assert!(!s.process(0, &mut ping, &no_local, false), "the request is left alone");
@@ -621,7 +621,7 @@ fn srcnat_leaves_replies_to_the_hosts_own_address() {
 fn static_dstnat_from_several_wans() {
     let mut s = StaticNat::new(7);
     // the host is published on two WANs, and goes out by WAN 1 itself
-    s.set_rules(vec![(HOST, PUB)], vec![(PUB, HOST), (WAN2, HOST)]);
+    s.set_all(vec![(HOST, PUB)], vec![(PUB, HOST), (WAN2, HOST)], vec![]);
     for (public, sport) in [(PUB, 4000), (WAN2, 5000)] {
         let mut syn = tcp(REMOTE, sport, public, 443, SYN, &[], b"");
         assert!(s.process(0, &mut syn, &no_local, false));
@@ -665,7 +665,7 @@ fn static_dstnat_from_several_wans() {
     // new rules: the connection in progress keeps its translation (it came
     // in on WAN 2, which is no longer published) ...
     let conns = s.stats.conns;
-    s.set_rules(vec![], vec![(PUB, HOST)]);
+    s.set_all(vec![], vec![(PUB, HOST)], vec![]);
     assert_eq!(s.stats.conns, conns);
     let mut late = tcp(HOST, 443, REMOTE, 5000, ACK, &[], b"");
     assert!(s.process(6, &mut late, &no_local, false));
@@ -771,7 +771,7 @@ fn partial_checksums_through_nat() {
     assert_eq!(dst_of(&back), (HOST, 2222));
     // static NAT too
     let mut s = StaticNat::new(9);
-    s.set_rules(vec![(HOST, PUB)], vec![]);
+    s.set_all(vec![(HOST, PUB)], vec![], vec![]);
     let mut u = udp(HOST, 53, REMOTE, 53, &[1u8; 2000]);
     make_partial(&mut u);
     assert!(s.process(0, &mut u, &no_local, true));

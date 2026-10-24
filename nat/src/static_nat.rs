@@ -154,13 +154,8 @@ impl StaticNat {
         }
     }
 
-    /// New rules (for new connections; those in progress keep theirs).
-    pub fn set_rules(&mut self, snat: Vec<(Ip, Ip)>, dnat: Vec<(Ip, Ip)>) {
-        let fwd = self.fwd.clone();
-        self.set_all(snat, dnat, fwd);
-    }
-
-    /// New rules, port forwards too; connections start over if they changed.
+    /// New rules (srcnat, dstnat, port forwards), for new connections; those
+    /// in progress keep their translation.
     pub fn set_all(&mut self, mut snat: Vec<(Ip, Ip)>, mut dnat: Vec<(Ip, Ip)>, mut fwd: Vec<PortForward>) {
         snat.sort_unstable();
         dnat.sort_unstable();

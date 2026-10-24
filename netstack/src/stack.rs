@@ -219,19 +219,6 @@ impl Stack {
         })
     }
 
-    pub fn config(&mut self, ip: Ip, mask: Ip, gw: Ip) {
-        self.config_nic(0, ip, mask, gw);
-    }
-
-    pub fn config_nic(&mut self, nic: usize, ip: Ip, mask: Ip, gw: Ip) {
-        if let Some(f) = self.ifs.0.get_mut(nic) {
-            f.ip = ip;
-            f.mask = mask;
-            f.gw = gw;
-            f.arp.clear();
-        }
-    }
-
     pub fn arp_table(&self, now: u64) -> Vec<(Ip, [u8; 6], u64)> {
         self.ifs.0.iter().flat_map(|f| f.arp.iter()).map(|e| (e.ip, e.mac, now - e.seen)).collect()
     }

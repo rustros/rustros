@@ -423,21 +423,6 @@ impl devices::NetDevice for VirtioNet {
         true
     }
 
-    fn recv(&mut self, out: &mut [u8]) -> Option<usize> {
-        let mut b = new_buf();
-        let (n, off) = self.recv_swap(&mut b)?;
-        let n = n.min(out.len());
-        if off.csum_partial {
-            rustros_util::offload::complete_csum(&mut b[HEADROOM..HEADROOM + n]);
-        }
-        out[..n].copy_from_slice(&b[HEADROOM..HEADROOM + n]);
-        Some(n)
-    }
-
-    fn tx_offloads(&self) -> bool {
-        self.tx_offload
-    }
-
     fn stats(&self) -> devices::DevStats {
         self.stats
     }

@@ -34,7 +34,7 @@ enum Phase {
 }
 
 #[cfg(feature = "tls")]
-type Tls = tls::TlsClient;
+type Tls = tls::Tls;
 /// Without TLS there is never one.
 #[cfg(not(feature = "tls"))]
 struct Tls {

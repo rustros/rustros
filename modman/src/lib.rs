@@ -25,8 +25,6 @@ use rustros_api::{ModuleInfo, ModuleKind};
 use rustros_util::snap::{Bad, R, W};
 
 const PREFIX: &str = "sys/app/";
-/// Old location of WebAssembly modules (before native modules existed).
-const LEGACY_WASM: &str = "sys/wasm/";
 /// What a module is besides an app (`ROLE_SERVICE`, `ROLE_FS`).
 const ROLE: &str = "role";
 /// The state handed to the next version (hot replacement).
@@ -209,10 +207,10 @@ impl ModManager for Manager {
         }
     }
 
-    /// Switch off a native module that crashed the last boot, move old
-    /// WebAssembly modules to the new layout, then queue every installed
-    /// module: file system drivers first (apps find their files mounted),
-    /// then the runtime (WebAssembly modules need it).
+    /// Switch off a native module that crashed the last boot, install what
+    /// the boot image carries, then queue every installed module: the ones
+    /// that replace services first, file system drivers next (apps find
+    /// their files mounted), then the runtime (WebAssembly modules need it).
     fn boot(&mut self, h: &mut dyn ModHost) {
         let crashed = h.store().and_then(|b| b.env("crash_app")).map(String::from);
         if let Some(name) = crashed {
@@ -222,15 +220,6 @@ impl ModManager for Manager {
             }
             if let Some(b) = h.store() {
                 b.env_set(&[("crash_app", "")]);
-            }
-        }
-        let legacy: Vec<String> = h.store().map(|s| s.kv_keys(LEGACY_WASM)).unwrap_or_default();
-        for old in legacy {
-            let name = &old[LEGACY_WASM.len()..];
-            if let Some(image) = get(h, &old) {
-                if put(h, &key(name, "wasm"), &image).is_ok() && put(h, &key(name, "prefer"), b"wasm").is_ok() {
-                    delete(h, &old);
-                }
             }
         }
         // what the image carries is installed first, so it starts in order too

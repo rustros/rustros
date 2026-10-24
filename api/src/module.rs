@@ -304,26 +304,18 @@ pub trait NetDevice {
     fn mac(&self) -> [u8; 6];
     /// Transmit one frame (without FCS). False if the device is busy.
     fn send(&mut self, frame: &[u8]) -> bool;
-    /// Copy the next received frame into `buf`; returns its length.
-    fn recv(&mut self, buf: &mut [u8]) -> Option<usize>;
     /// Short description for the boot log.
     fn kind(&self) -> &'static str;
     /// Zero-copy receive: the next frame ends up in `buf` (at HEADROOM;
     /// its length and pending offloads are returned) and the driver keeps
     /// the buffer that was there.
-    fn recv_swap(&mut self, buf: &mut Buf) -> Option<(usize, Offload)> {
-        self.recv(&mut buf[HEADROOM..]).map(|n| (n, Offload::default()))
-    }
+    fn recv_swap(&mut self, buf: &mut Buf) -> Option<(usize, Offload)>;
     /// Zero-copy send of `buf[start..start + len]`: the driver keeps the
     /// buffer until the device is done with it and leaves a spare one in
     /// `buf`. False if the device is busy (`buf` is then unchanged).
-    /// `offload` only if `tx_offloads()`.
+    /// `offload` as the driver can finish it (else it sends plain packets).
     fn send_swap(&mut self, buf: &mut Buf, start: usize, len: usize, _offload: Offload) -> bool {
         self.send(&buf[start..start + len])
-    }
-    /// The device completes partial checksums and cuts big TCP segments.
-    fn tx_offloads(&self) -> bool {
-        false
     }
     /// Tell the device about frames sent and buffers returned since the last
     /// flush (`send`/`recv` batch their notifications, which are expensive

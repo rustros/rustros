@@ -385,7 +385,7 @@ def main():
     ap.add_argument("host")
     ap.add_argument("action", choices=["status", "upload", "confirm", "reboot", "poweroff", "info", "net", "log",
                                        "module-install", "module-remove", "module-switch", "module-config", "run", "ps", "kill",
-                                       "wasm-install", "wasm-remove", "esp-get", "esp-put", "esp-grow"])
+                                       "esp-get", "esp-put", "esp-grow"])
     ap.add_argument("image", nargs="?", help="kernel image, or the module name for module-*")
     ap.add_argument("module", nargs="?", help="module file (module-install), native|wasm, or the setting's key (module-config)")
     ap.add_argument("value", nargs="*", help="module-config: the value ('-' removes the setting)")
@@ -444,7 +444,7 @@ def main():
         print(f"confirm: {reply}")
         sys.exit(0 if reply == "OK" else 1)
 
-    if a.action in ("module-install", "wasm-install"):
+    if a.action == "module-install":
         if not a.image or not a.module:
             sys.exit(f"{a.action} needs NAME and a module file")
         module = open(a.module, "rb").read()
@@ -505,7 +505,7 @@ def main():
         reply, _, _ = command(a.host, a.port, key, b"K", payload.encode(), encrypt=True)
         print(reply)
         sys.exit(0 if reply == "OK" else 1)
-    if a.action in ("module-remove", "wasm-remove", "module-switch"):
+    if a.action in ("module-remove", "module-switch"):
         if not a.image:
             sys.exit(f"{a.action} needs NAME")
         kind = a.module or ""

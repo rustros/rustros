@@ -240,7 +240,7 @@ impl NetDevice for Gone {
     fn send(&mut self, _: &[u8]) -> bool {
         false
     }
-    fn recv(&mut self, _: &mut [u8]) -> Option<usize> {
+    fn recv_swap(&mut self, _: &mut devices::Buf) -> Option<(usize, rustros_api::Offload)> {
         None
     }
     fn kind(&self) -> &'static str {

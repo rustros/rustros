@@ -101,7 +101,7 @@ save            # 写入 grubenv，以后重启和在线更新都会保留
 | | 原生（编进内核） | WebAssembly（运行时安装） |
 |---|---|---|
 | 性能 | 最快 | 解释执行（wasmi），慢一个数量级 |
-| 更新 | 在线更新内核，需要重启 | `wasm-install` 立即替换，不用重启，其他应用不受影响 |
+| 更新 | 在线更新内核，需要重启 | `module-install` 立即替换，不用重启，其他应用不受影响 |
 | 故障隔离 | panic 会导致整机重启 | 只停这一个实例，释放它的 socket，退避后重启（1、2、4…60 秒） |
 | 死循环 | 软件看门狗重启整机 | 每次调用限 5000 万指令（fuel），超出就停掉实例 |
 | 内存 | 共用内核堆 | 每个实例上限 16 MiB |
@@ -116,8 +116,8 @@ rustros_guest::export_app!(echo::Echo::new());
 
 ```sh
 make wasm                                                   # 生成 build/wasm/*.wasm
-tools/rustros-update.py HOST wasm-install echo build/wasm/echo_wasm.wasm
-tools/rustros-update.py HOST wasm-remove echo
+tools/rustros-update.py HOST module-install echo build/wasm/echo_wasm.wasm
+tools/rustros-update.py HOST module-remove echo
 tools/rustros-update.py HOST info                            # 包括各模块的状态和重启次数
 ```
 
