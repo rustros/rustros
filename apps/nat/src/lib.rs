@@ -323,7 +323,7 @@ impl NatModule {
         if d.len() < ETH + 20 || d[12..14] != [8, 0] || d[..6] != me.mac || be16(d, ETH + 2) as usize > d.len() - ETH {
             return;
         }
-        if let Some(fixed) = self.fixed.as_mut().filter(|x| !x.is_empty()) {
+        if let Some(fixed) = self.fixed.as_mut().filter(|x| !x.idle()) {
             let local = &self.local;
             let total = be16(f.data(), ETH + 2) as usize;
             let partial = f.offload.csum_partial;
@@ -439,7 +439,7 @@ impl Module for NatModule {
     }
 
     fn on_frames(&mut self, sys: &mut dyn Sys, frames: &mut [Frame]) {
-        if self.inside == 0 && self.fixed.as_ref().is_none_or(|x| x.is_empty()) {
+        if self.inside == 0 && self.fixed.as_ref().is_none_or(|x| x.idle()) {
             return;
         }
         let now = sys.now_ms();

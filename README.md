@@ -293,6 +293,7 @@ pub trait App {
 
 1. **socket 接口按 Linux 语义重做**：就绪主动通知（epoll、边沿触发），地址留 IPv6 的位置。
 2. **进程和用户态**：ring 3、每个进程独立的地址空间、系统调用入口、抢占式调度（数据面优先）；以后再做多核。
+   - 以后要加：给进程保留最低 CPU 份额，转发满负荷时业务进程也不会完全饿死（现在进程只在主循环空闲时运行）。
 3. **VFS 和 POSIX 级的 ext4**（做成模块）：按偏移读写、truncate、fsync、原子 rename、硬链接和符号链接、权限、属主和时间、jbd2 日志；/tmp、/dev、/proc。
 4. **Linux 兼容层模块**：系统调用（clone、futex、mmap、epoll、信号……）、伪终端、网络系统调用。
 5. **容器运行时**：导入镜像、compose、`run/exec/ps/stop/rm/logs`。

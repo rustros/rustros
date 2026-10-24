@@ -662,11 +662,64 @@ fn static_dstnat_from_several_wans() {
         assert_eq!(get32(f, 16), HOST);
     }
     assert_valid(&reassemble(&frags));
-    // new rules: connections start over
+    // new rules: the connection in progress keeps its translation (it came
+    // in on WAN 2, which is no longer published) ...
+    let conns = s.stats.conns;
     s.set_rules(vec![], vec![(PUB, HOST)]);
-    assert_eq!(s.stats.conns, 0);
+    assert_eq!(s.stats.conns, conns);
     let mut late = tcp(HOST, 443, REMOTE, 5000, ACK, &[], b"");
-    assert!(!s.process(6, &mut late, &no_local, false));
+    assert!(s.process(6, &mut late, &no_local, false));
+    assert_eq!(src_of(&late), (WAN2, 443));
+    // ... but a new one to WAN 2 is not translated any more
+    let mut fresh = tcp(REMOTE, 5001, WAN2, 443, SYN, &[], b"");
+    assert!(!s.process(7, &mut fresh, &no_local, false));
+}
+
+/// Changing or removing a port forward leaves the connections in progress
+/// alone (they keep their host until they end), and the others too; only
+/// new connections see the new rules.
+#[test]
+fn rule_changes_keep_connections() {
+    let mut s = StaticNat::new(11);
+    let fw = |ports, host, hport| PortForward { proto: TCP, public: WAN2, ports, host, hport };
+    s.set_all(vec![], vec![], vec![fw((2222, 2222), HOST, 22), fw((8080, 8080), HOST, 80)]);
+    let open = |s: &mut StaticNat, sport: u16, dport: u16| {
+        let mut syn = tcp(REMOTE, sport, WAN2, dport, SYN, &[], b"");
+        let ok = s.process(0, &mut syn, &no_local, false);
+        (ok, dst_of(&syn))
+    };
+    assert_eq!(open(&mut s, 40001, 2222), (true, (HOST, 22)));
+    assert_eq!(open(&mut s, 40002, 8080), (true, (HOST, 80)));
+    // the forward on 2222 moves to another host
+    s.set_all(vec![], vec![], vec![fw((2222, 2222), HOST2, 22), fw((8080, 8080), HOST, 80)]);
+    let mut more = tcp(REMOTE, 40001, WAN2, 2222, ACK, &[], b"data");
+    assert!(s.process(1, &mut more, &no_local, false));
+    assert_valid(&more);
+    assert_eq!(dst_of(&more), (HOST, 22), "the connection in progress stays with its host");
+    let mut reply = tcp(HOST, 22, REMOTE, 40001, ACK, &[], b"r");
+    assert!(s.process(1, &mut reply, &no_local, false));
+    assert_eq!(src_of(&reply), (WAN2, 2222));
+    assert_eq!(open(&mut s, 40003, 2222), (true, (HOST2, 22)), "a new one goes to the new host");
+    // both forwards removed
+    s.set_all(vec![], vec![], vec![]);
+    let mut web = tcp(REMOTE, 40002, WAN2, 8080, ACK, &[], b"GET");
+    assert!(s.process(2, &mut web, &no_local, false));
+    assert_eq!(dst_of(&web), (HOST, 80), "untouched by the changes");
+    let mut old = tcp(REMOTE, 40001, WAN2, 2222, ACK, &[], b"x");
+    assert!(s.process(2, &mut old, &no_local, false));
+    assert_eq!(dst_of(&old), (HOST, 22));
+    assert!(!open(&mut s, 40004, 8080).0, "no new connections on a removed forward");
+    assert!(s.is_empty() && !s.idle(), "no rules, but connections to serve");
+    // a connection that ends goes, as before
+    let mut fin = tcp(REMOTE, 40002, WAN2, 8080, FIN | ACK, &[], b"");
+    assert!(s.process(3, &mut fin, &no_local, false));
+    let mut fin_back = tcp(HOST, 80, REMOTE, 40002, FIN | ACK, &[], b"");
+    assert!(s.process(3, &mut fin_back, &no_local, false));
+    let mut after = tcp(REMOTE, 40002, WAN2, 8080, ACK, &[], b"");
+    assert!(!s.process(3 + 241_000, &mut after, &no_local, false), "gone once its FIN timeout passed");
+    // the rest expire too, and then there is nothing to do
+    s.expire(3 + 3 * 3600 * 1000, usize::MAX);
+    assert!(s.idle());
 }
 
 /// The packet with its TCP/UDP checksum made partial, as with offloads: the

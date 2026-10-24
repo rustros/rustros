@@ -10,7 +10,9 @@
 //!   WAN it came in on.
 //!
 //! Connections are remembered by their inside tuple and by their public one;
-//! replies follow their connection before any rule. ICMP errors follow the
+//! replies follow their connection before any rule. Changing the rules does
+//! not touch the connections in progress: they keep their translation until
+//! they end (or time out), and the new rules apply to new connections only. ICMP errors follow the
 //! connection of the packet they quote; later fragments follow their first.
 //! A packet a rule names that cannot be tracked (table full) is still
 //! translated by the rule.
@@ -152,7 +154,7 @@ impl StaticNat {
         }
     }
 
-    /// New rules; connections start over if they changed.
+    /// New rules (for new connections; those in progress keep theirs).
     pub fn set_rules(&mut self, snat: Vec<(Ip, Ip)>, dnat: Vec<(Ip, Ip)>) {
         let fwd = self.fwd.clone();
         self.set_all(snat, dnat, fwd);
@@ -166,17 +168,19 @@ impl StaticNat {
         if snat == self.snat && dnat == self.dnat && fwd == self.fwd {
             return;
         }
+        // the tracked connections stay: a removed or changed rule only
+        // stops new connections; the ones in progress end by themselves
         (self.snat, self.dnat, self.fwd) = (snat, dnat, fwd);
-        self.conns.clear();
-        self.free.clear();
-        self.by_in.clear();
-        self.by_pub.clear();
-        self.frags.clear();
-        self.stats.conns = 0;
     }
 
     pub fn is_empty(&self) -> bool {
         self.snat.is_empty() && self.dnat.is_empty() && self.fwd.is_empty()
+    }
+
+    /// Nothing to do: no rules, and no connections left from earlier ones
+    /// (those go on after their rule is removed, until they end).
+    pub fn idle(&self) -> bool {
+        self.is_empty() && self.stats.conns == 0
     }
 
     pub fn forwards(&self) -> &[PortForward] {
@@ -279,17 +283,24 @@ impl StaticNat {
     fn packet(&mut self, now: u64, p: &mut [u8], h: &V4, local: &dyn Fn(Ip) -> bool, partial: bool) -> bool {
         let Some((sp, dp)) = ports(p, h) else { return false };
         let (src, dst) = (h.src, h.dst);
-        // a port forward
+        // towards a public address on a connection in progress: it keeps its
+        // translation, whatever the rules say now (they may have changed)
+        if let Some(i) = self.lookup(true, key(h.proto, dst, dp, src, sp), now) {
+            self.touch(i, now, p, h);
+            let c = self.conns[i as usize];
+            if c.host == dst {
+                return false; // a connection to the host's own address: as it is
+            }
+            translate(p, h, false, c.host, c.hport, partial);
+            self.remember_fragment(now, h, c.host, false);
+            return true;
+        }
+        // a port forward (a new connection)
         if let Some(f) = self.fwd.iter().find(|f| f.proto == h.proto && f.public == dst && (f.ports.0..=f.ports.1).contains(&dp)).copied() {
             let hp = f.hport.wrapping_add(dp - f.ports.0);
             let c = Conn { proto: h.proto, host: f.host, public: dst, hport: hp, pport: dp, remote: src, rport: sp, ..Conn::default() };
-            match self.lookup(true, c.pub_key(), now) {
-                Some(i) if self.conns[i as usize].host == f.host => self.touch(i, now, p, h),
-                _ => {
-                    if let Some(i) = self.track(now, c) {
-                        self.touch(i, now, p, h);
-                    }
-                }
+            if let Some(i) = self.track(now, c) {
+                self.touch(i, now, p, h);
             }
             translate(p, h, false, f.host, hp, partial);
             self.remember_fragment(now, h, f.host, false);
@@ -303,27 +314,13 @@ impl StaticNat {
             self.remember_fragment(now, h, c.public, true);
             return true;
         }
-        // towards a public address: a dstnat rule, or a reply to a srcnat connection
-        let to = match find(&self.dnat, dst) {
-            Some(host) => {
-                let c = Conn { proto: h.proto, host, public: dst, hport: dp, pport: dp, remote: src, rport: sp, ..Conn::default() };
-                // a known connection keeps its timer and state
-                match self.lookup(true, c.pub_key(), now) {
-                    Some(i) if self.conns[i as usize].host == host => self.touch(i, now, p, h),
-                    _ => {
-                        if let Some(i) = self.track(now, c) {
-                            self.touch(i, now, p, h);
-                        }
-                    }
-                }
-                Some(host)
-            }
-            None => self.lookup(true, key(h.proto, dst, dp, src, sp), now).map(|i| {
+        // towards a public address with a dstnat rule (a new connection; a
+        // reply to a srcnat connection was found above)
+        if let Some(host) = find(&self.dnat, dst) {
+            let c = Conn { proto: h.proto, host, public: dst, hport: dp, pport: dp, remote: src, rport: sp, ..Conn::default() };
+            if let Some(i) = self.track(now, c) {
                 self.touch(i, now, p, h);
-                self.conns[i as usize].host
-            }),
-        };
-        if let Some(host) = to {
+            }
             if host == dst {
                 return false; // a connection to the host's own address: as it is
             }
