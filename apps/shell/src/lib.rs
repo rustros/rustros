@@ -544,6 +544,7 @@ impl Shell {
 /// The settings, for user interfaces (`Module::params`).
 const PARAMS: &[Param] = &[
     Param { key: "dns", kind: "address", default: "1.1.1.1", help: "resolver for curl" },
+    Param { key: "ca", kind: "text", default: "", help: "CA certificates (PEM) curl trusts besides the Mozilla roots" },
 ];
 
 impl Module for Shell {

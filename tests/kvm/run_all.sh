@@ -69,7 +69,7 @@ run $P default "proc uefi" DISK_MB=300 -- python3 proc_test.py uefi
 grep -ah "spinner" "$P/log-proc bios" "$P/log-proc uefi" >> $P/out
 
 # ---------------------------------------------------------------- parallel groups
-PORTS="17777 17001 19000 28820 23400 19202 19201 18766 18089 18088 19203 18557 18490 11701 28123 19301"
+PORTS="17777 17001 19000 28820 23400 19202 19201 18766 18089 18088 19203 18557 18490 11701 28123 19301 18580 18581"
 group() {  # number, then "variant|name|env...|command" items
     local n=$1; shift
     local d=$S/groups/g$n; tests_into $d
@@ -94,7 +94,8 @@ group 4 "su|bootloop|DISK_MB=300|python3 bootloop_test.py bios" "su|modules|DISK
 group 5 "seh|update bios|IMG=rustros.img DISK_MB=1200|python3 test.py bios update" "seh|update uefi|IMG=rustros.img DISK_MB=1200|python3 test.py uefi update" \
         "seh|store bios|IMG=rustros.img DISK_MB=1200|python3 store_test.py bios" "seh|store uefi|IMG=rustros.img DISK_MB=1200|python3 store_test.py uefi" \
         "seh|watchdog|WDT=1 DISK_MB=300|python3 wdt_test.py bios" &
-group 6 "default|hot bios|IMG=rustros.img DISK_MB=1200|python3 hot_test.py bios" "default|hot uefi legacy|IMG=rustros.img DISK_MB=1200|python3 hot_test.py uefi legacy" &
+group 6 "default|hot bios|IMG=rustros.img DISK_MB=1200|python3 hot_test.py bios" "default|hot uefi legacy|IMG=rustros.img DISK_MB=1200|python3 hot_test.py uefi legacy" \
+        "default|curl|DISK_MB=300|python3 curl_test.py bios" &
 wait
 
 # ---------------------------------------------------------------- forwarding benchmark, alone

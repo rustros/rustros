@@ -1,6 +1,7 @@
 //! `curl`: an HTTP request with curl's options, through a DNS lookup, from
 //! a chosen local address; HTTPS through the `tls` crate (TLS 1.3,
-//! certificates checked against the Mozilla roots). Other commands use it
+//! certificates checked against the Mozilla roots, and the CA certificates
+//! of `cfg shell ca` if set). Other commands use it
 //! too (`Curl::request`), keeping the answer instead of printing it.
 //!
 //! ```text
@@ -301,7 +302,10 @@ impl Curl {
         #[cfg(feature = "tls")]
         let tls = if self.https {
             tls::set_time(sys.unix_time());
-            let mut t = tls::TlsClient::new(&self.host).map_err(|e| format!("curl: (35) TLS: {e}\n"))?;
+            // `cfg shell ca`: CA certificates trusted besides the Mozilla
+            // roots (a private CA; the regression tests' local server)
+            let ca = sys.kv().and_then(|k| k.get("cfg/ca")).map(|v| rustros_util::pem::normalize(&String::from_utf8_lossy(&v))).unwrap_or_default();
+            let mut t = tls::Tls::client_trusting(&self.host, &ca).map_err(|e| format!("curl: (35) TLS: {e}\n"))?;
             t.write(&req); // sent once the handshake is done
             Some(t)
         } else {
