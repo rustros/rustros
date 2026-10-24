@@ -512,12 +512,14 @@ impl Queue {
     }
 
     /// Notify the device unless it said it does not need it (it is still
-    /// processing the queue: VIRTQ_USED_F_NO_NOTIFY).
-    pub fn kick(&self) {
+    /// processing the queue: VIRTQ_USED_F_NO_NOTIFY). True if it was.
+    pub fn kick(&self) -> bool {
         fence(Ordering::SeqCst);
         if unsafe { rd::<u16>(self.used) } & 1 == 0 {
             self.notify();
+            return true;
         }
+        false
     }
 
     /// Completed buffers not taken yet.

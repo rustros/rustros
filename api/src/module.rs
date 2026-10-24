@@ -290,6 +290,10 @@ pub struct DevStats {
     pub rx_full: u64,
     /// unicast frames for other MACs, dropped on arrival
     pub rx_foreign: u64,
+    /// notifications sent to the device (each a VM exit under a hypervisor)
+    pub kicks: u64,
+    /// CPU time (TSC ticks) spent waiting for a free TX slot
+    pub tx_wait_tsc: u64,
 }
 
 /// An Ethernet interface.

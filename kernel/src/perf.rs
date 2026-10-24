@@ -72,6 +72,9 @@ impl Perf {
                 })
                 .collect();
             let per_ms = arch::tsc_per_ms().max(1);
+            let kicks = self.last.iter().zip(&now_stats).map(|(a, b)| b.kicks - a.kicks).sum();
+            let waits = self.last.iter().zip(&now_stats).map(|(a, b)| b.tx_wait_tsc - a.tx_wait_tsc).sum();
+            crate::stages::tick(dt, kicks, waits);
             let idle_ms = (self.idle_tsc - self.last_idle) / per_ms;
             self.cpu = 100u64.saturating_sub(idle_ms * 100 / dt);
             self.mod_last.resize(self.mod_tsc.len(), 0);
@@ -142,6 +145,12 @@ impl Perf {
             if let Some(d) = stats.get(i).filter(|d| d.rx_foreign > 0) {
                 s += &format!(", {} not for us", d.rx_foreign);
             }
+        }
+        // measurement builds (feature `stages`): where the packet path's time goes
+        let st = crate::stages::line();
+        if !st.is_empty() {
+            s += "\n";
+            s += &st;
         }
         s
     }

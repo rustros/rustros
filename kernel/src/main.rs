@@ -11,6 +11,7 @@ mod drivers;
 mod modules;
 mod klog;
 mod perf;
+mod stages;
 mod frames;
 mod proc;
 mod services;
@@ -428,9 +429,12 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 }
             }
         }
+        stages::pass();
+        let t = stages::t();
         for id in 0..slots.len() {
             modules::call(&mut k, &mut slots, id, |app, ctx| app.poll(ctx));
         }
+        stages::add(stages::POLL, t);
         while stack_tx_batch(&mut k, &mut slots, &mut pool) {
             busy = true;
         }
@@ -548,6 +552,7 @@ fn receive_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf]) 
     let mut starts = [HEADROOM; BATCH];
     let mut offs = [Offload::default(); BATCH];
     let mut n = 0;
+    let t = stages::t();
     // take from every NIC in turn so none can starve the others
     let mut idle = 0;
     let mut nic = 0;
@@ -583,6 +588,8 @@ fn receive_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf]) 
     if n == 0 {
         return false;
     }
+    stages::add(stages::RX, t);
+    stages::batch(n);
     process_batch(k, slots, pool, n, &starts, &lens, &from, &offs, i32::MIN);
     true
 }
@@ -661,6 +668,7 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
     });
     // frames[..live] are still undecided
     let mut live = if after == i32::MAX { 0 } else { n };
+    let mut t = stages::t();
     // packet modules by their order, then by id
     let mut ids = [0usize; 64];
     let mut count = 0;
@@ -702,37 +710,40 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
         }
         live = j;
     }
+    t = stages::add(stages::MODULES, t);
     // egress hook (shapers): the frames to send, first in frames[live..]
-    let mut t = live;
+    let mut e = live;
     for i in live..n {
         if frames[i].verdict == Verdict::Transmit {
-            frames.swap(i, t);
-            t += 1;
+            frames.swap(i, e);
+            e += 1;
         }
     }
-    if t > live {
+    let t_egress = e;
+    if t_egress > live {
         for id in 0..slots.len() {
             if k.caps.get(id).is_some_and(|c| c.contains(Caps::PACKET)) {
                 if !slots[id].app().is_some_and(|a| a.offloads()) {
                     // plain packets for it: they come back to the egress hook,
                     // with every frame behind the first big one (in order)
-                    if let Some(first) = frames[live..t].iter().position(|f| f.verdict == Verdict::Transmit && f.offload.gso_size > 0) {
-                        for f in frames[live + first..t].iter_mut().filter(|f| f.verdict == Verdict::Transmit) {
+                    if let Some(first) = frames[live..t_egress].iter().position(|f| f.verdict == Verdict::Transmit && f.offload.gso_size > 0) {
+                        for f in frames[live + first..t_egress].iter_mut().filter(|f| f.verdict == Verdict::Transmit) {
                             for p in devices::plain(f.data(), f.offload) {
                                 k.injected.push_back((f.nic, i32::MAX, p, Offload::default()));
                             }
                             f.verdict = Verdict::Consumed;
                         }
                     }
-                    for f in frames[live..t].iter_mut().filter(|f| f.verdict == Verdict::Transmit && f.offload.csum_partial) {
+                    for f in frames[live..t_egress].iter_mut().filter(|f| f.verdict == Verdict::Transmit && f.offload.csum_partial) {
                         rustros_util::offload::complete_csum(f.data_mut());
                         f.offload = Offload::default();
                     }
                 }
-                modules::call(k, slots, id, |app, ctx| app.on_egress(ctx, &mut frames[live..t]));
+                modules::call(k, slots, id, |app, ctx| app.on_egress(ctx, &mut frames[live..t_egress]));
             }
         }
     }
+    t = stages::add(stages::EGRESS, t);
     // frames to send: (pool slot, start, length, NIC, offloads)
     let mut out = [(0u8, 0usize, 0usize, 0usize, Offload::default()); BATCH];
     let mut sends = 0;
@@ -767,14 +778,17 @@ fn process_batch(k: &mut Kernel, slots: &mut [Slot], pool: &mut [devices::Buf], 
         st.input(&mut link, f.nic as usize, f.data());
     }
     drop(frames);
+    t = stages::add(stages::STACK, t);
     // zero copy: the buffers themselves go onto the TX rings (a spare one
     // comes back into the pool slot)
     for &(slot, start, len, phys, off) in &out[..sends] {
         k.nics[phys].send_swap(&mut pool[slot as usize], start, len, off);
     }
+    t = stages::add(stages::TX, t);
     for nic in k.nics.iter_mut() {
         nic.flush();
     }
+    stages::add(stages::FLUSH, t);
 }
 
 #[panic_handler]

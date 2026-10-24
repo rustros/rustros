@@ -92,9 +92,11 @@ impl TxQ {
             // full: make sure the device is draining it, and give it a moment
             // (dropping costs more than waiting while the CPU has time)
             self.q.notify();
+            stats.kicks += 1;
             self.kick = 0;
             stats.tx_wait += 1;
-            let until = rdtsc() + tsc_per_ms * TX_WAIT_US / 1000;
+            let t0 = rdtsc();
+            let until = t0 + tsc_per_ms * TX_WAIT_US / 1000;
             loop {
                 self.reclaim();
                 if !self.free.is_empty() {
@@ -102,22 +104,24 @@ impl TxQ {
                 }
                 if rdtsc() > until {
                     stats.tx_full += 1;
+                    stats.tx_wait_tsc += rdtsc() - t0;
                     return None;
                 }
                 core::hint::spin_loop();
             }
+            stats.tx_wait_tsc += rdtsc() - t0;
         }
         self.free.pop()
     }
 
     /// Queue descriptor `id` for `buf[at..at + len]` (header included).
-    fn post(&mut self, id: u16, buf: Buf, at: usize, len: usize) {
+    fn post(&mut self, id: u16, buf: Buf, at: usize, len: usize, stats: &mut devices::DevStats) {
         self.q.set_desc(id, buf.as_ptr() as u64 + at as u64, len as u32, 0, 0);
         self.inflight[id as usize] = Some(buf);
         self.q.push(id);
         self.kick += 1;
         if self.kick >= 32 {
-            self.q.kick();
+            stats.kicks += self.q.kick() as u64;
             self.kick = 0;
         }
     }
@@ -374,7 +378,7 @@ impl devices::NetDevice for VirtioNet {
         let mut b = t.spare.pop().expect("one spare per free slot");
         b[HEADROOM - self.hdr..HEADROOM].fill(0);
         b[HEADROOM..HEADROOM + len].copy_from_slice(&frame[..len]);
-        t.post(id, b, HEADROOM - self.hdr, self.hdr + len);
+        t.post(id, b, HEADROOM - self.hdr, self.hdr + len, &mut self.stats);
         self.stats.tx_pkts += 1;
         self.stats.tx_bytes += len as u64;
         true
@@ -413,7 +417,7 @@ impl devices::NetDevice for VirtioNet {
             }
         }
         let frame = core::mem::replace(buf, t.spare.pop().expect("one spare per free slot"));
-        t.post(id, frame, start - self.hdr, self.hdr + len);
+        t.post(id, frame, start - self.hdr, self.hdr + len, &mut self.stats);
         self.stats.tx_pkts += 1;
         self.stats.tx_bytes += len as u64;
         true
@@ -518,11 +522,11 @@ impl devices::NetDevice for VirtioNet {
 
     fn flush(&mut self) {
         for r in self.rx.iter_mut().filter(|r| r.kick) {
-            r.q.kick();
+            self.stats.kicks += r.q.kick() as u64;
             r.kick = false;
         }
         for t in self.tx.iter_mut().filter(|t| t.kick != 0) {
-            t.q.kick();
+            self.stats.kicks += t.q.kick() as u64;
             t.kick = 0;
         }
     }

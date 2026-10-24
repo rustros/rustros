@@ -16,6 +16,8 @@ bench = false
 [features]
 # none by default: rescue, dhcp and the updater are boot modules (see bootmods.rs)
 default = []
+# measurement builds: cycle counters per stage of the packet path (stages.rs)
+stages = []
 
 [dependencies]
 rustros-api = { path = "../api" }
