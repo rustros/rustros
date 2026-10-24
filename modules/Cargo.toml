@@ -2,7 +2,7 @@
 # unlike the kernel). Built by `make modules`; each module is a static-pie
 # ELF whose entry point is rustros_module_init.
 [workspace]
-members = ["support", "echo", "crashy", "httpd", "shell", "nat", "l2tp", "router", "cake", "wasm", "webadmin", "wireguard", "proxy", "anytls", "panel", "sites", "ext4", "boot", "netstack", "storage", "modman", "virtio"]
+members = ["support", "echo", "crashy", "httpd", "shell", "nat", "l2tp", "router", "cake", "wasm", "webadmin", "wireguard", "proxy", "anytls", "panel", "sites", "ext4", "boot", "netstack", "storage", "modman", "virtio", "linux"]
 resolver = "3"
 
 [workspace.package]
@@ -116,12 +116,16 @@ opt-level = 3
 [profile.release.package.netstack]
 opt-level = "s"
 
-# The boot modules (`make bootmods`): all for size but the NIC and disk
-# driver, so the kernel image with them fits the deployed boxes' 256 KiB
+# The boot modules (`make bootmods`): all for size (-Oz) but the NIC and
+# disk driver, so the kernel image with them fits the deployed boxes' 256 KiB
 # kernel slots. Their network stack only has to get the system online and
 # fetch modules: the full-speed one (the `netstack` module, cached on the
 # disk) replaces it at every boot.
 [profile.boot]
 inherits = "release"
 [profile.boot.package.tcpip]
-opt-level = "s"
+opt-level = "z"
+[profile.boot.package.netstack]
+opt-level = "z"
+[profile.boot.package.rustros-util]
+opt-level = "z"

@@ -558,6 +558,25 @@ pub trait Admin: Base {
     fn module_config(&mut self, name: &str) -> Vec<(String, String)>;
     /// Set (or with None remove) one setting of a module.
     fn module_config_set(&mut self, name: &str, key: &str, value: Option<&str>) -> Result<(), String>;
+    /// Start a user-mode process running the ELF program `image` with
+    /// `args` (argv[0] first); its pid.
+    fn spawn(&mut self, image: &[u8], args: &[&str]) -> Result<u32, String>;
+    fn processes(&self) -> Vec<ProcInfo>;
+    /// End a process (and what it holds); false if there is none.
+    fn kill(&mut self, pid: u32) -> bool;
+}
+
+/// A user-mode process, for listings.
+pub struct ProcInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: String,
+    /// "running", "waiting", "exited 3", ...
+    pub state: String,
+    /// resident memory, in KiB
+    pub mem_kib: u64,
+    /// CPU time used, in ms
+    pub cpu_ms: u64,
 }
 
 /// An application. All methods except `name` have defaults, so an app only

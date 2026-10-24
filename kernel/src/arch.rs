@@ -153,6 +153,12 @@ extern "C" fn isr_handler(f: &mut Frame) {
         0..=31 => {
             let cr2: u64;
             unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) }
+            // a user-mode process's fault: the process's problem (proc.rs)
+            if f.cs & 3 == 3 {
+                // Safety: interrupts are off; read by the main loop afterwards
+                unsafe { *FAULT.get() = (f.vector, f.err, cr2) };
+                return;
+            }
             // in an installed module's code: pinned on it, whoever called it
             if let Some(name) = crate::loader::owner_of(f.rip) {
                 crate::modules::set_current_native(Some(name));
@@ -184,6 +190,9 @@ extern "C" fn isr_handler(f: &mut Frame) {
             if (33..48).contains(&v) {
                 crate::drivers::ack_irq((v - 32) as u8);
             }
+            if v >= 48 {
+                return; // a local-APIC one, acknowledged already (isr_other)
+            }
             unsafe {
                 if v >= 40 {
                     outb(0xA0, 0x20);
@@ -191,6 +200,109 @@ extern "C" fn isr_handler(f: &mut Frame) {
                 outb(0x20, 0x20);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- user mode
+
+/// The last fault of a user-mode process: (vector, error code, CR2).
+pub static FAULT: Global<(u64, u64, u64)> = Global::new((0, 0, 0));
+
+/// What a user-mode process had in its registers when it stopped
+/// (boot.rs's user_enter / syscall_entry / user_trap use this layout).
+#[repr(C)]
+#[derive(Clone, Default)]
+pub struct UserRegs {
+    pub rax: u64, pub rbx: u64, pub rcx: u64, pub rdx: u64, pub rsi: u64, pub rdi: u64, pub rbp: u64,
+    pub r8: u64, pub r9: u64, pub r10: u64, pub r11: u64, pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
+    pub rip: u64, pub rflags: u64, pub rsp: u64,
+}
+
+/// Why `user_enter` came back.
+pub const BY_SYSCALL: u64 = 1;
+pub const BY_INTERRUPT: u64 = 2;
+pub const BY_FAULT: u64 = 3;
+
+unsafe extern "C" {
+    /// Run the process whose registers `regs` holds (its address space
+    /// active) until a system call, an interrupt or a fault; the reason.
+    /// Called with interrupts off; returns with them off.
+    pub fn user_enter(regs: *mut UserRegs) -> u64;
+    fn syscall_entry();
+    static mut cur_regs: *mut UserRegs;
+}
+
+/// An interrupt or fault in user mode (from boot.rs, on the TSS stack): the
+/// registers go into the process's UserRegs.
+#[unsafe(no_mangle)]
+extern "C" fn user_trap(f: &Frame) -> u64 {
+    // Safety: user_enter set it; interrupts are off
+    let r = unsafe { &mut *cur_regs };
+    *r = UserRegs {
+        rax: f.rax, rbx: f.rbx, rcx: f.rcx, rdx: f.rdx, rsi: f.rsi, rdi: f.rdi, rbp: f.rbp,
+        r8: f.r8, r9: f.r9, r10: f.r10, r11: f.r11, r12: f.r12, r13: f.r13, r14: f.r14, r15: f.r15,
+        rip: f.rip, rflags: f.rflags, rsp: f.rsp,
+    };
+    if f.vector < 32 { BY_FAULT } else { BY_INTERRUPT }
+}
+
+/// 64-bit TSS: only rsp0 matters (the stack interrupts from user mode use).
+#[repr(C, packed)]
+struct Tss {
+    _r0: u32,
+    rsp0: u64,
+    _rest: [u64; 11],
+    _r1: u16,
+    iomap: u16,
+}
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static TRAP_STACK: Global<Stack> = Global::new(Stack([0; 16384]));
+static TSS: Global<Tss> = Global::new(Tss { _r0: 0, rsp0: 0, _rest: [0; 11], _r1: 0, iomap: 104 });
+/// kernel code 0x08, kernel data 0x10, (0x18 unused), user data 0x20, user
+/// code 0x28, TSS 0x30
+static GDT: Global<[u64; 8]> = Global::new([0, 0x00AF_9A00_0000_FFFF, 0x00CF_9200_0000_FFFF, 0, 0x00CF_F200_0000_FFFF, 0x00AF_FA00_0000_FFFF, 0, 0]);
+
+pub fn write_fs_base(v: u64) {
+    unsafe { wrmsr(0xC000_0100, v) }
+}
+
+/// Segments, TSS and `syscall` for user mode; SSE on (user code uses it;
+/// the kernel is soft-float) and NX pages.
+pub fn init_user_mode() {
+    unsafe {
+        let tss = TSS.get();
+        tss.rsp0 = TRAP_STACK.get().0.as_ptr() as u64 + 16384;
+        let base = tss as *const Tss as u64;
+        let gdt = GDT.get();
+        gdt[6] = 103 | (base & 0xFF_FFFF) << 16 | 0x89 << 40 | (base >> 24 & 0xFF) << 56;
+        gdt[7] = base >> 32;
+        let ptr = IdtPtr { limit: 63, base: gdt.as_ptr() as u64 };
+        asm!(
+            "lgdt [{p}]",
+            "push 0x08",
+            "lea {t}, [rip + 2f]",
+            "push {t}",
+            "retfq",
+            "2:",
+            "mov {t:e}, 0x10",
+            "mov ds, {t:e}",
+            "mov es, {t:e}",
+            "mov ss, {t:e}",
+            "mov {t:e}, 0x30",
+            "ltr {t:x}",
+            p = in(reg) &ptr, t = out(reg) _,
+        );
+        wrmsr(0xC000_0080, rdmsr(0xC000_0080) | 1 | 1 << 11); // EFER: SCE, NXE
+        wrmsr(0xC000_0081, 0x18 << 48 | 0x08 << 32); // STAR
+        wrmsr(0xC000_0082, syscall_entry as *const () as u64); // LSTAR
+        wrmsr(0xC000_0084, 0x4_7700); // SFMASK: TF IF DF NT AC
+        asm!(
+            "mov {t}, cr0", "and {t}, ~4", "or {t}, 2", "mov cr0, {t}",
+            "mov {t}, cr4", "or {t}, 0x600", "mov cr4, {t}",
+            t = out(reg) _, options(nostack),
+        );
     }
 }
 

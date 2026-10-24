@@ -266,6 +266,14 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
             apply_runtime(k, slots, matches!(op, ModOp::Start(_)));
             continue;
         }
+        // the system calls' module
+        if k.syscalls.as_ref().is_some_and(|s| s.0 == name) {
+            k.syscalls = None;
+            kprintln!("modules: {} stopped (processes have no system calls until it is back)", name);
+            if matches!(op, ModOp::Stop(_)) {
+                continue;
+            }
+        }
         // a module that replaced services: the boot image's come back
         if matches!(op, ModOp::Stop(_)) && crate::services::provides(k, name) {
             match crate::services::revert(k, name) {
@@ -312,6 +320,11 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
                 unsafe { *CURRENT_NATIVE.get() = None };
                 match r {
                     Ok(m) if matches!(m.export, Some(Export::Module(_))) => Slot::Native(m),
+                    Ok(m) if matches!(m.export, Some(Export::Syscalls(_))) => {
+                        kprintln!("modules: {} started (system calls, {} KiB)", name, image.len() / 1024);
+                        k.syscalls = Some((leaked, m));
+                        continue;
+                    }
                     Ok(m) if crate::services::is_service(&m) => {
                         if let Err(e) = crate::services::start(k, leaked, m) {
                             kprintln!("modules: {}: {}", name, e);
@@ -353,6 +366,14 @@ pub fn apply(k: &mut Kernel, slots: &mut Vec<Slot>) {
         kprintln!("modules: {} started ({}, {} KiB)", name, kind.as_str(), image.len() / 1024);
         k.app_status.push(ModuleStatus { name: leaked, kind, state: String::from("running"), restarts: 0, params, version });
         call(k, slots, id, |app, ctx| app.start(ctx));
+    }
+}
+
+/// The system calls' module, if one is installed.
+pub fn syscalls<'a>(m: &'a mut Option<(&'static str, loader::Module)>) -> Option<&'a mut dyn rustros_api::module::Syscalls> {
+    match m.as_mut()?.1.export.as_mut()? {
+        Export::Syscalls(s) => Some(s.as_mut()),
+        _ => None,
     }
 }
 

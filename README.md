@@ -11,7 +11,7 @@
 ## 目录结构
 
 ```
-kernel/        HAL（启动、CPU、内存、控制台、PCI、看门狗）+ 组装和调度、模块加载、服务替换（services.rs）   ← 唯一含 unsafe 的地方
+kernel/        HAL（启动、CPU、内存、控制台、PCI、看门狗）+ 组装和调度、模块加载、服务替换（services.rs）、用户态进程（proc.rs/vm.rs/frames.rs：ring 3、每进程地址空间、按需分页、写时复制）   ← 唯一含 unsafe 的地方
 api/           rustros-api：应用接口 App/Sys、类型、错误码、WebAssembly ABI（无依赖）
 util/          rustros-util：给应用用的工具：Conn、地址和报文工具、SHA-256/HMAC
 devices/       设备接口：BlockDevice、NetDevice
@@ -24,7 +24,9 @@ virtio/        virtio-pci 传输层、PCI 配置空间、virtio-blk 和 virtio-n
 slots/         A/B 内核槽位 + grubenv（在线更新、试启动、回滚）
 wasmhost/      WebAssembly 运行时（wasmi），可选：`make WASM=0` 不带它
 apps/          原生应用：shell、echo、httpd、updater
+user/          用户态测试程序（单独的 workspace）：无 libc 的静态 ELF，发 Linux x86-64 系统调用（hello、badptr、spin、forktest）
 wasm/          WebAssembly 应用（单独的 workspace）：guest 库 + 示例 echo、crashy
+modules 里另有：linux（用户态进程的 Linux 系统调用），netstack/storage/modman/virtio（替换启动镜像里的同类服务）
 tools/         mkimg.py 生成 raw 盘；pack.py 把内核打成自解压 ELF（LZ4）以放进 256 KiB 槽位；rustros-update.py 在线更新/管理客户端
 ```
 
@@ -154,6 +156,18 @@ tools/rustros-update.py HOST info     # 运行时长、槽位、地址、存储�
 
 **无损扩容。** 槽不够大时，`rustros-update.py HOST esp-grow 8 1024` 把 ESP 在线扩到 8 MiB、槽扩到 1 MiB，数据分区不动：先在 ESP 后面的空闲启动区（64 MiB 以内）写好一份更大的新 ESP（GRUB、grub.cfg、grubenv、两个槽里的内核原样拷过去，只改 grub.cfg 里的扇区号），读回校验，再只改 GPT 里 ESP 那一项的位置，然后重启。切换之前断电，用的还是旧 ESP；切换之后断电，用的是已经校验过的新 ESP。分区编号和 GUID 不变，BIOS 和 UEFI 都照常找到它。
 
+## 用户态进程（ring 3）
+
+容器里的 Linux 程序需要真正的进程：ring 3、每个进程独立的地址空间、Linux 系统调用。这些机制在内核里（`proc.rs`、`vm.rs`、`frames.rs`），系统调用的具体实现在可热替换的 `linux` 模块里。
+
+- **数据面优先：** 进程只在主循环本来要睡觉时才运行；任何中断（网卡、1ms 时钟）立刻把 CPU 交还给主循环。一个进程死循环也不会拖慢转发或控制台。
+- **地址空间：** 内核的映射（恒等映射、设备：PML4 前 128 项）在所有进程里相同；用户区（64 TiB 以上）每个进程各自用 4 KiB 页。内存按需清零分配，`fork` 时写时复制。
+- **系统调用：** 内核只接 `syscall`、保存寄存器、把编号和参数交给 `linux` 模块（号和 errno 都按 Linux x86-64）。进程状态在内核，所以模块能在进程运行中替换。
+- **故障隔离：** 进程访问了不该碰的内存只杀它自己，整机不受影响。崩溃的进程不影响内核。
+- **管理：** `rustros-update.py HOST run <程序> [参数...]` 启动一个进程，`ps` 列出，`kill <pid>` 结束。
+- **现在有的系统调用：** 控制台输出（fd 1/2）、`mmap`（匿名）/`munmap`/`brk`、`fork`/`wait4`/`exit`、`arch_prctl`、`uname`、`clock_gettime`、若干查询；其余返回 `ENOSYS`。文件、信号、线程等随 M2/M3 补齐。
+- **测试：** `proc_test.py`（BIOS 和 UEFI）：ring 3 跑程序、fork/wait/写时复制、坏指针只杀进程、死循环下转发照常、运行中替换 `linux` 模块。测试程序在 `user/`，`make user` 编译。
+
 ## 服务的热替换
 
 启动镜像里的服务（驱动、存储、协议栈、模块管理）都可以在运行中换成新版本，不用重启。做法和安装应用一样：用 `module-install` 装一个导出同类服务的模块。
@@ -257,10 +271,10 @@ pub trait App {
 模块可以在运行中替换，内核只能靠重启更换，所以内核里的每一行代码都是"改了就得重启"的代码。衡量内核的标准是"多久需要改一次"，而不只是字节数。
 
 1. **内核只放机制，不放策略和功能**：
-   - 留在内核：内存管理、中断、调度核心、系统调用入口和分发、模块加载与替换、数据包路径最底层的收发。
+   - 留在内核：内存管理、中断、调度核心、系统调用入口和分发、模块加载与替换、数据包路径最底层的收发；用户态进程的机制（地址空间、物理内存、fork/exec/wait、按需分页和写时复制）也在内核，这样系统调用模块可以在进程运行中替换。
    - 做成可热替换的模块：协议栈、网络配置、驱动、存储、文件系统（VFS、ext4）、Linux 兼容层、容器运行时、控制台、各种应用，以及具体的包处理逻辑（包处理模块）。
    - 继续瘦身是日常收敛的一部分，优先把将来会经常改动的代码移出内核。
-2. **系统调用**：内核里只做入口和分发，Linux 系统调用的具体实现放在可热更新的兼容层模块里，它会是以后改动最频繁的部分。
+2. **系统调用**：内核里只做入口和分发（`syscall` 进入，进程状态在内核），Linux 系统调用的具体实现放在可热更新的 `linux` 模块里（`rustros_api::module::Syscalls`），它会是以后改动最频繁的部分。
 3. **有状态的模块要有热更新策略**，在设计接口时就定下来：
    - 无状态的直接替换；
    - 把状态交接给新版本（例如替换协议栈时，已有的 TCP 连接不断）；

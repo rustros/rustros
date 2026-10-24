@@ -88,7 +88,7 @@ def command(host, port, key, cmd, payload=b"", encrypt=False):
     reply = b""
     try:
         # 'I' and listings send several lines and close; the others answer one line
-        while cmd in (b"I", b"E", b"N", b"L") or not reply.endswith(b"\n"):
+        while cmd in (b"I", b"E", b"N", b"L", b"J") or not reply.endswith(b"\n"):
             chunk = s.recv(256)
             if not chunk:
                 break
@@ -384,7 +384,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("host")
     ap.add_argument("action", choices=["status", "upload", "confirm", "reboot", "poweroff", "info", "net", "log",
-                                       "module-install", "module-remove", "module-switch", "module-config",
+                                       "module-install", "module-remove", "module-switch", "module-config", "run", "ps", "kill",
                                        "wasm-install", "wasm-remove", "esp-get", "esp-put", "esp-grow"])
     ap.add_argument("image", nargs="?", help="kernel image, or the module name for module-*")
     ap.add_argument("module", nargs="?", help="module file (module-install), native|wasm, or the setting's key (module-config)")
@@ -462,6 +462,19 @@ def main():
         if not a.image:
             sys.exit(f"{a.action} needs a FILE")
         sys.exit(esp(a, key))
+    if a.action == "run":
+        if not a.image:
+            sys.exit("run needs a program file (and its arguments)")
+        args = [os.path.basename(a.image)] + [w for w in [a.module, *a.value] if w]
+        payload = bytes([len(args)]) + b"".join(bytes([len(x.encode())]) + x.encode() for x in args) + open(a.image, "rb").read()
+        reply, _, _ = command(a.host, a.port, key, b"G", payload)
+        print(reply)
+        sys.exit(0 if reply.startswith("OK") else 1)
+    if a.action in ("ps", "kill"):
+        words = [a.action] + [w for w in [a.image] if w]
+        reply, _, _ = command(a.host, a.port, key, b"J", " ".join(words).encode())
+        print(reply, end="" if reply.endswith("\n") else "\n")
+        sys.exit(1 if reply.startswith("ERR") else 0)
     if a.action == "log":
         words = [w for w in [a.image, a.module, *a.value] if w]
         reply, _, _ = command(a.host, a.port, key, b"L", " ".join(words).encode())

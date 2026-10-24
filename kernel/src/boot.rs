@@ -137,8 +137,12 @@ isr_common:
     push %r13
     push %r14
     push %r15
+    cld
     mov %rsp, %rdi
     call isr_handler
+    /* from user mode: the process stops here, back to the main loop */
+    testb $3, 144(%rsp)
+    jnz from_user
     pop %r15
     pop %r14
     pop %r13
@@ -156,15 +160,101 @@ isr_common:
     pop %rax
     add $16, %rsp
     iretq
+from_user:
+    mov %rsp, %rdi
+    call user_trap
+    jmp kernel_resume
 
-/* vectors >= 48: nothing of ours, just ack a possible local-APIC interrupt */
+/* vectors >= 48: nothing of ours, just ack a possible local-APIC interrupt
+   (device MSIs); from user mode the process stops too */
     .global isr_other
 isr_other:
     push %rax
     mov $0xFEE000B0, %rax
     movl $0, (%rax)
     pop %rax
+    testb $3, 8(%rsp)
+    jnz 1f
     iretq
+1:  push $0
+    push $255
+    jmp isr_common
+
+/* ---- user mode (proc.rs): user_enter(regs) runs the process until a
+   system call, an interrupt or a fault, then returns the reason (1, 2, 3)
+   on the main loop's stack. UserRegs: rax rbx rcx rdx rsi rdi rbp r8-r15
+   (0..112), rip 120, rflags 128, rsp 136. */
+    .global user_enter
+user_enter:
+    push %rbx
+    push %rbp
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    mov %rsp, kctx_rsp(%rip)
+    mov %rdi, cur_regs(%rip)
+    pushq $0x23
+    pushq 136(%rdi)
+    pushq 128(%rdi)
+    pushq $0x2B
+    pushq 120(%rdi)
+    mov 0(%rdi), %rax
+    mov 8(%rdi), %rbx
+    mov 16(%rdi), %rcx
+    mov 24(%rdi), %rdx
+    mov 32(%rdi), %rsi
+    mov 48(%rdi), %rbp
+    mov 56(%rdi), %r8
+    mov 64(%rdi), %r9
+    mov 72(%rdi), %r10
+    mov 80(%rdi), %r11
+    mov 88(%rdi), %r12
+    mov 96(%rdi), %r13
+    mov 104(%rdi), %r14
+    mov 112(%rdi), %r15
+    mov 40(%rdi), %rdi
+    iretq
+
+/* back on the main loop's stack, out of user_enter with eax = reason */
+kernel_resume:
+    mov kctx_rsp(%rip), %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbp
+    pop %rbx
+    ret
+
+/* `syscall` (Linux ABI): rcx = return address, r11 = rflags, interrupts
+   off (SFMASK); the registers go into the process's UserRegs */
+    .global syscall_entry
+syscall_entry:
+    mov %rsp, user_rsp(%rip)
+    mov cur_regs(%rip), %rsp
+    mov %rax, 0(%rsp)
+    mov %rbx, 8(%rsp)
+    mov %rcx, 16(%rsp)
+    mov %rdx, 24(%rsp)
+    mov %rsi, 32(%rsp)
+    mov %rdi, 40(%rsp)
+    mov %rbp, 48(%rsp)
+    mov %r8, 56(%rsp)
+    mov %r9, 64(%rsp)
+    mov %r10, 72(%rsp)
+    mov %r11, 80(%rsp)
+    mov %r12, 88(%rsp)
+    mov %r13, 96(%rsp)
+    mov %r14, 104(%rsp)
+    mov %r15, 112(%rsp)
+    mov %rcx, 120(%rsp)
+    mov %r11, 128(%rsp)
+    mov user_rsp(%rip), %rax
+    mov %rax, 136(%rsp)
+    cld
+    mov $1, %eax
+    jmp kernel_resume
 
     .section .rodata
     .balign 8
@@ -184,6 +274,10 @@ gdt64_ptr:
     .long gdt64
 
     .section .bss
+    .balign 8
+kctx_rsp: .skip 8
+cur_regs: .skip 8
+user_rsp: .skip 8
     .balign 4096
     .global boot_pml4, boot_pdpt
 boot_pml4: .skip 4096

@@ -1,0 +1,15 @@
+[package]
+name = "hello"
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rt = { path = "../rt" }

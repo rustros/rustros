@@ -22,6 +22,22 @@ pub struct BootInfo {
     pub efi: bool,
     /// Copy of the ACPI RSDP (tag 14 or 15)
     pub rsdp: Option<&'static [u8]>,
+    /// The memory map's entries (tag 6): base, length, type (1: RAM)
+    pub mmap: &'static [u8],
+    pub mmap_entry: usize,
+    /// Where this structure is: (address, bytes)
+    pub at: (u64, u64),
+}
+
+impl BootInfo {
+    /// The usable RAM: (base, length).
+    pub fn ram(&self) -> impl Iterator<Item = (u64, u64)> + Clone + '_ {
+        self.mmap.chunks_exact(self.mmap_entry.max(24)).filter(|e| rd32(e, 16) == 1).map(|e| (rd64(e, 0), rd64(e, 8)))
+    }
+}
+
+fn rd64(b: &[u8], o: usize) -> u64 {
+    rd32(b, o) as u64 | (rd32(b, o + 4) as u64) << 32
 }
 
 fn rd32(b: &[u8], o: usize) -> u32 {
@@ -29,7 +45,7 @@ fn rd32(b: &[u8], o: usize) -> u32 {
 }
 
 pub fn parse(magic: u32, info: u32) -> BootInfo {
-    let mut bi = BootInfo { cmdline: &[], fb: None, efi: false, rsdp: None };
+    let mut bi = BootInfo { cmdline: &[], fb: None, efi: false, rsdp: None, mmap: &[], mmap_entry: 24, at: (0, 0) };
     if magic != MAGIC || info == 0 {
         return bi;
     }
@@ -37,6 +53,7 @@ pub fn parse(magic: u32, info: u32) -> BootInfo {
     // which nothing else overwrites.
     let total = unsafe { (info as *const u32).read() } as usize;
     let b: &'static [u8] = unsafe { core::slice::from_raw_parts(info as *const u8, total) };
+    bi.at = (info as u64, total as u64);
     let mut o = 8;
     while o + 8 <= b.len() {
         let ty = rd32(b, o);
@@ -63,6 +80,10 @@ pub fn parse(magic: u32, info: u32) -> BootInfo {
                     green: (c(34), c(35)),
                     blue: (c(36), c(37)),
                 });
+            }
+            6 if size >= 16 => {
+                bi.mmap_entry = rd32(t, 8) as usize;
+                bi.mmap = &t[16..];
             }
             11 | 12 => bi.efi = true,
             // prefer the ACPI 2.0 RSDP (XSDT) when both are there

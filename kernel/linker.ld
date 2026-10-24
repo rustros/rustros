@@ -22,5 +22,6 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
     } :zero
+    __kernel_end = .;
     /DISCARD/ : { *(.comment) *(.note .note.*) *(.eh_frame*) }
 }

@@ -1,0 +1,22 @@
+# Test programs for user mode (ring 3): static ELF executables without a
+# libc, built by `make user` into build/user/. They make Linux x86-64
+# system calls (the `linux` module answers them).
+[workspace]
+members = ["rt", "hello", "badptr", "spin", "forktest"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+panic = "abort"

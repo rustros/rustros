@@ -1,0 +1,7 @@
+[build]
+target = "x86_64-unknown-none"
+
+# static position-independent executables: the kernel puts them at the PIE
+# base in the user range, rt applies their relocations at start
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=pie", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-z", "-C", "link-arg=norelro", "-C", "link-arg=--entry=_start"]

@@ -5,6 +5,7 @@
 #   make update HOST=...  push the current kernel to a running RustROS
 #   make wasm             build the WebAssembly modules in wasm/ into build/wasm/
 #   make modules          build the native modules in modules/ into build/modules/
+#   make user             build the user-mode test programs in user/ into build/user/
 #
 # Default network settings written into grub.cfg (IP= empty: set them on the
 # console with 'ip' + 'save'; saved settings always win):
@@ -40,7 +41,7 @@ QEMU := qemu-system-x86_64 -m 256 -serial stdio \
 	-drive file=$(IMG),format=raw,if=virtio \
 	-nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:9000-:9000,hostfwd=tcp:127.0.0.1:7777-:7
 
-.PHONY: all kernel bootmods disk-modules $(PACKED) wasm modules run-bios run-uefi update clean
+.PHONY: all kernel bootmods disk-modules $(PACKED) wasm modules user run-bios run-uefi update clean
 all: $(IMG)
 
 kernel:
@@ -74,6 +75,11 @@ modules:
 	@mkdir -p build/modules
 	@for f in modules/target/x86_64-unknown-none/release/*; do \
 		[ -f "$$f" ] && [ -x "$$f" ] && [ "$$(basename $$f)" != boot ] && cp "$$f" build/modules/$$(basename $$f).mod; done; ls build/modules
+
+user:
+	cd user && cargo build --release
+	@mkdir -p build/user
+	@for p in hello badptr spin forktest; do cp user/target/x86_64-unknown-none/release/$$p build/user/$$p; done
 
 run-bios: $(IMG)
 	$(QEMU)

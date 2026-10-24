@@ -151,7 +151,7 @@ impl Session {
                             say!(sys, "updater: receiving {} bytes into slot {}\n", len, target);
                             self.phase = Phase::Body { cmd, left: len, mac, first: true, buf: None };
                         }
-                        b'W' | b'X' | b'S' | b'K' | b'Q' | b'E' | b'N' if (1..=MAX_MODULE).contains(&len) => {
+                        b'W' | b'X' | b'S' | b'K' | b'Q' | b'E' | b'N' | b'G' | b'J' if (1..=MAX_MODULE).contains(&len) => {
                             self.phase = Phase::Body { cmd, left: len, mac, first: false, buf: Some(Vec::new()) };
                         }
                         b'L' if (1..=64).contains(&len) => self.phase = Phase::Body { cmd, left: len, mac, first: false, buf: Some(Vec::new()) },
@@ -261,6 +261,42 @@ impl Session {
                                 }
                                 Err(e) => self.finish(&alloc::format!("ERR {e}\n")),
                             }
+                            return None;
+                        }
+                        b'G' => {
+                            // a program: its arguments (count, then each with its length), the ELF
+                            let mut args = Vec::new();
+                            let mut at = 1;
+                            for _ in 0..payload[0] {
+                                let n = payload.get(at).copied().unwrap_or(0) as usize;
+                                args.push(String::from_utf8_lossy(payload.get(at + 1..at + 1 + n).unwrap_or(&[])).into_owned());
+                                at += 1 + n;
+                            }
+                            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                            let image = payload.get(at..).unwrap_or(&[]);
+                            match sys.admin().map_or(Err(String::from("not permitted")), |a| a.spawn(image, &argv)) {
+                                Ok(pid) => self.finish(&alloc::format!("OK {pid}\n")),
+                                Err(e) => self.finish(&alloc::format!("ERR {e}\n")),
+                            }
+                            return None;
+                        }
+                        b'J' => {
+                            // the processes: "ps", "kill <pid>"
+                            let text = String::from_utf8_lossy(&payload).into_owned();
+                            let mut w = text.split_whitespace();
+                            let reply = match (sys.admin(), w.next(), w.next().and_then(|p| p.parse().ok())) {
+                                (None, _, _) => String::from("ERR not permitted\n"),
+                                (Some(a), Some("kill"), Some(pid)) => String::from(if a.kill(pid) { "OK\n" } else { "ERR no such process\n" }),
+                                (Some(a), Some("ps"), _) => {
+                                    let mut r = String::from("  PID  PPID  MEM KiB  CPU ms  STATE        NAME\n");
+                                    for p in a.processes() {
+                                        r += &alloc::format!("{:>5} {:>5} {:>8} {:>7}  {:<12} {}\n", p.pid, p.ppid, p.mem_kib, p.cpu_ms, p.state, p.name);
+                                    }
+                                    r
+                                }
+                                _ => String::from("ERR ps | kill <pid>\n"),
+                            };
+                            self.finish(&reply);
                             return None;
                         }
                         b'L' => {

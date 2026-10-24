@@ -4,3 +4,4 @@
 /wasm/target
 __pycache__/
 *.pyc
+/user/target

@@ -11,7 +11,10 @@ mod drivers;
 mod modules;
 mod klog;
 mod perf;
+mod frames;
+mod proc;
 mod services;
+mod vm;
 mod acpi;
 mod arch;
 mod boot;
@@ -209,6 +212,7 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
     arch::init_clock();
     arch::init_wall_clock();
     arch::init_interrupts();
+    arch::init_user_mode();
     let t0 = arch::now_ms();
     while arch::now_ms() - t0 < 20 {
         arch::wait_for_interrupt_or_spin();
@@ -256,6 +260,15 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
         Some(Err(e)) => kprintln!("modules: boot modules: {}", e),
         None => kprintln!("modules: the kernel image carries no boot modules"),
     }
+
+    // the RAM the kernel and the boot modules do not use: for processes
+    unsafe extern "C" {
+        static __kernel_end: u8;
+    }
+    let kernel_end = &raw const __kernel_end as u64;
+    let bundle = bootmods::bundle().map_or((0, 0), |b| (b.as_ptr() as u64, b.as_ptr() as u64 + b.len() as u64));
+    frames::init(bi.ram(), &[(0, kernel_end), bundle, (bi.at.0, bi.at.0 + bi.at.1)]);
+    kprintln!("memory: {} MiB for processes", frames::stats().1 >> 8);
 
     // the drivers take their devices: disks now, NICs once grubenv is readable
     let mut pci = Vec::new();
@@ -493,7 +506,8 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             arch::cli();
             if k.nics.iter().any(|n| n.rx_pending()) {
                 arch::sti();
-            } else {
+            } else if !proc::run(&mut k.procs, modules::syscalls(&mut k.syscalls)) {
+                // nothing to run: sleep until the next interrupt
                 let t = arch::rdtsc();
                 arch::wait_for_interrupt();
                 k.perf.idle_tsc += arch::rdtsc() - t;

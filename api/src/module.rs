@@ -63,6 +63,9 @@ pub enum Export {
     NetStack(Box<dyn NetStack>),
     /// The installed modules' bookkeeping (a boot module's).
     Manager(Box<dyn ModManager>),
+    /// The system calls of user-mode processes (the Linux compatibility
+    /// layer, an installed module).
+    Syscalls(Box<dyn Syscalls>),
 }
 
 /// A file system driver, a module of its own. The kernel lends it the files
@@ -536,4 +539,62 @@ pub trait ModManager {
     /// The queued operations, in format `version`.
     fn save_state(&self, version: u32) -> Option<Vec<u8>>;
     fn load_state(&mut self, state: &[u8]) -> Result<(), String>;
+}
+
+// ---------------------------------------------------------------- user-mode processes
+
+/// What a system call returns to the kernel.
+pub enum Sysret {
+    /// The value for the caller's rax (a negative errno for an error).
+    Value(i64),
+    /// The caller has to wait for something to happen to it (a child
+    /// ended): the kernel makes the same call again then.
+    Wait,
+    /// The caller ended (`ProcHost::exit`).
+    Exit,
+}
+
+/// What a system call implementation gets from the kernel: the calling
+/// process and the kernel's mechanisms (the process table, address spaces,
+/// the console). Addresses are the caller's.
+pub trait ProcHost {
+    fn pid(&self) -> u32;
+    fn ppid(&self) -> u32;
+    /// Copy from / to the caller's memory; false on a bad address.
+    fn read(&mut self, addr: u64, buf: &mut [u8]) -> bool;
+    fn write(&mut self, addr: u64, data: &[u8]) -> bool;
+    /// Output for the console (fd 1 and 2 until there are files).
+    fn console(&mut self, data: &[u8]);
+    /// The caller ends with `status` (as wait reports it).
+    fn exit(&mut self, status: i32);
+    /// A copy of the caller (its memory shared copy-on-write); the child's
+    /// pid. The child returns from the call with 0.
+    fn fork(&mut self) -> Result<u32, i32>;
+    /// A child that ended (`pid` -1: any), reaped: (pid, status). Ok(None):
+    /// none yet; Err(errno): no such child.
+    fn wait(&mut self, pid: i32) -> Result<Option<(u32, i32)>, i32>;
+    /// Anonymous memory (zero-filled on first touch): `len` bytes with
+    /// `prot` (PROT_READ 1, PROT_WRITE 2, PROT_EXEC 4) at `addr` (0: the
+    /// kernel picks; `fixed`: exactly there, replacing what was); where.
+    fn map(&mut self, addr: u64, len: u64, prot: u32, fixed: bool) -> Result<u64, i32>;
+    fn unmap(&mut self, addr: u64, len: u64) -> Result<(), i32>;
+    /// Move the end of the heap (0: ask); where it is now.
+    fn brk(&mut self, addr: u64) -> u64;
+    /// The thread pointer (FS base).
+    fn set_fs(&mut self, base: u64);
+    /// Monotonic and wall-clock time, in ns.
+    fn now_ns(&self) -> u64;
+    fn unix_ns(&self) -> u64;
+}
+
+/// The system calls of user-mode processes. The kernel only takes the
+/// `syscall` and hands it here (number and arguments as on Linux x86-64);
+/// what the calls do is this module's. Process state lives in the kernel,
+/// so the module can be replaced while processes run.
+pub trait Syscalls {
+    /// The release this version is from (see `BUILD`).
+    fn version(&self) -> &'static str {
+        crate::BUILD
+    }
+    fn syscall(&mut self, host: &mut dyn ProcHost, nr: u64, args: [u64; 6]) -> Sysret;
 }

@@ -105,6 +105,9 @@ pub struct Kernel {
     /// Booting: no app has run yet, so nothing holds state in the network
     /// stack but its configuration.
     pub booting: bool,
+    /// User-mode processes, and the module with their system calls.
+    pub procs: crate::proc::Procs,
+    pub syscalls: Option<(&'static str, crate::loader::Module)>,
     /// Module names by id ("" for a free slot).
     pub names: Vec<&'static str>,
     /// Capabilities granted, by app id.
@@ -150,6 +153,8 @@ impl Kernel {
             nic_options: "",
             parked: services::Parked::default(),
             booting: true,
+            procs: crate::proc::Procs::default(),
+            syscalls: None,
             names: Vec::new(),
             caps: Vec::new(),
             builtin_names: Vec::new(),
@@ -759,5 +764,14 @@ impl Admin for Ctx<'_> {
     }
     fn module_config_set(&mut self, name: &str, key: &str, value: Option<&str>) -> Result<(), String> {
         modules::manager(self.k, |m, h| m.config_set(h, name, key, value)).unwrap_or_else(|| Err(String::from(NO_MANAGER)))
+    }
+    fn spawn(&mut self, image: &[u8], args: &[&str]) -> Result<u32, String> {
+        self.k.procs.spawn(image, args)
+    }
+    fn processes(&self) -> Vec<rustros_api::ProcInfo> {
+        self.k.procs.list()
+    }
+    fn kill(&mut self, pid: u32) -> bool {
+        self.k.procs.kill(pid)
     }
 }

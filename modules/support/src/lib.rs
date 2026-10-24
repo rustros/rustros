@@ -140,3 +140,16 @@ macro_rules! export_runtime {
         }
     };
 }
+
+#[macro_export]
+macro_rules! export_syscalls {
+    ($ctor:expr) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rustros_module_init(
+            host: *const $crate::rustros_api::module::HostTable,
+            out: *mut Option<$crate::rustros_api::module::Export>,
+        ) -> u64 {
+            unsafe { $crate::init(host, out, || $crate::rustros_api::module::Export::Syscalls($crate::Box::new($ctor))) }
+        }
+    };
+}

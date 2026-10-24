@@ -22,11 +22,17 @@ static EXTRA_USED: Global<usize> = Global::new(0);
 /// Return the table referenced by `entry`, allocating one if it is empty.
 fn next_table(entry: &mut u64) -> Option<&'static mut [u64; 512]> {
     if *entry & 1 == 0 {
-        // Safety: single core, called during init only.
+        // Safety: single core, main loop only
         let (pool, used) = unsafe { (EXTRA.get(), EXTRA_USED.get()) };
-        let t = pool.get_mut(*used)?;
-        *used += 1;
-        *entry = t.0.as_ptr() as u64 | 3;
+        // the spare tables first, then free frames (RAM above 4 GiB)
+        let t = match pool.get_mut(*used) {
+            Some(t) => {
+                *used += 1;
+                t.0.as_ptr() as u64
+            }
+            None => crate::frames::alloc()?,
+        };
+        *entry = t | 3;
     }
     // Safety: identity-mapped page table we own.
     Some(unsafe { &mut *((*entry & 0x000F_FFFF_FFFF_F000) as *mut [u64; 512]) })
@@ -49,7 +55,7 @@ fn map(phys: u64, len: u64, uncached_low: bool) -> bool {
     if phys + len <= 4 << 30 && !uncached_low {
         return true;
     }
-    if phys + len > 1 << 47 {
+    if phys + len > 1 << 46 {
         return false;
     }
     let pml4 = unsafe { &mut *(&raw mut boot_pml4) };
@@ -65,8 +71,29 @@ fn map(phys: u64, len: u64, uncached_low: bool) -> bool {
         }
         a += MB2;
     }
+    // a process's address space may be active: it shares these entries
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)) };
+    if cr3 != kernel_pml4() {
+        // Safety: an active page table, identity-mapped
+        unsafe { (&mut *((cr3 & !0xFFF) as *mut [u64; 512]))[..KERNEL_ENTRIES].copy_from_slice(&pml4[..KERNEL_ENTRIES]) };
+    }
     unsafe { core::arch::asm!("mov rax, cr3; mov cr3, rax", out("rax") _, options(nostack)) }
     true
+}
+
+/// The kernel's PML4 entries (the identity map, devices): the first 128,
+/// shared by every address space; the rest is user space (vm.rs).
+pub const KERNEL_ENTRIES: usize = 128;
+
+pub fn kernel_pml4() -> u64 {
+    &raw const boot_pml4 as u64
+}
+
+/// The kernel's entries, for an address space.
+pub fn kernel_entries() -> &'static [u64] {
+    // Safety: read only; written by `map` on the main loop
+    unsafe { &(&*(&raw const boot_pml4))[..KERNEL_ENTRIES] }
 }
 
 // ---------------------------------------------------------------- heap
