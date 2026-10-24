@@ -10,7 +10,7 @@ GPT layout (512-byte sectors) of the 2 MiB image:
                      /EFI/BOOT/BOOTX64.EFI   GRUB for UEFI
                      /boot/grub/grub.cfg
                      /boot/grub/grubenv      boot_slot / try_slot / saved network
-                     /boot/kernel-a.elf      kernel slot A (preallocated, contiguous, 256 KiB)
+                     /boot/kernel-a.elf      kernel slot A (preallocated, contiguous, 472 KiB)
                      /boot/kernel-b.elf      kernel slot B
   LBA 4063..4095   backup GPT (the kernel moves it to the real end of the disk)
 
@@ -210,7 +210,7 @@ def main():
     ap.add_argument("--key", default="", help="online update key (empty: generate one)")
     ap.add_argument("--key-file", help="read/store the update key in this file")
     ap.add_argument("--size-mb", type=int, default=2, help="image size in MiB (2 to 64; the EFI partition is all of it)")
-    ap.add_argument("--slot-kb", type=int, default=0, help="size of each kernel slot in KiB (default 256, 1024 from 8 MiB on)")
+    ap.add_argument("--slot-kb", type=int, default=0, help="size of each kernel slot in KiB (default 472: what the 2 MiB image has room for; 1024 from 8 MiB on)")
     ap.add_argument("--timeout", type=int, default=2, help="GRUB menu timeout in seconds")
     ap.add_argument("--bundle", action="append", default=[], metavar="NAME=FILE",
                     help="a module the image carries (installed at first boot), e.g. panel=build/modules/panel.mod")
@@ -224,7 +224,7 @@ def main():
         sys.exit("mkimg: --size-mb is 2 to 64 (the boot area)")
     IMAGE_SECTORS = a.size_mb * 2048
     ESP_LAST = IMAGE_SECTORS - 34
-    a.slot_kb = a.slot_kb or (1024 if a.size_mb >= 8 else 256)
+    a.slot_kb = a.slot_kb or (1024 if a.size_mb >= 8 else 472)
     bundle = make_bundle(a.bundle)
     assert IMAGE_SECTORS + len(bundle) // SECTOR <= BOOT_AREA_SECTORS, "the bundle must fit in the 64 MiB boot area"
 

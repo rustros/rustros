@@ -16,7 +16,7 @@ api/           rustros-api：应用接口 App/Sys、类型、错误码、WebAsse
 util/          rustros-util：给应用用的工具：Conn、地址和报文工具、SHA-256/HMAC
 devices/       设备接口：BlockDevice、NetDevice
 netstack/      协议栈：以太网/ARP/IPv4/ICMP/UDP/TCP + 多应用 socket 分发；网络配置：生效、候选、apply/确认/超时回滚，读取与保存（命令行/grubenv，util::netconf）；交给下一个版本的状态（handover.rs）。引导模块里是不带状态交接的引导版，完整的在 netstack 模块里
-tcpip/         协议栈里每个包都要经过的部分：IPv4 接口（以太网、ARP、IP、ICMP、路由）和 TCP，按 -O3 编译，netstack 的其余部分按 -Os；引导模块里的引导版全部按 -Os，让启动镜像放得进 256 KiB 的槽
+tcpip/         协议栈里每个包都要经过的部分：IPv4 接口（以太网、ARP、IP、ICMP、路由）和 TCP，按 -O3 编译，netstack 的其余部分按 -Os；引导模块里的引导版全部按 -Os，让启动镜像放得进内核槽
 kvstore/       键值存储引擎（断电安全）
 storage/       存储服务（在引导模块里，可替换）：GPT 分区、kvstore、A/B 槽与 grubenv、开机日志、files 分区
 modman/        模块管理（在引导模块里，可替换）：已装模块的存放（sys/app/<名>/）、安装/删除/切换、选择原生或 WebAssembly 形式、模块的角色（服务、文件系统驱动）和开机顺序、崩溃后关掉原生形式、镜像自带模块；内核只负责加载和运行
@@ -27,7 +27,7 @@ apps/          原生应用：shell、echo、httpd、updater
 user/          用户态测试程序（单独的 workspace）：无 libc 的静态 ELF，发 Linux x86-64 系统调用（hello、badptr、spin、forktest）
 wasm/          WebAssembly 应用（单独的 workspace）：guest 库 + 示例 echo、crashy
 modules 里另有：linux（用户态进程的 Linux 系统调用），netstack/storage/modman/virtio（替换启动镜像里的同类服务）
-tools/         mkimg.py 生成 raw 盘；pack.py 把内核打成自解压 ELF（LZ4）以放进 256 KiB 槽位；rustros-update.py 在线更新/管理客户端
+tools/         mkimg.py 生成 raw 盘；pack.py 把内核打成自解压 ELF（LZ4）以放进内核槽；rustros-update.py 在线更新/管理客户端
 ```
 
 依赖方向是单向的：
@@ -149,12 +149,14 @@ tools/rustros-update.py HOST info     # 运行时长、槽位、地址、存储�
 
 流程如下：
 
-1. ESP 里有两个预分配、物理连续的槽位 `/boot/kernel-a.elf` 和 `/boot/kernel-b.elf`（镜像默认 2 MiB，每个槽 256 KiB；内核连同引导模块正好 256 KiB）。内核从启动参数得知它们的扇区号，更新时直接写扇区，不改动 FAT。
+1. ESP 里有两个预分配、物理连续的槽位 `/boot/kernel-a.elf` 和 `/boot/kernel-b.elf`（镜像默认 2 MiB，每个槽 472 KiB；更早装的机器是 256 KiB，可以用 `slots-grow` 原地扩到 448 KiB，见下）。内核从启动参数得知它们的扇区号，更新时直接写扇区，不改动 FAT。
 2. 上传前先校验头部的 HMAC-SHA256（服务端每次连接下发随机 nonce，防止重放），通过后才写盘。整个镜像的 HMAC 校验通过后，才在 `grubenv` 里写 `try_slot`。
 3. GRUB 只会用 `try_slot` 启动一次，并且会先把它清掉。新内核必须在 5 分钟内确认（`confirm`），否则自动重启。如果新内核起不来，断电重启也会回到 `boot_slot`；加载失败时，GRUB 会走 fallback 菜单项。
 4. 试启动期间拒绝再次上传，避免覆盖用来回滚的旧内核。
 
 **无损扩容。** 槽不够大时，`rustros-update.py HOST esp-grow 8 1024` 把 ESP 在线扩到 8 MiB、槽扩到 1 MiB，数据分区不动：先在 ESP 后面的空闲启动区（64 MiB 以内）写好一份更大的新 ESP（GRUB、grub.cfg、grubenv、两个槽里的内核原样拷过去，只改 grub.cfg 里的扇区号），读回校验，再只改 GPT 里 ESP 那一项的位置，然后重启。切换之前断电，用的还是旧 ESP；切换之后断电，用的是已经校验过的新 ESP。分区编号和 GUID 不变，BIOS 和 UEFI 都照常找到它。
+
+**原地扩槽。** `rustros-update.py HOST slots-grow` 在 EFI 分区内部把两个槽扩到它放得下的大小（256 KiB 槽的 2 MiB 镜像是 448 KiB），不移动分区，分区表、MBR 和内核都不动：B 槽先搬到分区尾部的空闲簇，A 槽再原地扩展到 B 原来的位置，最后换上新的 grub.cfg，然后重启。每一步先写数据和 FAT（这时还没有任何文件引用它们），再用一个目录扇区提交，所以任何一次写入之后断电都能照常启动；再运行一次就把剩下的做完（中断后先这样做，再更新内核）。
 
 ## 用户态进程（ring 3）
 
@@ -197,7 +199,7 @@ tools/rustros-update.py HOST module-remove storage                              
 | 模块管理 | 还没执行的模块操作队列 | |
 | 驱动 | 不交接 | 设备先复位，再由新驱动重新接管，网络会断开片刻，TCP 自己重传。换掉启动盘的驱动时，存储服务先交出磁盘，再接着用新驱动 |
 
-**协议栈的引导版。** 启动镜像要放进 256 KiB 的槽，所以里面的协议栈是按体积编译、不带状态交接的引导版，只负责联网和拉取模块。
+**协议栈的引导版。** 启动镜像要放进内核槽，所以里面的协议栈是按体积编译、不带状态交接的引导版，只负责联网和拉取模块。
 
 - 镜像默认把完整的、按速度编译的 `netstack` 模块带在磁盘上（`DISK_MODULES=netstack`），第一次开机时安装。
 - 以后每次开机，它都在任何应用运行之前接替引导版。这时引导版里除了网络配置还没有别的状态，交接配置就够了。
@@ -287,7 +289,7 @@ pub trait App {
 - 安装的模块（应用、ext4、WebAssembly 运行时）本来就能在线替换，但它们是重启式的：应用丢掉自己的 socket，ext4 先卸载再由新驱动挂载，WebAssembly 实例在新运行时上重新启动。
 - 内核本身更新仍然需要重启。
 
-**启动镜像保持最小、不变**：原始启动镜像（256 KiB 的内核槽）不扩容，只保留启动、联网、拉取模块和救援所需的部分。其他组件，包括将来兼容 Linux 的完整版本（兼容层、VFS、容器运行时等），一律作为模块缓存在磁盘上、开机从磁盘加载、通过网络更新，或随离线安装包写到磁盘上。
+**启动镜像保持最小**：2 MiB 的启动镜像只保留启动、联网、拉取模块和救援所需的部分。其他组件，包括将来兼容 Linux 的完整版本（兼容层、VFS、容器运行时等），一律作为模块缓存在磁盘上、开机从磁盘加载、通过网络更新，或随离线安装包写到磁盘上。
 
 为此要铺的路（详细里程碑和验收标准见项目笔记）：
 

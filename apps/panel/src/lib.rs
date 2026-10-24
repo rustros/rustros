@@ -52,7 +52,6 @@ const METRICS_MS: u64 = 60_000;
 /// The claim code is printed again this often.
 const REPRINT_MS: u64 = 120_000;
 const MAX_MODULE: usize = 1 << 20;
-const MAX_KERNEL: usize = 256 * 1024;
 /// A network change from the panel is reverted unless the panel is reached
 /// again within this.
 const NET_CONFIRM_S: u32 = 120;
@@ -557,8 +556,9 @@ impl Panel {
                 }
             }
             "update" => {
-                if data.len() > MAX_KERNEL {
-                    Err(String::from("a kernel is at most 256 KiB"))
+                let max = sys.update_info().map_or(0, |u| u.max_bytes as usize);
+                if data.len() > max {
+                    Err(format!("a kernel is at most {} KiB (this machine's slot)", max / 1024))
                 } else {
                     match sys.admin() {
                         Some(a) => {

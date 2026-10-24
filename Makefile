@@ -13,7 +13,7 @@ IP  ?= 10.0.2.15/24
 GW  ?= 10.0.2.2
 MTU ?=
 KEY ?=
-# image size in MiB (default 2: 256 KiB kernel slots; a kernel with apps built in needs 8)
+# image size in MiB (default 2: 472 KiB kernel slots; a kernel with apps built in needs 8)
 SIZE_MB ?=
 # more kernel arguments in grub.cfg (test images: CMDLINE=rustros.stable=20)
 CMDLINE ?=

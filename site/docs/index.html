@@ -109,7 +109,7 @@ python3 rustros-update.py 203.0.113.10 module-install nat nat-x86_64.mod
 python3 rustros-update.py 203.0.113.10 module-config webadmin allow 198.51.100.7
 python3 rustros-update.py 203.0.113.10 log prev</pre></div>
 <p><code>upload --wait</code> 把内核写进备用槽，重启试运行一次，起来后自动确认。新内核起不来或没确认，下次启动就回到原来的内核；连续三次启动不稳定会进安全模式，第四次换回另一个槽。</p>
-<p>镜像默认 2 MiB，两个内核槽各 256 KiB。以后需要更大的槽时，<code>esp-grow 8 1024</code> 在线把 EFI 分区扩到 8 MiB、槽扩到 1 MiB，不丢数据：新分区先在空闲的启动区里写好并校验，最后才切换分区表，中途断电也能照常启动（需要 dosfstools 和 mtools）。</p>
+<p>镜像默认 2 MiB，两个内核槽各 472 KiB；更早装的机器是 256 KiB，<code>slots-grow</code> 在 EFI 分区内部原地把它们扩到 448 KiB，不移动分区，任何一次写入后断电都能启动。以后需要更大的槽时，<code>esp-grow 8 1024</code> 在线把 EFI 分区扩到 8 MiB、槽扩到 1 MiB，不丢数据：新分区先在空闲的启动区里写好并校验，最后才切换分区表，中途断电也能照常启动（需要 dosfstools 和 mtools）。</p>
 
 <h2 id="webadmin">网页管理</h2>
 <p>装上 <code>webadmin</code> 后在 8080 端口提供网页管理，每个应用的设置页按它声明的参数自动生成。默认只允许没有网关的网卡所在网段访问，所以在云主机上要先放行自己的地址并设置密码：</p>
@@ -226,7 +226,7 @@ python3 rustros-update.py 203.0.113.10 module-install nat nat-x86_64.mod
 python3 rustros-update.py 203.0.113.10 module-config webadmin allow 198.51.100.7
 python3 rustros-update.py 203.0.113.10 log prev</pre></div>
 <p><code>upload --wait</code> writes the kernel into the spare slot, boots it once and confirms it once it is up. A kernel that does not come up, or is not confirmed, is followed by the old one at the next boot; after three unstable boots it starts in safe mode, at the fourth the other slot takes over.</p>
-<p>Images are 2 MiB with two 256 KiB kernel slots. Should the slots ever be too small, <code>esp-grow 8 1024</code> grows the EFI partition to 8 MiB and the slots to 1 MiB online, losing nothing: the new partition is written and checked in the free boot area first, and only then does the partition table switch to it, so a power cut at any point still boots (needs dosfstools and mtools).</p>
+<p>Images are 2 MiB with two 472 KiB kernel slots; machines installed earlier have 256 KiB, which <code>slots-grow</code> grows to 448 KiB inside the EFI partition, without moving it; a power cut after any write still boots. Should the slots ever be too small, <code>esp-grow 8 1024</code> grows the EFI partition to 8 MiB and the slots to 1 MiB online, losing nothing: the new partition is written and checked in the free boot area first, and only then does the partition table switch to it, so a power cut at any point still boots (needs dosfstools and mtools).</p>
 
 <h2 id="webadmin-en">Web admin</h2>
 <p>The <code>webadmin</code> app serves a web admin on port 8080; each app's page is generated from the settings it declares. By default only the networks of NICs without a gateway may connect, so on a VPS allow your own address and set a password first:</p>

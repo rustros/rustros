@@ -36,6 +36,8 @@ make modules >>$S/build.log 2>&1 && make wasm >>$S/build.log 2>&1 && make user >
 variant default
 python3 tools/mkimg.py build/rustros.elf $B/default/build/big.img --size-mb 8 --ip 10.0.2.15/24 --gw 10.0.2.2 --key-file build/update.key --cmdline "$STABLE" >>$S/build.log 2>&1
 python3 tools/mkimg.py build/rustros.elf $B/default/build/dhcp.img --key-file build/update.key --cmdline "$STABLE" >>$S/build.log 2>&1
+# the layout of the deployed boxes: 2 MiB with 256 KiB slots (esp-grow, slots-grow)
+python3 tools/mkimg.py build/rustros.elf $B/default/build/slots256.img --slot-kb 256 --bundle netstack=build/modules/netstack.mod --key-file build/update.key --cmdline "rustros.stable=5" >>$S/build.log 2>&1
 variant su APPS="shell updater" SIZE_MB=8
 variant seh APPS="shell echo httpd updater" SIZE_MB=8
 make -B >>$S/build.log 2>&1   # the repo's own build/ back to the plain default
@@ -87,7 +89,7 @@ group 1 "default|vlan||python3 vlan_test.py bios" "default|cand||python3 cand_te
 group 2 "default|rescue bios|DISK_MB=1200|python3 rescue_test.py bios" "default|rescue uefi|DISK_MB=1200|python3 rescue_test.py uefi" \
         "default|layout bios|IMG=rustros.img DISK_MB=1200|python3 layout_test.py bios" "default|layout uefi|IMG=rustros.img DISK_MB=1200|python3 layout_test.py uefi" \
         "default|layout big|IMG=big.img DISK_MB=1200|python3 layout_test.py bios" &
-group 3 "default|grow bios|IMG=rustros.img DISK_MB=1200|python3 grow_test.py bios" "default|grow uefi|IMG=rustros.img DISK_MB=1200|python3 grow_test.py uefi" \
+group 3 "default|grow bios|IMG=slots256.img DISK_MB=1200|python3 grow_test.py bios" "default|grow uefi|IMG=slots256.img DISK_MB=1200|python3 grow_test.py uefi" \
         "default|sites|IMG=rustros.img DISK_MB=1200|python3 sites_test.py bios" "default|webadmin|IMG=rustros.img DISK_MB=1200|python3 webadmin_test.py bios" \
         "default|pkg|IMG=rustros.img DISK_MB=1200|python3 pkg_test.py bios" &
 group 4 "su|bootloop|DISK_MB=300|python3 bootloop_test.py bios" "su|modules|DISK_MB=300|python3 module_test.py bios" &
@@ -96,6 +98,8 @@ group 5 "seh|update bios|IMG=rustros.img DISK_MB=1200|python3 test.py bios updat
         "seh|watchdog|WDT=1 DISK_MB=300|python3 wdt_test.py bios" &
 group 6 "default|hot bios|IMG=rustros.img DISK_MB=1200|python3 hot_test.py bios" "default|hot uefi legacy|IMG=rustros.img DISK_MB=1200|python3 hot_test.py uefi legacy" \
         "default|curl|DISK_MB=300|python3 curl_test.py bios" &
+group 7 "default|slots-grow bios|IMG=slots256.img DISK_MB=300|python3 slots_grow_test.py bios" \
+        "default|slots-grow uefi|IMG=slots256.img DISK_MB=300|python3 slots_grow_test.py uefi" &
 wait
 
 # ---------------------------------------------------------------- forwarding benchmark, alone

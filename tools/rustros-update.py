@@ -19,6 +19,8 @@
   rustros-update.py HOST esp-put FILE                 write back the sectors of FILE that differ (then verify)
   rustros-update.py HOST esp-grow MIB [SLOT_KIB]      grow the EFI partition (and the kernel slots) into the
                                                      free boot area, losing nothing; then reboot
+  rustros-update.py HOST slots-grow [SLOT_KIB]        grow the kernel slots inside the EFI partition as it is
+                                                     (default: as far as it has room); then reboot
 
 The key comes from --key, $RUSTROS_KEY or --key-file (default build/update.key).
 `upload --wait` waits for the trial boot to come up and confirms it.
@@ -189,46 +191,297 @@ def esp(a, key):
     return 0
 
 
-def fat_locate(img, path):
-    """(first sector, size) of a contiguous file in a FAT12/16 image."""
-    bps, spc, rsvd, nfats, root_entries = struct.unpack_from("<HBHBH", img, 11)
-    fatsz, total = struct.unpack_from("<H", img, 22)[0], struct.unpack_from("<H", img, 19)[0] or struct.unpack_from("<I", img, 32)[0]
-    root = rsvd + nfats * fatsz
-    data = root + (root_entries * 32 + 511) // 512
-    bits = 12 if (total - data) // spc < 4085 else 16
+class EspFat:
+    """A FAT12/16 EFI partition (its bytes), for lookups and in-place edits:
+    every change goes to the image here and to all FAT copies."""
 
-    def nxt(c):
-        o = rsvd * 512 + (c * 3 // 2 if bits == 12 else c * 2)
-        v = struct.unpack_from("<H", img, o)[0]
-        return (v >> 4 if c & 1 else v & 0xFFF) if bits == 12 else v
+    def __init__(self, img):
+        self.img = bytearray(img)
+        bps, self.spc, rsvd, self.nfats, root_entries = struct.unpack_from("<HBHBH", img, 11)
+        self.fatsz = struct.unpack_from("<H", img, 22)[0]
+        total = struct.unpack_from("<H", img, 19)[0] or struct.unpack_from("<I", img, 32)[0]
+        if bps != 512 or not self.fatsz:
+            sys.exit("not a FAT12/16 partition with 512-byte sectors")
+        self.fat_start = rsvd
+        self.root = rsvd + self.nfats * self.fatsz
+        self.data = self.root + (root_entries * 32 + 511) // 512
+        self.clusters = (total - self.data) // self.spc
+        self.bits = 12 if self.clusters < 4085 else 16
+        self.eoc = 0xFFF if self.bits == 12 else 0xFFFF
 
-    def chain(c):
+    def get(self, c):
+        o = self.fat_start * 512
+        if self.bits == 12:
+            v = struct.unpack_from("<H", self.img, o + c * 3 // 2)[0]
+            return v >> 4 if c & 1 else v & 0xFFF
+        return struct.unpack_from("<H", self.img, o + c * 2)[0]
+
+    def set(self, c, v):
+        for k in range(self.nfats):
+            o = (self.fat_start + k * self.fatsz) * 512
+            if self.bits == 12:
+                o += c * 3 // 2
+                w = struct.unpack_from("<H", self.img, o)[0]
+                w = (w & 0x000F) | (v << 4) if c & 1 else (w & 0xF000) | v
+                struct.pack_into("<H", self.img, o, w)
+            else:
+                struct.pack_into("<H", self.img, o + c * 2, v)
+
+    def chain(self, c):
         out = []
-        while 2 <= c < (0xFF8 if bits == 12 else 0xFFF8):
+        while 2 <= c < self.eoc - 7 and len(out) <= self.clusters:
             out.append(c)
-            c = nxt(c)
+            c = self.get(c)
         return out
 
-    def entries(c):
-        raw = img[root * 512:data * 512] if c is None else b"".join(img[(data + (x - 2) * spc) * 512:(data + (x - 1) * spc) * 512] for x in chain(c))
-        for i in range(0, len(raw), 32):
-            e = raw[i:i + 32]
-            if e[0] == 0:
-                break
-            if e[0] != 0xE5 and e[11] != 0x0F:
-                yield e[:11], struct.unpack_from("<H", e, 26)[0], struct.unpack_from("<I", e, 28)[0]
+    def lba(self, c):
+        """The partition-relative sector of cluster `c`."""
+        return self.data + (c - 2) * self.spc
 
-    c, size = None, 0
-    for p in path.strip("/").split("/"):
-        base, _, ext = p.upper().partition(".")
-        want = (base.ljust(8) + ext.ljust(3)).encode()
-        c, size = next(((x, sz) for n, x, sz in entries(c) if n == want), (None, None))
-        if c is None:
-            sys.exit(f"esp-grow: {path} not in the new EFI partition")
-    ch = chain(c)
-    if ch != list(range(ch[0], ch[0] + len(ch))):
-        sys.exit(f"esp-grow: {path} is fragmented")
-    return data + (ch[0] - 2) * spc, size
+    def entries(self, start):
+        """(name, attr, first cluster, size, byte offset of the entry) of a
+        directory (None: the root directory), without . and .. or long names."""
+        if start is None:
+            spans = [(self.root * 512, self.data * 512)]
+        else:
+            spans = [(self.lba(c) * 512, (self.lba(c) + self.spc) * 512) for c in self.chain(start)]
+        for lo, hi in spans:
+            for o in range(lo, hi, 32):
+                e = self.img[o:o + 32]
+                if e[0] == 0:
+                    return
+                if e[0] == 0xE5 or e[11] == 0x0F or e[:2] in (b". ", b".."):
+                    continue
+                first = struct.unpack_from("<H", e, 20)[0] << 16 | struct.unpack_from("<H", e, 26)[0]
+                yield bytes(e[:11]), e[11], first, struct.unpack_from("<I", e, 28)[0], o
+
+    def find(self, path):
+        d, found = None, None
+        for p in path.strip("/").split("/"):
+            base, _, ext = p.upper().partition(".")
+            want = (base.ljust(8) + ext.ljust(3)).encode()
+            found = next((e for e in self.entries(d) if e[0] == want), None)
+            if found is None:
+                sys.exit(f"{path} not in the EFI partition")
+            d = found[2]
+        return found
+
+    def referenced(self):
+        """Every cluster a directory entry's chain reaches."""
+        seen, todo = set(), [None]
+        while todo:
+            for name, attr, first, size, _ in self.entries(todo.pop()):
+                if first >= 2:
+                    seen.update(self.chain(first))
+                    if attr & 0x10:
+                        todo.append(first)
+        return seen
+
+    def set_entry(self, off, first, size):
+        struct.pack_into("<H", self.img, off + 20, first >> 16)
+        struct.pack_into("<H", self.img, off + 26, first & 0xFFFF)
+        struct.pack_into("<I", self.img, off + 28, size)
+
+    def read(self, path):
+        _, _, first, size, _ = self.find(path)
+        return b"".join(bytes(self.img[self.lba(c) * 512:(self.lba(c) + self.spc) * 512]) for c in self.chain(first))[:size]
+
+    def contiguous(self, path):
+        """(first sector, size) of a file that must be one run of clusters."""
+        _, _, first, size, _ = self.find(path)
+        ch = self.chain(first)
+        if not ch or ch != list(range(ch[0], ch[0] + len(ch))):
+            sys.exit(f"{path} is fragmented")
+        return self.lba(ch[0]), size
+
+
+def fat_locate(img, path):
+    """(first sector, size) of a contiguous file in a FAT12/16 image."""
+    return EspFat(img).contiguous(path)
+
+
+def slots_grow(a, key, slot_kb, stop_after):
+    """Grow both kernel slots inside the EFI partition as it is (no partition
+    move, nothing outside it changes): kernel-b.elf moves to free space,
+    kernel-a.elf grows over B's old place, then grub.cfg gets the new sector
+    numbers, then a reboot. Each step writes its data and FAT entries first
+    (unreferenced until then) and commits with one directory sector, so the
+    machine boots after a power cut at any point; running this again
+    finishes the job. Never during an update."""
+    import re
+    s, _, slot, trial = hello(a.host, a.port)
+    s.close()
+    if trial:
+        sys.exit("confirm the running trial kernel first")
+    first = esp_first(a, key)
+    old = esp_get(a, key, first)
+    f = EspFat(old)
+    if f.spc != 1:
+        sys.exit("expected one sector per cluster (images from mkimg.py or esp-grow)")
+    A, B, CFG = "/boot/kernel-a.elf", "/boot/kernel-b.elf", "/boot/grub/grub.cfg"
+    cfg = f.read(CFG).decode()
+    m = re.search(r"rustros\.slots=(\d+),(\d+),(\d+)", cfg)
+    if not m:
+        sys.exit("grub.cfg has no rustros.slots=")
+    # what the kernels use now: both slots hold that much (the smallest, if
+    # an interrupted run left the entries different)
+    secs = min(int(x) for x in re.findall(r"rustros\.slots=\d+,\d+,(\d+)", cfg))
+    a_ch, b_ch = f.chain(f.find(A)[2]), f.chain(f.find(B)[2])
+    a0 = a_ch[0]
+    if a_ch != list(range(a0, a0 + len(a_ch))) or f.lba(a0) != int(m.group(1)) - first:
+        sys.exit("kernel-a.elf is not where grub.cfg says, or fragmented")
+    ref = f.referenced()
+    b_set = set(b_ch)
+
+    def avail_for_a(c):  # A may grow over free clusters and B's (B moves first)
+        return c in a_ch or c in b_set or c not in ref
+
+    def free_runs(exclude):
+        runs, run = [], []
+        for c in range(2, f.clusters + 2):
+            if c not in ref and c not in exclude:
+                run.append(c)
+                continue
+            if run:
+                runs.append(run)
+            run = []
+        if run:
+            runs.append(run)
+        return runs
+
+    cfg_n = (len(cfg) + 600) // 512  # room for longer sector numbers
+    la = 0
+    while a0 + la < f.clusters + 2 and avail_for_a(a0 + la):
+        la += 1
+
+    def plan(S):
+        """Where B goes for slots of S sectors (None: it does not fit)."""
+        a_range = set(range(a0, a0 + S))
+        if S > la:
+            return None
+        if b_ch == list(range(b_ch[0], b_ch[0] + len(b_ch))) and len(b_ch) >= S and not a_range & b_set:
+            b_new = b_ch[0]  # already moved
+        else:
+            runs = [r for r in free_runs(a_range) if len(r) >= S]
+            if not runs:
+                return None
+            b_new = max(runs, key=len)[0]
+        taken = a_range | set(range(b_new, b_new + S))
+        if not any(len(r) >= cfg_n for r in free_runs(taken)):
+            return None
+        return b_new
+
+    sizes = [f.find(A)[3] // 512, f.find(B)[3] // 512]
+    if slot_kb:
+        S = slot_kb * 2
+    elif max(sizes) > secs:
+        S = max(sizes)  # an interrupted run: finish it
+    else:
+        S = la // 16 * 16
+        while S > secs and plan(S) is None:
+            S -= 16
+    if S < secs:
+        sys.exit("the slots cannot shrink")
+    b_new = plan(S)
+    if b_new is None:
+        sys.exit(f"{S // 2} KiB slots do not fit in this EFI partition")
+    print(f"kernel slots {secs // 2} -> {S // 2} KiB (running slot {slot}): "
+          f"B to sector {first + f.lba(b_new)}, A grows in place at {first + f.lba(a0)}")
+
+    writes = [0]
+
+    def put(lo, hi):
+        """Write the partition-relative sectors lo..hi of the image (what the
+        disk has already, from an interrupted run, is left alone)."""
+        for at in range(lo, hi, ESP_CHUNK - 8):
+            n = min(ESP_CHUNK - 8, hi - at)
+            data = bytes(f.img[at * 512:(at + n) * 512])
+            if data == old[at * 512:(at + n) * 512]:
+                continue
+            if stop_after is not None and writes[0] >= stop_after:
+                print(f"stopped after {writes[0]} writes (--stop-after)")
+                sys.exit(3)
+            reply, _, _ = command(a.host, a.port, key, b"B", struct.pack("<Q", first + at) + data, encrypt=True)
+            if reply != "OK" or esp_read(a, key, first + at, n) != data:
+                sys.exit(f"write at {first + at} failed: {reply} (run again to finish)")
+            writes[0] += 1
+
+    def put_fat(before):
+        """The FAT sectors that changed since `before` (all copies), one by one."""
+        for k in range(f.nfats):
+            for i in range(f.fatsz):
+                sec = f.fat_start + k * f.fatsz + i
+                if f.img[sec * 512:(sec + 1) * 512] != before[sec * 512:(sec + 1) * 512]:
+                    put(sec, sec + 1)
+
+    def put_entry(path, start, size):
+        off = f.find(path)[4]
+        f.set_entry(off, start, size)
+        put(off // 512, off // 512 + 1)
+
+    def link(run):
+        before = bytes(f.img)
+        for c in run[:-1]:
+            f.set(c, c + 1)
+        f.set(run[-1], f.eoc)
+        put_fat(before)
+
+    # 1. B: its contents (and zeros) to the new place, FAT chain, then the entry
+    if b_new != b_ch[0]:
+        src = f.lba(b_ch[0])
+        body = bytes(f.img[src * 512:(src + secs) * 512])
+        lo = f.lba(b_new)
+        f.img[lo * 512:(lo + S) * 512] = body + bytes((S - secs) * 512)
+        put(lo, lo + S)
+        link(list(range(b_new, b_new + S)))
+        put_entry(B, b_new, S * 512)
+    # 2. A: the chain over B's old place, then the entry's size
+    if f.find(A)[3] < S * 512:
+        link(list(range(a0, a0 + S)))
+        put_entry(A, a0, S * 512)
+    # 3. grub.cfg with the new sector numbers, last
+    # every menu entry (the fallback entry has it too)
+    new_cfg = re.sub(r"rustros\.slots=\d+,\d+,\d+", f"rustros.slots={first + f.lba(a0)},{first + f.lba(b_new)},{S}", cfg)
+    if new_cfg != cfg:
+        ref = f.referenced()
+        taken = set(range(a0, a0 + S)) | set(range(b_new, b_new + S))
+        n = (len(new_cfg) + 511) // 512
+        run = next(r for r in free_runs(taken) if len(r) >= n)[:n]
+        lo = f.lba(run[0])
+        f.img[lo * 512:(lo + n) * 512] = new_cfg.encode().ljust(n * 512, b"\0")
+        put(lo, lo + n)
+        link(run)
+        put_entry(CFG, run[0], len(new_cfg))
+    # 4. clusters nothing refers to any more (B's old tail, the old grub.cfg),
+    # and the other FAT copies equal to the first (written first every time;
+    # an interrupted run may have left the others behind)
+    ref = f.referenced()
+    before = bytes(f.img)
+    fat1 = f.img[f.fat_start * 512:(f.fat_start + f.fatsz) * 512]
+    for k in range(1, f.nfats):
+        o = (f.fat_start + k * f.fatsz) * 512
+        f.img[o:o + len(fat1)] = fat1
+    for c in range(2, f.clusters + 2):
+        if f.get(c) not in (0, f.eoc - 8) and c not in ref:  # not free, not a bad cluster
+            f.set(c, 0)
+    put_fat(before)
+    if esp_get(a, key, first) != bytes(f.img):
+        sys.exit("verify failed: the EFI partition differs (run again)")
+    if not writes[0]:
+        print(f"nothing to do: the slots are {S // 2} KiB" + (" (no room to grow)" if S == secs else ""))
+        return 0
+    print(f"done in {writes[0]} writes; rebooting into {S // 2} KiB slots")
+    command(a.host, a.port, key, b"R")
+    time.sleep(5)
+    for _ in range(120):
+        try:
+            s, _, cur_slot, _ = hello(a.host, a.port, timeout=3)
+            s.close()
+            print(f"up again on slot {cur_slot}")
+            return 0
+        except OSError:
+            time.sleep(1)
+    sys.exit("it did not come back within 2 minutes")
 
 
 def esp_grow(a, key, mb, slot_kb):
@@ -385,7 +638,7 @@ def main():
     ap.add_argument("host")
     ap.add_argument("action", choices=["status", "upload", "confirm", "reboot", "poweroff", "info", "net", "log",
                                        "module-install", "module-remove", "module-switch", "module-config", "run", "ps", "kill",
-                                       "esp-get", "esp-put", "esp-grow"])
+                                       "esp-get", "esp-put", "esp-grow", "slots-grow"])
     ap.add_argument("image", nargs="?", help="kernel image, or the module name for module-*")
     ap.add_argument("module", nargs="?", help="module file (module-install), native|wasm, or the setting's key (module-config)")
     ap.add_argument("value", nargs="*", help="module-config: the value ('-' removes the setting)")
@@ -393,6 +646,7 @@ def main():
     ap.add_argument("--key")
     ap.add_argument("--key-file", default="build/update.key")
     ap.add_argument("--wait", action="store_true", help="after upload, wait for the new kernel and confirm it")
+    ap.add_argument("--stop-after", type=int, help="slots-grow: stop after this many writes (power-cut tests)")
     ap.add_argument("-y", "--yes", action="store_true", help="net apply: do not ask (keep the change if new connections work)")
     a = ap.parse_args()
 
@@ -458,6 +712,10 @@ def main():
         if not a.image or not a.image.isdigit():
             sys.exit("esp-grow needs the new size in MiB (and optionally the slot size in KiB)")
         sys.exit(esp_grow(a, key, int(a.image), int(a.module) if a.module else 0))
+    if a.action == "slots-grow":
+        if a.image and not a.image.isdigit():
+            sys.exit("slots-grow takes the slot size in KiB (default: as big as fits)")
+        sys.exit(slots_grow(a, key, int(a.image or 0), a.stop_after))
     if a.action in ("esp-get", "esp-put"):
         if not a.image:
             sys.exit(f"{a.action} needs a FILE")
