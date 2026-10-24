@@ -392,12 +392,13 @@ impl ProcHost for Host<'_> {
 }
 
 /// Run a process for a while (the CPU would otherwise sleep): until an
-/// interrupt comes in. False if none could run. Called with interrupts off;
-/// returns with them on.
+/// interrupt comes in. Called with interrupts off. True: a process ran, and
+/// interrupts are on again. False: none could run, and interrupts are still
+/// off, so the caller's `sti; hlt` cannot miss an interrupt that comes in
+/// meanwhile (it would otherwise sleep until the next timer tick).
 pub fn run(procs: &mut Procs, syscalls: Option<&mut dyn Syscalls>) -> bool {
     let n = procs.list.len();
     let Some(i) = (0..n).map(|k| (procs.next + k) % n).find(|&i| matches!(procs.list[i].state, State::Run)) else {
-        arch::sti();
         return false;
     };
     procs.next = i + 1;
@@ -416,6 +417,8 @@ pub fn run(procs: &mut Procs, syscalls: Option<&mut dyn Syscalls>) -> bool {
         fxrstor(&procs.list[i].fx);
         procs.fx_owner = pid;
     }
+    // `syscall` allowed for the time a process runs (see arch::syscall_insn)
+    arch::syscall_insn(true);
     loop {
         let t = arch::rdtsc();
         // Safety: the process's address space is active; its registers stay put
@@ -473,6 +476,7 @@ pub fn run(procs: &mut Procs, syscalls: Option<&mut dyn Syscalls>) -> bool {
             _ => break, // BY_INTERRUPT: the main loop's turn
         }
     }
+    arch::syscall_insn(false);
     arch::sti();
     true
 }

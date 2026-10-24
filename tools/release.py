@@ -51,6 +51,7 @@ APPS = {
     "storage": "the storage service (grubenv, kernel slots, key-value store, console log)",
     "modman": "the module manager",
     "virtio": "the virtio-blk and virtio-net drivers",
+    "linux": "the Linux system calls of user-mode processes (ring 3)",
 }
 
 

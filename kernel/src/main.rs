@@ -507,7 +507,8 @@ extern "C" fn kmain(magic: u32, info: u32) -> ! {
             if k.nics.iter().any(|n| n.rx_pending()) {
                 arch::sti();
             } else if !proc::run(&mut k.procs, modules::syscalls(&mut k.syscalls)) {
-                // nothing to run: sleep until the next interrupt
+                // no process to run: sleep until the next interrupt
+                // (interrupts are still off, so `sti; hlt` cannot miss one)
                 let t = arch::rdtsc();
                 arch::wait_for_interrupt();
                 k.perf.idle_tsc += arch::rdtsc() - t;

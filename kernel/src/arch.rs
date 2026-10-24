@@ -268,8 +268,25 @@ pub fn write_fs_base(v: u64) {
     unsafe { wrmsr(0xC000_0100, v) }
 }
 
-/// Segments, TSS and `syscall` for user mode; SSE on (user code uses it;
-/// the kernel is soft-float) and NX pages.
+/// EFER as set at boot, without SCE (`init_user_mode`), so turning the
+/// `syscall` instruction on and off needs no MSR read.
+static EFER: AtomicU64 = AtomicU64::new(0);
+
+/// Allow the `syscall` instruction (EFER.SCE) only while RustROS runs a
+/// user-mode process (proc::run). Under KVM, a guest with SCE set has its
+/// syscall MSRs swapped with the host's on every exit to the hypervisor's
+/// user space (with QEMU user networking, every packet: about 8% of the
+/// UDP round-trip rate); with SCE off outside processes, the data plane
+/// never pays for it.
+pub fn syscall_insn(on: bool) {
+    let v = EFER.load(Ordering::Relaxed) | if on { 1 } else { 0 };
+    unsafe { wrmsr(0xC000_0080, v) }
+}
+
+/// RustROS's CPU setup for its user-mode processes: user segments and a TSS
+/// in the GDT, the `syscall` entry point (STAR, LSTAR, SFMASK; the
+/// instruction itself is allowed only while a process runs, see
+/// `syscall_insn`), SSE for user code (the kernel is soft-float) and NX pages.
 pub fn init_user_mode() {
     unsafe {
         let tss = TSS.get();
@@ -294,7 +311,10 @@ pub fn init_user_mode() {
             "ltr {t:x}",
             p = in(reg) &ptr, t = out(reg) _,
         );
-        wrmsr(0xC000_0080, rdmsr(0xC000_0080) | 1 | 1 << 11); // EFER: SCE, NXE
+        // EFER: NXE now; SCE only while a process runs (syscall_insn)
+        let efer = rdmsr(0xC000_0080) & !1 | 1 << 11;
+        EFER.store(efer, Ordering::Relaxed);
+        wrmsr(0xC000_0080, efer);
         wrmsr(0xC000_0081, 0x18 << 48 | 0x08 << 32); // STAR
         wrmsr(0xC000_0082, syscall_entry as *const () as u64); // LSTAR
         wrmsr(0xC000_0084, 0x4_7700); // SFMASK: TF IF DF NT AC
