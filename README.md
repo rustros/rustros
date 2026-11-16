@@ -14,6 +14,13 @@ RustROS 是一个用 Rust 编写的路由器操作系统，面向云服务器、
 - 安装：`curl -fsSL https://rustros.com/install.sh | sh`（先试启动，确认正常后才写入系统盘）
 - 文档：<https://rustros.com/docs/>
 
+## 社区与联系
+
+- Telegram 频道：<https://t.me/RustROS>（版本发布通知）
+- X：<https://x.com/RustROS>
+- 联系邮箱：contact@rustros.com
+- 安全漏洞：请私下发到 security@rustros.com，见 [SECURITY.md](SECURITY.md)
+
 ## 许可
 
 RustROS 是闭源软件，源代码不公开。发行版中附带的第三方组件按各自的许可提供，说明随发行版一起发布。
@@ -23,5 +30,7 @@ RustROS 是闭源软件，源代码不公开。发行版中附带的第三方组
 RustROS is a router operating system written in Rust for cloud servers, VPS and KVM virtual machines: routing, NAT and port forwarding, VLAN, L2TP, WireGuard, CAKE shaping, a web admin with confirm-or-revert network changes, online updates with a trial boot and automatic rollback, and hot replacement of the network stack, storage, drivers and apps. A 2 MiB disk image boots on BIOS and UEFI.
 
 Website: <https://rustros.com> · Install: `curl -fsSL https://rustros.com/install.sh | sh` · Docs: <https://rustros.com/docs/>
+
+Telegram: <https://t.me/RustROS> (release announcements) · X: <https://x.com/RustROS> · Contact: contact@rustros.com · Security issues: privately to security@rustros.com, see [SECURITY.md](SECURITY.md)
 
 RustROS is proprietary software; its source code is not published.
